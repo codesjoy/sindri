@@ -2,6 +2,7 @@ SHELL := /bin/bash
 GO := go
 
 GOCACHE ?= /tmp/skuld-gocache
+GOLANGCI_LINT_CACHE ?= /tmp/skuld-golangci-cache
 
 .PHONY: proto proto-lint proto-breaking-check \
 	fmt-check test test-race build  verify \
@@ -19,7 +20,7 @@ proto-breaking-check: ## Reject breaking Proto contract changes against main
 	buf breaking api --against '.git#branch=main,subdir=api'
 
 go-lint: ## Run golangci-lint
-	golangci-lint run ./...
+	GOCACHE=$(GOCACHE) GOLANGCI_LINT_CACHE=$(GOLANGCI_LINT_CACHE) golangci-lint run ./...
 
 go-fix: ## Run golangci-lint
 	gofumpt -w .
@@ -28,7 +29,7 @@ go-fix: ## Run golangci-lint
 	golangci-lint run --fix ./...
 
 fmt-check: ## Verify Go formatting without rewriting source
-	@test -z "$$(gofmt -l $$(find cmd internal pkg tools tests -name '*.go' -type f -print))" || { echo 'gofmt: unformatted Go files' >&2; exit 1; }
+	@test -z "$$(gofmt -l $$(find cmd internal pkg -name '*.go' -type f -print))" || { echo 'gofmt: unformatted Go files' >&2; exit 1; }
 
 test: ## Run contract and retained pure-algorithm tests
 	$(GO) test ./...

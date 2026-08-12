@@ -27,10 +27,12 @@ type RouteNode struct {
 	Slots  []uint32
 }
 
+// RouteRepo loads route snapshots newer than a known version.
 type RouteRepo interface {
 	GetNewerRoute(ctx context.Context, version int64) (*Route, error)
 }
 
+// RouteCache stores the latest route and coalesces update notifications.
 type RouteCache struct {
 	cache atomic.Pointer[Route]
 
@@ -44,14 +46,17 @@ func NewRouteCache() *RouteCache {
 	return r
 }
 
+// Version returns the cached route version.
 func (r *RouteCache) Version() int64 {
 	return r.cache.Load().Version
 }
 
+// Route returns the cached route snapshot.
 func (r *RouteCache) Route() *Route {
 	return r.cache.Load()
 }
 
+// UpdateRoute publishes a new route snapshot.
 func (r *RouteCache) UpdateRoute(route *Route) {
 	r.cache.Store(route)
 	select {
@@ -61,6 +66,7 @@ func (r *RouteCache) UpdateRoute(route *Route) {
 	r.eventChan <- route
 }
 
+// EventChan returns the coalescing route update channel.
 func (r *RouteCache) EventChan() <-chan *Route {
 	return r.eventChan
 }

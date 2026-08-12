@@ -1,3 +1,4 @@
+// Package service implements the sequence generator RPC service.
 package service
 
 import (
@@ -14,12 +15,14 @@ import (
 	"google.golang.org/genproto/googleapis/rpc/code"
 )
 
+// SequenceService implements the sequence generator RPC contract.
 type SequenceService struct {
 	sequencev1.UnimplementedSequenceGeneratorServer
 	allocator *biz.Allocator
 	route     *biz.RouteCache
 }
 
+// NewSequenceService constructs a sequence generator service.
 func NewSequenceService(allocator *biz.Allocator, route *biz.RouteCache) *SequenceService {
 	return &SequenceService{
 		allocator: allocator,
@@ -79,7 +82,7 @@ func (s *SequenceService) FetchNext(
 
 // GetRoute returns the active route or a not-modified response.
 func (s *SequenceService) GetRoute(
-	ctx context.Context,
+	_ context.Context,
 	req *sequencev1.GetRouteRequest,
 ) (*sequencev1.GetRouteResponse, error) {
 	route := s.route.Route()

@@ -12,12 +12,14 @@ import (
 	"gorm.io/gorm"
 )
 
+// RouteModel stores a serialized sequence route in the owner database.
 type RouteModel struct {
 	Version   int64     `gorm:"column:version;primaryKey;autoIncrement:false"`
 	Payload   []byte    `gorm:"column:payload;not null"`
 	CreatedAt time.Time `gorm:"column:created_at;not null"`
 }
 
+// TableName returns the route table name.
 func (RouteModel) TableName() string { return "sequence_routes" }
 
 type routePayload struct {
@@ -33,6 +35,7 @@ type routeData struct {
 	db *gorm.DB
 }
 
+// NewRouteModel constructs the route repository backed by db.
 func NewRouteModel(db *gorm.DB) biz.RouteRepo {
 	return &routeData{db: db}
 }
@@ -91,14 +94,15 @@ func decodeRoute(model RouteModel) (*biz.Route, error) {
 					slot,
 				)
 			}
-			if assigned[slot] {
+			slotIndex := int(slot)
+			if assigned[slotIndex] {
 				return nil, fmt.Errorf(
 					"decode route version %d: slot %d is assigned more than once",
 					model.Version,
 					slot,
 				)
 			}
-			assigned[slot] = true
+			assigned[slotIndex] = true
 			assignedCount++
 		}
 		sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })

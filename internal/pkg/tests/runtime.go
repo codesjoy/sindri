@@ -37,20 +37,27 @@ func NewRuntime(t testing.TB, values map[string]any) *Runtime {
 	return &Runtime{manager: manager}
 }
 
+// NewClient reports that the test runtime has no transport clients.
 func (*Runtime) NewClient(context.Context, string) (transportclient.Client, error) {
 	return nil, errors.New("test runtime: client is unavailable")
 }
 
+// Config returns the in-memory configuration manager.
 func (r *Runtime) Config() *config.Manager { return r.manager }
 
+// Logger returns a discard-backed logger for tests.
 func (*Runtime) Logger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// TracerProvider returns a no-op tracer provider for tests.
 func (*Runtime) TracerProvider() trace.TracerProvider { return tracenoop.NewTracerProvider() }
 
+// MeterProvider returns a no-op meter provider for tests.
 func (*Runtime) MeterProvider() metric.MeterProvider { return metricnoop.NewMeterProvider() }
 
+// Identity returns the zero runtime identity used by tests.
 func (*Runtime) Identity() yggdrasil.Identity { return yggdrasil.Identity{} }
 
+// Lookup reports that dependency lookup is unavailable in the test runtime.
 func (*Runtime) Lookup(any) error { return errors.New("test runtime: lookup is unavailable") }

@@ -1,3 +1,4 @@
+// Package task runs the sequence node background tick scheduler.
 package task
 
 import (
@@ -8,15 +9,19 @@ import (
 	"time"
 )
 
+// Config contains ticker timing configuration.
 type Config struct {
 	BaseTickInterval time.Duration `mapstructure:"base_tick_interval"`
 	HeartbeatTicks   int64         `mapstructure:"heartbeat_ticks"`
 }
 
+// TickType identifies a scheduled node task.
 type TickType int
 
 const (
-	TickBase      TickType = 0
+	// TickBase schedules the base allocation tick.
+	TickBase TickType = 0
+	// TickHeartbeat schedules the node heartbeat tick.
 	TickHeartbeat TickType = 1
 )
 
@@ -25,6 +30,7 @@ type tickSchedule struct {
 	interval int64
 }
 
+// NodeLifecycle is the node manager contract used by Ticker.
 type NodeLifecycle interface {
 	Heartbeat()
 	BaseTick()
@@ -33,6 +39,7 @@ type NodeLifecycle interface {
 	Pause()
 }
 
+// Ticker drives node heartbeats and allocation ticks.
 type Ticker struct {
 	baseTickInterval time.Duration
 	schedules        []tickSchedule
@@ -46,6 +53,7 @@ type Ticker struct {
 	stopOnce  sync.Once
 }
 
+// NewTicker constructs a ticker from timing configuration and node manager.
 func NewTicker(cfg Config, nodeManager NodeLifecycle) *Ticker {
 	ticker := &Ticker{
 		baseTickInterval: cfg.BaseTickInterval,
@@ -60,6 +68,7 @@ func NewTicker(cfg Config, nodeManager NodeLifecycle) *Ticker {
 	return ticker
 }
 
+// Serve runs the ticker until it is stopped.
 func (t *Ticker) Serve() error {
 	if !t.serving.CompareAndSwap(false, true) {
 		return errors.New("sequence ticker: Serve may only be called once")
@@ -86,6 +95,7 @@ func (t *Ticker) Serve() error {
 	}
 }
 
+// Stop requests ticker shutdown and waits for Serve to exit.
 func (t *Ticker) Stop(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("sequence ticker: stop context is required")

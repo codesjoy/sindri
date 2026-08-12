@@ -14,6 +14,7 @@ import (
 )
 
 const (
+	// DefaultStep is the default number of IDs reserved per range.
 	DefaultStep int64 = 100
 	MinStep     int64 = 10
 	MaxStep     int64 = 1000
@@ -31,6 +32,7 @@ const (
 	StateReady
 )
 
+// SequenceRepo persists ranges reserved for sequence keys.
 type SequenceRepo interface {
 	ReserveRange(ctx context.Context, key string, step int64) (SequenceRange, error)
 }
@@ -139,12 +141,14 @@ func (k *keyState) touch() {
 	k.lastUsed.Store(time.Now().Unix())
 }
 
+// PrepareApply describes a route update scheduled for a future tick.
 type PrepareApply struct {
 	Version   int64
 	ApplyTick int64
 	Slots     []uint32
 }
 
+// Allocator allocates monotonically increasing IDs from reserved ranges.
 type Allocator struct {
 	state atomic.Uint32
 
@@ -199,6 +203,7 @@ func (obj *Allocator) FetchNext(ctx context.Context, key string) (int64, error) 
 	return id, nil
 }
 
+// CurrentVersion returns the version of the active route.
 func (obj *Allocator) CurrentVersion() int64 {
 	obj.slotsMu.RLock()
 	defer obj.slotsMu.RUnlock()
@@ -213,6 +218,7 @@ func (obj *Allocator) Pause() {
 // Paused reports whether allocation is currently disabled.
 func (obj *Allocator) Paused() bool { return obj.state.Load() == StatePaused }
 
+// Open schedules a route for activation while reopening allocation.
 func (obj *Allocator) Open(version int64, applyTick int64, slots []uint32) {
 	obj.slotsMu.Lock()
 	defer obj.slotsMu.Unlock()
@@ -225,6 +231,7 @@ func (obj *Allocator) Open(version int64, applyTick int64, slots []uint32) {
 	obj.state.Store(StateReady)
 }
 
+// CommitRoute schedules a route for activation on the next allocation tick.
 func (obj *Allocator) CommitRoute(version int64, applyTick int64, slots []uint32) {
 	obj.slotsMu.Lock()
 	defer obj.slotsMu.Unlock()

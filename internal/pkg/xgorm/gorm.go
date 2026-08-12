@@ -19,8 +19,10 @@ import (
 )
 
 const (
+	// DriverPostgres identifies the PostgreSQL database driver.
 	DriverPostgres = "postgres"
-	DriverMySQL    = "mysql"
+	// DriverMySQL identifies the MySQL database driver.
+	DriverMySQL = "mysql"
 )
 
 // Config is the process-local database configuration contract. Expected
@@ -135,11 +137,11 @@ func New(rt yggdrasil.Runtime, cfg Config) (*Database, error) {
 	}
 	databaseName, account, err := resolveIdentity(context.Background(), db, driver)
 	if err != nil {
-		_ = close(db)
+		_ = closeDatabase(db)
 		return nil, fmt.Errorf("resolve database identity: %w", err)
 	}
 	if databaseName != cfg.ExpectedDatabase || account != cfg.ExpectedAccount {
-		_ = close(db)
+		_ = closeDatabase(db)
 		return nil, fmt.Errorf(
 			"database identity is %s/%s, expected %s/%s",
 			databaseName,
@@ -184,10 +186,10 @@ func (d *Database) Close() error {
 	if d == nil {
 		return nil
 	}
-	return close(d.DB)
+	return closeDatabase(d.DB)
 }
 
-func close(db *gormio.DB) error {
+func closeDatabase(db *gormio.DB) error {
 	if db == nil {
 		return nil
 	}

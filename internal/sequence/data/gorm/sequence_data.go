@@ -12,18 +12,21 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+// SequenceModel stores a reserved sequence range in the owner database.
 type SequenceModel struct {
 	SequenceKey string    `gorm:"column:sequence_key;size:256;primaryKey"`
 	MaxID       int64     `gorm:"column:max_id;not null"`
 	UpdatedAt   time.Time `gorm:"column:updated_at;not null"`
 }
 
+// TableName returns the sequence range table name.
 func (SequenceModel) TableName() string { return "sequence_ranges" }
 
 type sequenceData struct {
 	db *gorm.DB
 }
 
+// NewSequenceData constructs the sequence repository backed by db.
 func NewSequenceData(db *gorm.DB) biz.SequenceRepo {
 	return &sequenceData{db: db}
 }
