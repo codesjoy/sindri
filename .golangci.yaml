@@ -1,0 +1,115 @@
+# Default profile excludes generated Go files.
+# Use INCLUDE_GENERATED=1 in make targets to include generated files.
+version: "2"
+
+linters:
+  default: none
+  enable:
+    # basic checks
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+
+    # style
+    - revive
+    - unconvert
+    - gocritic
+
+    # security
+    - gosec
+
+    # concurrency
+    - bodyclose
+    - noctx
+  settings:
+    gosec:
+      excludes:
+        - G115
+    revive:
+      rules:
+        # Enforce GoDoc comments for exported identifiers.
+        - name: exported
+        - name: unused-parameter
+          disabled: true
+  exclusions:
+    generated: strict
+    paths:
+      - '(^|/).*\.pb\.go$'
+      - '(^|/).*\.pb\.gw\.go$'
+      - '(^|/).*\.gen\.go$'
+      - '(^|/).*_gen\.go$'
+      - '(^|/).*_generated\.go$'
+      - '(^|/)zz_generated.*\.go$'
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - noctx
+      # Don't require GoDoc comments in *_test.go.
+      - path: _test\.go
+        linters:
+          - revive
+        text: "exported (.+) should have comment"
+      # app/ assembly packages are wired across internal subpackages, but they
+      # are not a public API surface.
+      - path: internal/.*/app/
+        linters:
+          - revive
+        text: "exported (.+) should have comment"
+      # biz aggregate enums are grouped const blocks whose type carries the
+      # doc comment; per-const comments would just repeat the type name.
+      - path: internal/.*/biz/
+        linters:
+          - revive
+        text: "exported const .* should have comment"
+      # wire provider sets and helper providers in app/providers.go are only
+      # referenced from wire.go (wireinject build tag) and wire_gen.go
+      # (excluded as *_gen.go). They look unused to the linter otherwise.
+      - path: internal/.*/app/providers.go
+        linters:
+          - unused
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G402:"
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G104:"
+      # tools/ holds developer/CI CLI utilities (migrator, contract/baseline
+      # checkers, smoke). They walk workspace files by path, spawn subprocesses
+      # (buf), and build SQL from fixed owner table names by design. gosec's
+      # filesystem/subprocess/SQL/perm rules fire non-deterministically across
+      # these and are false positives for local tooling, so the whole linter is
+      # silenced here; real attack surface lives in the networked services under
+      # internal/ and cmd/, where gosec stays enabled.
+      - path: ^tools/
+        linters:
+          - gosec
+      # contracttest loads fixture files by caller-supplied paths by design.
+      - path: internal/shared/contracttest/
+        linters:
+          - gosec
+        text: "G304:"
+      - path: _test\.go
+        linters:
+          - revive
+        text: "unused-parameter:"
+
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+    - goimports
+    - golines
+  exclusions:
+    generated: strict
+    paths:
+      - '(^|/).*\.pb\.go$'
+      - '(^|/).*\.pb\.gw\.go$'
+      - '(^|/).*\.gen\.go$'
+      - '(^|/).*_gen\.go$'
+      - '(^|/).*_generated\.go$'
+      - '(^|/)zz_generated.*\.go$'

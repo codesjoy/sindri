@@ -1,0 +1,13 @@
+.git
+.idea
+artifacts
+bin
+web/console/node_modules
+web/console/dist
+web/console/test-results
+**/artifacts
+**/bin
+**/node_modules
+**/dist
+**/test-results
+deploy/docker/certs

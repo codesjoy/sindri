@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package codesjoy.skuld.reason;
+
+import "codesjoy/reason/v1/reason.proto";
+
+option go_package = "skuld/reason;reason";
+
+enum Reason {
+  option (codesjoy.reason.v1.default_reason) = 10000;
+
+  REASON_UNSPECIFIED = 0;
+
+  SEQUENCE_ALLOCATOR_PAUSED = 150 [(codesjoy.reason.v1.code) = UNAVAILABLE];
+  SEQUENCE_SLOT_NOT_OWNER = 151 [(codesjoy.reason.v1.code) = FAILED_PRECONDITION];
+  SEQUENCE_ROUTE_EXPIRED = 152 [(codesjoy.reason.v1.code) = FAILED_PRECONDITION];
+  SEQUENCE_ROUTE_UNAVAILABLE = 154 [(codesjoy.reason.v1.code) = FAILED_PRECONDITION];
+}

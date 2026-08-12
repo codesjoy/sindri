@@ -1,0 +1,15 @@
+.pnpm-store/
+__pycache__/
+*.py[cod]
+.idea/
+artifacts/
+bin/
+configs/bootstrap.local.yaml
+deploy/seed.local.yaml
+deploy/seed-password.local.txt
+deploy/docker/certs/heimdall.localhost*.pem
+deploy/docker/certs/mtls/*
+!deploy/docker/certs/mtls/.gitkeep
+deploy/docker/traefik/dynamic/tls.yaml
+# G1B smoke/evidence output never belongs in version control.
+artifacts/foundation/

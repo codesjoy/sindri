@@ -1,0 +1,29 @@
+version: v2
+
+modules:
+  - path: ./skuld
+    name: buf.build/codesjoy/skuld
+
+lint:
+  use:
+    - STANDARD
+  except:
+    - PACKAGE_DIRECTORY_MATCH
+    - RPC_REQUEST_RESPONSE_UNIQUE
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+    - SERVICE_SUFFIX
+    - ENUM_VALUE_PREFIX
+    - ENUM_ZERO_VALUE_SUFFIX
+  ignore_only:
+    PACKAGE_VERSION_SUFFIX:
+      - skuld/common/reason.proto
+
+breaking:
+  use:
+    - FILE
+
+deps:
+  - buf.build/googleapis/googleapis
+  - buf.build/bufbuild/protovalidate
+  - buf.build/codesjoy/reason
