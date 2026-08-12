@@ -252,6 +252,7 @@ func (obj *Allocator) commitRoute(version int64, applyTick int64, slots []uint32
 	prepareApply := &PrepareApply{
 		Version:   version,
 		ApplyTick: applyTick,
+		Slots:     []uint32{},
 	}
 	for _, slot := range slots {
 		if _, ok := obj.slots[slot]; !ok {
@@ -259,11 +260,12 @@ func (obj *Allocator) commitRoute(version int64, applyTick int64, slots []uint32
 		}
 	}
 
-	if len(prepareApply.Slots) > 0 {
+	// A route version must be applied even when this node's slot set is
+	// unchanged (or empty). Consumers use the allocator version as the
+	// handoff barrier, so leaving prepareApply unset would make them wait
+	// forever after skipping an intermediate route snapshot.
+	if version > obj.version {
 		obj.prepareApply = prepareApply
-	}
-
-	if len(needDel) > 0 || len(prepareApply.Slots) > 0 {
 		obj.logger.Info(
 			"slot change",
 			slog.Int64("version", version),

@@ -121,15 +121,20 @@ func TestGetRouteResponses(t *testing.T) {
 	assert.True(t, xerror.IsReason(err, reason.Reason_SEQUENCE_ROUTE_UNAVAILABLE))
 
 	svc, _, _ := readyService(t, "orders")
-	unchanged, err := svc.GetRoute(
-		context.Background(),
-		&sequencev1.GetRouteRequest{KnownVersion: 2},
-	)
-	require.NoError(t, err)
-	assert.True(t, unchanged.NotModified)
-	assert.Nil(t, unchanged.Route)
+	for _, knownVersion := range []int64{2, 3} {
+		response, responseErr := svc.GetRoute(
+			context.Background(),
+			&sequencev1.GetRouteRequest{KnownVersion: knownVersion},
+		)
+		require.NoError(t, responseErr)
+		assert.True(t, response.NotModified)
+		assert.Nil(t, response.Route)
+	}
 
-	current, err := svc.GetRoute(context.Background(), &sequencev1.GetRouteRequest{})
+	current, err := svc.GetRoute(
+		context.Background(),
+		&sequencev1.GetRouteRequest{KnownVersion: 1},
+	)
 	require.NoError(t, err)
 	require.NotNil(t, current.Route)
 	assert.Equal(t, int64(2), current.Route.Version)

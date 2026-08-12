@@ -11,8 +11,10 @@ import (
 	sequencev1 "github.com/codesjoy/skuld/gen/go/sequence/v1"
 	"github.com/codesjoy/yggdrasil/v3/rpc/interceptor"
 	"github.com/codesjoy/yggdrasil/v3/rpc/metadata"
+	"github.com/codesjoy/yggdrasil/v3/rpc/status"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/genproto/googleapis/rpc/code"
 )
 
 func TestSequenceInterceptorRefreshesAndRetriesRouteErrorOnce(t *testing.T) {
@@ -43,7 +45,11 @@ func TestSequenceInterceptorRefreshesAndRetriesRouteErrorOnce(t *testing.T) {
 			require.Equal(t, SlotForKey("orders"), slot)
 			if calls == 1 {
 				response.(*sequencev1.FetchNextResponse).Id = 999
-				return xerror.NewWithReason(reason.Reason_SEQUENCE_ROUTE_EXPIRED, "stale", nil)
+				return status.FromError(xerror.NewWithReason(
+					reason.Reason_SEQUENCE_ROUTE_EXPIRED,
+					"stale",
+					nil,
+				))
 			}
 			require.Zero(t, response.(*sequencev1.FetchNextResponse).GetId())
 			response.(*sequencev1.FetchNextResponse).Id = 42
@@ -53,6 +59,65 @@ func TestSequenceInterceptorRefreshesAndRetriesRouteErrorOnce(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(42), reply.GetId())
 	assert.Equal(t, 2, calls)
+	assert.Equal(t, 2, loads)
+}
+
+func TestSequenceInterceptorRefreshesAndRetriesUnavailableOnce(t *testing.T) {
+	var loads int
+	router, err := NewRouter(func(
+		_ context.Context,
+		known int64,
+	) (*sequencev1.GetRouteResponse, error) {
+		loads++
+		return &sequencev1.GetRouteResponse{Route: testRoute(known+1, "node-a")}, nil
+	})
+	require.NoError(t, err)
+	middleware := newUnaryClientInterceptor(router)
+	calls := 0
+	err = middleware(
+		context.Background(),
+		fetchNextFullMethod,
+		&sequencev1.FetchNextRequest{Key: "orders"},
+		&sequencev1.FetchNextResponse{},
+		func(context.Context, string, any, any) error {
+			calls++
+			return xerror.New(code.Code_UNAVAILABLE, "owner unavailable")
+		},
+	)
+	require.Error(t, err)
+	assert.True(t, xerror.IsCode(err, code.Code_UNAVAILABLE))
+	assert.Equal(t, 2, calls)
+	assert.Equal(t, 2, loads)
+}
+
+func TestSequenceInterceptorReturnsRefreshFailureAfterUnavailable(t *testing.T) {
+	wantErr := errors.New("refresh failed")
+	loads := 0
+	router, err := NewRouter(func(
+		context.Context,
+		int64,
+	) (*sequencev1.GetRouteResponse, error) {
+		loads++
+		if loads == 1 {
+			return &sequencev1.GetRouteResponse{Route: testRoute(1, "node-a")}, nil
+		}
+		return nil, wantErr
+	})
+	require.NoError(t, err)
+	middleware := newUnaryClientInterceptor(router)
+	calls := 0
+	err = middleware(
+		context.Background(),
+		fetchNextFullMethod,
+		&sequencev1.FetchNextRequest{Key: "orders"},
+		&sequencev1.FetchNextResponse{},
+		func(context.Context, string, any, any) error {
+			calls++
+			return xerror.New(code.Code_UNAVAILABLE, "owner unavailable")
+		},
+	)
+	require.ErrorIs(t, err, wantErr)
+	assert.Equal(t, 1, calls)
 	assert.Equal(t, 2, loads)
 }
 
@@ -77,6 +142,44 @@ func TestSequenceInterceptorDoesNotRetryNonRouteErrors(t *testing.T) {
 	)
 	require.ErrorIs(t, err, wantErr)
 	assert.Equal(t, 1, calls)
+}
+
+func TestSequenceInterceptorDoesNotRetryTerminalErrors(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		err  error
+	}{
+		{name: "cancelled", err: xerror.New(code.Code_CANCELLED, "cancelled")},
+		{name: "deadline", err: xerror.New(code.Code_DEADLINE_EXCEEDED, "deadline")},
+		{name: "validation", err: xerror.New(code.Code_INVALID_ARGUMENT, "invalid")},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			loads := 0
+			router, err := NewRouter(func(
+				context.Context,
+				int64,
+			) (*sequencev1.GetRouteResponse, error) {
+				loads++
+				return &sequencev1.GetRouteResponse{Route: testRoute(1, "node-a")}, nil
+			})
+			require.NoError(t, err)
+			middleware := newUnaryClientInterceptor(router)
+			calls := 0
+			err = middleware(
+				context.Background(),
+				fetchNextFullMethod,
+				&sequencev1.FetchNextRequest{Key: "orders"},
+				&sequencev1.FetchNextResponse{},
+				func(context.Context, string, any, any) error {
+					calls++
+					return testCase.err
+				},
+			)
+			require.ErrorIs(t, err, testCase.err)
+			assert.Equal(t, 1, calls)
+			assert.Equal(t, 1, loads)
+		})
+	}
 }
 
 func TestSequenceInterceptorPassesOtherMethodsThrough(t *testing.T) {

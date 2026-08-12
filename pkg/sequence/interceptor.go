@@ -10,6 +10,7 @@ import (
 	sequencev1 "github.com/codesjoy/skuld/gen/go/sequence/v1"
 	"github.com/codesjoy/yggdrasil/v3/rpc/interceptor"
 	"github.com/codesjoy/yggdrasil/v3/rpc/metadata"
+	"google.golang.org/genproto/googleapis/rpc/code"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -75,7 +76,8 @@ func invokeFetchNext(
 
 func isRefreshableRouteError(err error) bool {
 	return xerror.IsReason(err, reason.Reason_SEQUENCE_ROUTE_EXPIRED) ||
-		xerror.IsReason(err, reason.Reason_SEQUENCE_SLOT_NOT_OWNER)
+		xerror.IsReason(err, reason.Reason_SEQUENCE_SLOT_NOT_OWNER) ||
+		xerror.IsCode(err, code.Code_UNAVAILABLE)
 }
 
 // NewUnaryClientInterceptorProvider constructs the sequence routing interceptor provider.

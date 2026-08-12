@@ -2,6 +2,7 @@ package biz
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"testing"
 )
@@ -108,5 +109,74 @@ func TestKeyStateRejectsInvalidReservedRange(t *testing.T) {
 		10,
 	); err == nil {
 		t.Fatal("expected invalid reserved range error")
+	}
+}
+
+func TestAllocatorAppliesRouteVersionWithoutNewSlots(t *testing.T) {
+	tests := []struct {
+		name   string
+		routes []struct {
+			version int64
+			slots   []uint32
+			apply   bool
+		}
+		wantVersion int64
+	}{
+		{
+			name: "unchanged slots",
+			routes: []struct {
+				version int64
+				slots   []uint32
+				apply   bool
+			}{
+				{version: 1, slots: []uint32{1}, apply: true},
+				{version: 2, slots: []uint32{1}, apply: true},
+			},
+			wantVersion: 2,
+		},
+		{
+			name: "empty slots",
+			routes: []struct {
+				version int64
+				slots   []uint32
+				apply   bool
+			}{
+				{version: 1, slots: []uint32{1}, apply: true},
+				{version: 2, apply: true},
+			},
+			wantVersion: 2,
+		},
+		{
+			name: "skipped intermediate snapshot",
+			routes: []struct {
+				version int64
+				slots   []uint32
+				apply   bool
+			}{
+				{version: 1, slots: []uint32{1}, apply: true},
+				{version: 2, slots: []uint32{1}},
+				{version: 3, slots: []uint32{1}, apply: true},
+			},
+			wantVersion: 3,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			allocator := NewAllocator(
+				&AllocatorConfig{Step: 10},
+				&rangeStore{max: make(map[string]int64)},
+				slog.Default(),
+			)
+			for _, route := range test.routes {
+				allocator.CommitRoute(route.version, 0, route.slots)
+				if route.apply {
+					allocator.ApplyRoute(0)
+				}
+			}
+			if got := allocator.CurrentVersion(); got != test.wantVersion {
+				t.Fatalf("route version = %d, want %d", got, test.wantVersion)
+			}
+		})
 	}
 }

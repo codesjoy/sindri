@@ -34,6 +34,7 @@ type remoteEndpoint struct {
 type sequenceBalancer struct {
 	cli    balancer.Client
 	router *Router
+	next   atomic.Uint64
 
 	mu          sync.RWMutex
 	remotes     map[string]*remoteEndpoint
@@ -201,7 +202,11 @@ func (b *sequenceBalancer) buildStateLocked() (remote.State, balancer.Picker) {
 			slots[slot] = client
 		}
 	}
-	return connectivity, &sequencePicker{slots: slots, control: controlClients}
+	return connectivity, &sequencePicker{
+		slots:   slots,
+		control: controlClients,
+		next:    &b.next,
+	}
 }
 
 func (b *sequenceBalancer) Close() error {
@@ -237,7 +242,7 @@ func (b *sequenceBalancer) Close() error {
 type sequencePicker struct {
 	slots   []remote.Client
 	control []remote.Client
-	next    atomic.Uint64
+	next    *atomic.Uint64
 }
 
 func (p *sequencePicker) Next(info balancer.RPCInfo) (balancer.PickResult, error) {
@@ -260,9 +265,9 @@ func (p *sequencePicker) Next(info balancer.RPCInfo) (balancer.PickResult, error
 	}
 	if int(slot) >= len(p.slots) || p.slots[slot] == nil {
 		return nil, fmt.Errorf(
-			"slot %d has no ready owner: %w",
+			"%w: slot %d has no ready owner",
+			ErrRouteUnavailable,
 			slot,
-			balancer.ErrNoAvailableInstance,
 		)
 	}
 	return pickedRemote{client: p.slots[slot]}, nil

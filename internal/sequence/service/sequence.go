@@ -93,7 +93,7 @@ func (s *SequenceService) GetRoute(
 			nil,
 		)
 	}
-	if req.GetKnownVersion() == route.Version {
+	if req.GetKnownVersion() >= route.Version {
 		return &sequencev1.GetRouteResponse{NotModified: true}, nil
 	}
 	out := &sequencev1.RouteSnapshot{

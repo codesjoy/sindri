@@ -65,7 +65,7 @@ func TestSequenceBalancerControlPlaneAndInvalidOwners(t *testing.T) {
 		Ctx:    WithSlot(context.Background(), 0),
 		Method: fetchNextFullMethod,
 	})
-	require.ErrorIs(t, err, balancer.ErrNoAvailableInstance)
+	require.ErrorIs(t, err, ErrRouteUnavailable)
 
 	seen := map[any]bool{}
 	for range 3 {
@@ -77,6 +77,23 @@ func TestSequenceBalancerControlPlaneAndInvalidOwners(t *testing.T) {
 		seen[result.RemoteClient()] = true
 	}
 	assert.Len(t, seen, 3)
+
+	first, err := client.picker().Next(balancer.RPCInfo{
+		Ctx:    context.Background(),
+		Method: getRouteFullMethod,
+	})
+	require.NoError(t, err)
+	b.UpdateState(resolver.BaseState{Endpoints: []resolver.Endpoint{
+		testEndpoint("a:1", "node-a"),
+		testEndpoint("a:2", "node-a"),
+		testEndpoint("unknown:1", ""),
+	}})
+	second, err := client.picker().Next(balancer.RPCInfo{
+		Ctx:    context.Background(),
+		Method: getRouteFullMethod,
+	})
+	require.NoError(t, err)
+	assert.NotSame(t, first.RemoteClient(), second.RemoteClient())
 
 	_, err = client.picker().Next(balancer.RPCInfo{
 		Ctx:    context.Background(),

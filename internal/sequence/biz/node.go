@@ -68,7 +68,12 @@ func (m *NodeManager) Heartbeat() {
 	paused := m.allocator.Paused()
 	route, err := m.routeRepo.GetNewerRoute(ctx, m.route.Version())
 	if err != nil {
-		m.logger.Error("sequence heartbeat failed", slog.Any("err", err))
+		m.logger.Error(
+			"sequence heartbeat failed",
+			slog.Any("err", err),
+			slog.Int64("elapsed", m.heartbeatElapsed),
+			slog.Bool("paused", paused),
+		)
 		return
 	}
 
