@@ -34,6 +34,8 @@ app:
       step_increase_threshold: 15m
       step_decrease_threshold: 30m
       reserve_timeout: 1s
+      idle_timeout: 24h
+      cleanup_interval: 10m
     node:
       id: "${SKULD_SEQUENCE_NODE_ID}"
       heartbeat_timeout_ticks: 3

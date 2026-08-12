@@ -29,6 +29,12 @@ const (
 	DefaultStepDecreaseThreshold = 30 * time.Minute
 	// DefaultReserveTimeout bounds each asynchronous range reservation.
 	DefaultReserveTimeout = time.Second
+	// DefaultIdleTimeout evicts key state that has not allocated an ID for a day.
+	DefaultIdleTimeout = 24 * time.Hour
+	// DefaultCleanupInterval checks for idle key state every ten minutes.
+	DefaultCleanupInterval = 10 * time.Minute
+
+	maxCleanupCandidates = 1024
 )
 
 // AllocatorConfig contains immutable range allocation settings.
@@ -41,6 +47,8 @@ type AllocatorConfig struct {
 	StepIncreaseThreshold time.Duration `mapstructure:"step_increase_threshold"`
 	StepDecreaseThreshold time.Duration `mapstructure:"step_decrease_threshold"`
 	ReserveTimeout        time.Duration `mapstructure:"reserve_timeout"`
+	IdleTimeout           time.Duration `mapstructure:"idle_timeout"`
+	CleanupInterval       time.Duration `mapstructure:"cleanup_interval"`
 }
 
 func (c *AllocatorConfig) setDefaults() {
@@ -61,6 +69,12 @@ func (c *AllocatorConfig) setDefaults() {
 	}
 	if c.ReserveTimeout == 0 {
 		c.ReserveTimeout = DefaultReserveTimeout
+	}
+	if c.IdleTimeout == 0 {
+		c.IdleTimeout = DefaultIdleTimeout
+	}
+	if c.CleanupInterval == 0 {
+		c.CleanupInterval = DefaultCleanupInterval
 	}
 }
 
@@ -96,6 +110,7 @@ type keyState struct {
 	generation  atomic.Uint64
 	initialized atomic.Bool
 	lastUsed    atomic.Int64
+	returned    atomic.Int64
 
 	mu          sync.Mutex
 	activeStep  int64
@@ -218,6 +233,7 @@ func (k *keyState) afterAllocate(
 	id int64,
 	generation uint64,
 ) {
+	k.recordReturned(id)
 	k.touch(now())
 	start := k.start.Load()
 	end := k.end.Load()
@@ -364,7 +380,30 @@ func (k *keyState) inActiveRange(id int64) bool {
 }
 
 func (k *keyState) touch(now time.Time) {
-	k.lastUsed.Store(now.Unix())
+	k.lastUsed.Store(now.UnixNano())
+}
+
+func (k *keyState) recordReturned(id int64) {
+	for current := k.returned.Load(); id > current; current = k.returned.Load() {
+		if k.returned.CompareAndSwap(current, id) {
+			return
+		}
+	}
+}
+
+type cleanupCandidate struct {
+	slotID uint32
+	slot   *sync.Map
+	key    string
+	state  *keyState
+}
+
+type cleanupStats struct {
+	scanned          int
+	evicted          int
+	inflight         int
+	discardedActive  int64
+	discardedStandby int64
 }
 
 // PrepareApply describes a route update scheduled for a future tick.
@@ -387,6 +426,7 @@ type Allocator struct {
 	now   func() time.Time
 
 	prepareApply *PrepareApply
+	lastCleanup  atomic.Int64
 
 	logger *slog.Logger
 }
@@ -431,6 +471,120 @@ func (obj *Allocator) FetchNext(ctx context.Context, key string) (int64, error) 
 		return 0, err
 	}
 	return id, nil
+}
+
+func (obj *Allocator) cleanupIdle() {
+	now := obj.now()
+	lastCleanup := obj.lastCleanup.Load()
+	if lastCleanup != 0 && now.Sub(time.Unix(0, lastCleanup)) < obj.cfg.CleanupInterval {
+		return
+	}
+	if !obj.lastCleanup.CompareAndSwap(lastCleanup, now.UnixNano()) {
+		return
+	}
+
+	cutoff := now.Add(-obj.cfg.IdleTimeout).UnixNano()
+	candidates, scanned := obj.collectIdleCandidates(cutoff)
+	stats := obj.evictIdleCandidates(candidates, cutoff)
+	stats.scanned = scanned
+	obj.logger.Info(
+		"cleaned idle sequence key state",
+		slog.Int("scanned", stats.scanned),
+		slog.Int("evicted", stats.evicted),
+		slog.Int("inflight", stats.inflight),
+		slog.Int64("discarded_active", stats.discardedActive),
+		slog.Int64("discarded_standby", stats.discardedStandby),
+	)
+}
+
+func (obj *Allocator) collectIdleCandidates(cutoff int64) ([]cleanupCandidate, int) {
+	obj.slotsMu.RLock()
+	slots := make([]cleanupCandidate, 0, len(obj.slots))
+	for slotID, slot := range obj.slots {
+		slots = append(slots, cleanupCandidate{slotID: slotID, slot: slot})
+	}
+	obj.slotsMu.RUnlock()
+
+	candidates := make([]cleanupCandidate, 0, maxCleanupCandidates)
+	scanned := 0
+	for _, ownedSlot := range slots {
+		ownedSlot.slot.Range(func(key, value any) bool {
+			scanned++
+			state, ok := value.(*keyState)
+			if !ok || state.lastUsed.Load() > cutoff {
+				return true
+			}
+			keyString, ok := key.(string)
+			if !ok {
+				return true
+			}
+			candidates = append(candidates, cleanupCandidate{
+				slotID: ownedSlot.slotID,
+				slot:   ownedSlot.slot,
+				key:    keyString,
+				state:  state,
+			})
+			return len(candidates) < maxCleanupCandidates
+		})
+		if len(candidates) >= maxCleanupCandidates {
+			break
+		}
+	}
+	return candidates, scanned
+}
+
+func (obj *Allocator) evictIdleCandidates(
+	candidates []cleanupCandidate,
+	cutoff int64,
+) cleanupStats {
+	var stats cleanupStats
+	for _, candidate := range candidates {
+		obj.slotsMu.Lock()
+		currentSlot, owned := obj.slots[candidate.slotID]
+		if !owned || currentSlot != candidate.slot {
+			obj.slotsMu.Unlock()
+			continue
+		}
+		currentState, loaded := currentSlot.Load(candidate.key)
+		if !loaded || currentState != candidate.state || candidate.state.lastUsed.Load() > cutoff {
+			obj.slotsMu.Unlock()
+			continue
+		}
+
+		candidate.state.mu.Lock()
+		if candidate.state.lastUsed.Load() > cutoff {
+			candidate.state.mu.Unlock()
+			obj.slotsMu.Unlock()
+			continue
+		}
+		if candidate.state.fetch != nil {
+			stats.inflight++
+			candidate.state.mu.Unlock()
+			obj.slotsMu.Unlock()
+			continue
+		}
+
+		if candidate.state.initialized.Load() {
+			returned := candidate.state.returned.Load()
+			start := candidate.state.start.Load()
+			end := candidate.state.end.Load()
+			if returned < start {
+				returned = start - 1
+			}
+			if returned < end {
+				stats.discardedActive += end - returned
+			}
+		}
+		if candidate.state.standby != nil {
+			stats.discardedStandby += candidate.state.standby.End -
+				candidate.state.standby.Start + 1
+		}
+		currentSlot.Delete(candidate.key)
+		stats.evicted++
+		candidate.state.mu.Unlock()
+		obj.slotsMu.Unlock()
+	}
+	return stats
 }
 
 // CurrentVersion returns the version of the active route.

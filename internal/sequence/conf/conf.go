@@ -62,6 +62,12 @@ func setAllocatorDefaults(cfg *biz.AllocatorConfig, values map[string]any) {
 	if _, ok := values["reserve_timeout"]; !ok {
 		cfg.ReserveTimeout = biz.DefaultReserveTimeout
 	}
+	if _, ok := values["idle_timeout"]; !ok {
+		cfg.IdleTimeout = biz.DefaultIdleTimeout
+	}
+	if _, ok := values["cleanup_interval"]; !ok {
+		cfg.CleanupInterval = biz.DefaultCleanupInterval
+	}
 }
 
 // SetDefaults applies process defaults before the configuration becomes immutable.
@@ -126,6 +132,17 @@ func (c Config) Validate() error {
 	}
 	if c.Allocator.ReserveTimeout <= 0 {
 		return errors.New("sequence config: allocator.reserve_timeout must be positive")
+	}
+	if c.Allocator.IdleTimeout <= 0 {
+		return errors.New("sequence config: allocator.idle_timeout must be positive")
+	}
+	if c.Allocator.CleanupInterval <= 0 {
+		return errors.New("sequence config: allocator.cleanup_interval must be positive")
+	}
+	if c.Allocator.IdleTimeout < c.Allocator.CleanupInterval {
+		return errors.New(
+			"sequence config: allocator.idle_timeout must not be less than cleanup_interval",
+		)
 	}
 	if c.Node.ID == "" || len(c.Node.ID) > 256 {
 		return errors.New("sequence config: node.id must contain 1..256 bytes")

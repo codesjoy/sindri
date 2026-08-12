@@ -108,6 +108,7 @@ func (m *NodeManager) BaseTick() {
 		m.heartbeatElapsed++
 		m.allocator.ApplyRoute(m.tick)
 	}
+	m.allocator.cleanupIdle()
 }
 
 // TickClock advances the node's logical clock by one tick.

@@ -7,13 +7,12 @@
 package sequencev1
 
 import (
-	reflect "reflect"
-	sync "sync"
-	unsafe "unsafe"
-
 	_ "buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go/buf/validate"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	reflect "reflect"
+	sync "sync"
+	unsafe "unsafe"
 )
 
 const (
@@ -70,7 +69,8 @@ func (x *FetchNextRequest) GetKey() string {
 type FetchNextResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The allocated id. It is strictly increasing per key, but not necessarily
-	// contiguous across process or route ownership changes.
+	// contiguous across process or route ownership changes or idle state
+	// eviction.
 	Id            int64 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

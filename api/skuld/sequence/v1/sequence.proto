@@ -5,7 +5,7 @@ package codesjoy.skuld.sequence.v1;
 import "buf/validate/validate.proto";
 
 // IDs are monotonic per key and may contain gaps
-// after a process restart or route handoff.
+// after a process restart, route handoff, or idle state eviction.
 
 option go_package = "github.com/codesjoy/skuld/gen/go/skuld/sequence/v1;sequencev1";
 
@@ -28,7 +28,8 @@ message FetchNextRequest {
 
 message FetchNextResponse {
   // The allocated id. It is strictly increasing per key, but not necessarily
-  // contiguous across process or route ownership changes.
+  // contiguous across process or route ownership changes or idle state
+  // eviction.
   int64 id = 1;
 }
 

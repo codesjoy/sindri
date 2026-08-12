@@ -158,6 +158,29 @@ type recordingRangeStore struct {
 	err     error
 }
 
+type blockingRangeStore struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingRangeStore) ReserveRange(
+	ctx context.Context,
+	_ string,
+	step int64,
+) (SequenceRange, error) {
+	select {
+	case <-s.started:
+	default:
+		close(s.started)
+	}
+	select {
+	case <-ctx.Done():
+		return SequenceRange{}, ctx.Err()
+	case <-s.release:
+		return SequenceRange{Start: 1, End: step}, nil
+	}
+}
+
 func (s *recordingRangeStore) ReserveRange(
 	ctx context.Context,
 	_ string,
@@ -427,4 +450,301 @@ func TestAllocatorAppliesRouteVersionWithoutNewSlots(t *testing.T) {
 			}
 		})
 	}
+}
+
+func readyAllocatorForCleanup(
+	t *testing.T,
+	store SequenceRepo,
+	clock *fakeClock,
+	key string,
+) *Allocator {
+	t.Helper()
+	allocator := NewAllocator(&AllocatorConfig{
+		DefaultStep:     10,
+		MaxStep:         100,
+		IdleTimeout:     10 * time.Minute,
+		CleanupInterval: time.Minute,
+	}, store, slog.Default())
+	allocator.now = clock.Now
+	allocator.Open(1, 0, []uint32{SlotForKey(key)})
+	allocator.ApplyRoute(0)
+	return allocator
+}
+
+func allocatorKeyState(t *testing.T, allocator *Allocator, key string) (*sync.Map, *keyState) {
+	t.Helper()
+	allocator.slotsMu.RLock()
+	defer allocator.slotsMu.RUnlock()
+	slot := allocator.slots[SlotForKey(key)]
+	require.NotNil(t, slot)
+	value, ok := slot.Load(key)
+	require.True(t, ok)
+	return slot, value.(*keyState)
+}
+
+func TestAllocatorCleanupEvictsIdleStateAndContinuesFromWatermark(t *testing.T) {
+	key := "idle-orders"
+	clock := &fakeClock{now: time.Unix(1000, 0)}
+	store := &rangeStore{max: make(map[string]int64)}
+	allocator := readyAllocatorForCleanup(t, store, clock, key)
+
+	first, err := allocator.FetchNext(context.Background(), key)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), first)
+	oldSlot, oldState := allocatorKeyState(t, allocator, key)
+
+	clock.Advance(11 * time.Minute)
+	allocator.cleanupIdle()
+	_, loaded := oldSlot.Load(key)
+	assert.False(t, loaded)
+
+	next, err := allocator.FetchNext(context.Background(), key)
+	require.NoError(t, err)
+	assert.Equal(t, int64(11), next)
+	_, newState := allocatorKeyState(t, allocator, key)
+	assert.NotSame(t, oldState, newState)
+}
+
+func TestAllocatorCleanupRespectsInterval(t *testing.T) {
+	key := "scheduled-cleanup-orders"
+	clock := &fakeClock{now: time.Unix(1500, 0)}
+	allocator := readyAllocatorForCleanup(
+		t,
+		&rangeStore{max: make(map[string]int64)},
+		clock,
+		key,
+	)
+	slot := allocator.slots[SlotForKey(key)]
+	state := &keyState{}
+	state.lastUsed.Store(clock.Now().Add(-11 * time.Minute).UnixNano())
+	slot.Store(key, state)
+	allocator.lastCleanup.Store(clock.Now().Add(-30 * time.Second).UnixNano())
+
+	allocator.cleanupIdle()
+	_, loaded := slot.Load(key)
+	assert.True(t, loaded)
+
+	clock.Advance(31 * time.Second)
+	allocator.cleanupIdle()
+	_, loaded = slot.Load(key)
+	assert.False(t, loaded)
+}
+
+func TestNodeBaseTickCleansIdleAllocatorState(t *testing.T) {
+	key := "node-cleanup-orders"
+	clock := &fakeClock{now: time.Unix(1750, 0)}
+	allocator := readyAllocatorForCleanup(
+		t,
+		&rangeStore{max: make(map[string]int64)},
+		clock,
+		key,
+	)
+	slot := allocator.slots[SlotForKey(key)]
+	state := &keyState{}
+	state.lastUsed.Store(clock.Now().Add(-11 * time.Minute).UnixNano())
+	slot.Store(key, state)
+	manager := &NodeManager{allocator: allocator, heartbeatTimeout: 3}
+
+	manager.BaseTick()
+	_, loaded := slot.Load(key)
+	assert.False(t, loaded)
+}
+
+func TestAllocatorCleanupReportsDiscardedRanges(t *testing.T) {
+	key := "discarded-orders"
+	clock := &fakeClock{now: time.Unix(2000, 0)}
+	allocator := readyAllocatorForCleanup(
+		t,
+		&rangeStore{max: make(map[string]int64)},
+		clock,
+		key,
+	)
+	slot := allocator.slots[SlotForKey(key)]
+	state := &keyState{standby: &SequenceRange{Start: 11, End: 30}}
+	state.initialized.Store(true)
+	state.start.Store(1)
+	state.end.Store(10)
+	state.returned.Store(3)
+	state.lastUsed.Store(clock.Now().Add(-11 * time.Minute).UnixNano())
+	slot.Store(key, state)
+
+	candidates, scanned := allocator.collectIdleCandidates(
+		clock.Now().Add(-10 * time.Minute).UnixNano(),
+	)
+	stats := allocator.evictIdleCandidates(
+		candidates,
+		clock.Now().Add(-10*time.Minute).UnixNano(),
+	)
+
+	assert.Equal(t, 1, scanned)
+	assert.Equal(t, 1, stats.evicted)
+	assert.Equal(t, int64(7), stats.discardedActive)
+	assert.Equal(t, int64(20), stats.discardedStandby)
+}
+
+func TestAllocatorCleanupRechecksRecentUse(t *testing.T) {
+	key := "recent-orders"
+	clock := &fakeClock{now: time.Unix(3000, 0)}
+	allocator := readyAllocatorForCleanup(
+		t,
+		&rangeStore{max: make(map[string]int64)},
+		clock,
+		key,
+	)
+	slot := allocator.slots[SlotForKey(key)]
+	state := &keyState{}
+	state.lastUsed.Store(clock.Now().Add(-11 * time.Minute).UnixNano())
+	slot.Store(key, state)
+	cutoff := clock.Now().Add(-10 * time.Minute).UnixNano()
+	candidates, _ := allocator.collectIdleCandidates(cutoff)
+	require.Len(t, candidates, 1)
+
+	state.touch(clock.Now())
+	stats := allocator.evictIdleCandidates(candidates, cutoff)
+	assert.Zero(t, stats.evicted)
+	_, loaded := slot.Load(key)
+	assert.True(t, loaded)
+}
+
+func TestAllocatorCleanupSkipsInflightFetch(t *testing.T) {
+	key := "inflight-orders"
+	clock := &fakeClock{now: time.Unix(4000, 0)}
+	allocator := readyAllocatorForCleanup(
+		t,
+		&rangeStore{max: make(map[string]int64)},
+		clock,
+		key,
+	)
+	slot := allocator.slots[SlotForKey(key)]
+	state := &keyState{fetch: &rangeFetch{done: make(chan struct{})}}
+	state.lastUsed.Store(clock.Now().Add(-11 * time.Minute).UnixNano())
+	slot.Store(key, state)
+	cutoff := clock.Now().Add(-10 * time.Minute).UnixNano()
+	candidates, _ := allocator.collectIdleCandidates(cutoff)
+
+	stats := allocator.evictIdleCandidates(candidates, cutoff)
+	assert.Equal(t, 1, stats.inflight)
+	assert.Zero(t, stats.evicted)
+	_, loaded := slot.Load(key)
+	assert.True(t, loaded)
+}
+
+func TestAllocatorCleanupIgnoresReplacedSlotMap(t *testing.T) {
+	key := "rerouted-orders"
+	clock := &fakeClock{now: time.Unix(5000, 0)}
+	allocator := readyAllocatorForCleanup(
+		t,
+		&rangeStore{max: make(map[string]int64)},
+		clock,
+		key,
+	)
+	oldSlot := allocator.slots[SlotForKey(key)]
+	oldState := &keyState{}
+	oldState.lastUsed.Store(clock.Now().Add(-11 * time.Minute).UnixNano())
+	oldSlot.Store(key, oldState)
+	cutoff := clock.Now().Add(-10 * time.Minute).UnixNano()
+	candidates, _ := allocator.collectIdleCandidates(cutoff)
+
+	newSlot := &sync.Map{}
+	newState := &keyState{}
+	newSlot.Store(key, newState)
+	allocator.slotsMu.Lock()
+	allocator.slots[SlotForKey(key)] = newSlot
+	allocator.slotsMu.Unlock()
+
+	stats := allocator.evictIdleCandidates(candidates, cutoff)
+	assert.Zero(t, stats.evicted)
+	value, loaded := newSlot.Load(key)
+	assert.True(t, loaded)
+	assert.Same(t, newState, value)
+}
+
+func TestAllocatorCleanupWaitsForAllocationAndRechecksUse(t *testing.T) {
+	key := "blocked-orders"
+	clock := &fakeClock{now: time.Unix(6000, 0)}
+	store := &blockingRangeStore{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	allocator := readyAllocatorForCleanup(t, store, clock, key)
+
+	fetchDone := make(chan error, 1)
+	go func() {
+		_, err := allocator.FetchNext(context.Background(), key)
+		fetchDone <- err
+	}()
+	<-store.started
+
+	cleanupDone := make(chan struct{})
+	go func() {
+		allocator.cleanupIdle()
+		close(cleanupDone)
+	}()
+	select {
+	case <-cleanupDone:
+		t.Fatal("cleanup completed while allocation held the slot read lock")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(store.release)
+	require.NoError(t, <-fetchDone)
+	select {
+	case <-cleanupDone:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not finish after allocation completed")
+	}
+	_, state := allocatorKeyState(t, allocator, key)
+	assert.Equal(t, clock.Now().UnixNano(), state.lastUsed.Load())
+}
+
+func TestAllocatorConcurrentCleanupKeepsIDsUnique(t *testing.T) {
+	key := "concurrent-cleanup-orders"
+	clock := &fakeClock{now: time.Unix(7000, 0)}
+	store := &rangeStore{max: make(map[string]int64)}
+	allocator := readyAllocatorForCleanup(t, store, clock, key)
+	allocator.cfg.IdleTimeout = time.Nanosecond
+	allocator.cfg.CleanupInterval = time.Nanosecond
+
+	const workers = 8
+	const allocations = 100
+	values := make(chan int64, workers*allocations)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range allocations {
+				value, err := allocator.FetchNext(context.Background(), key)
+				if err != nil {
+					errs <- err
+					return
+				}
+				values <- value
+			}
+		}()
+	}
+	cleanupDone := make(chan struct{})
+	go func() {
+		defer close(cleanupDone)
+		for range allocations {
+			clock.Advance(time.Nanosecond)
+			allocator.cleanupIdle()
+		}
+	}()
+	wg.Wait()
+	<-cleanupDone
+	close(values)
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	seen := make(map[int64]struct{}, workers*allocations)
+	for value := range values {
+		_, duplicate := seen[value]
+		assert.False(t, duplicate, "duplicate ID %d", value)
+		seen[value] = struct{}{}
+	}
+	assert.Len(t, seen, workers*allocations)
 }

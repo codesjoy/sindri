@@ -63,6 +63,8 @@ func TestLoadAppliesDefaultsForSupportedDrivers(t *testing.T) {
 				cfg.Allocator.StepDecreaseThreshold,
 			)
 			assert.Equal(t, biz.DefaultReserveTimeout, cfg.Allocator.ReserveTimeout)
+			assert.Equal(t, biz.DefaultIdleTimeout, cfg.Allocator.IdleTimeout)
+			assert.Equal(t, biz.DefaultCleanupInterval, cfg.Allocator.CleanupInterval)
 			assert.Equal(t, int64(3), cfg.Node.HeartbeatTimeoutTicks)
 			assert.Equal(t, time.Second, cfg.Node.RouteQueryTimeout)
 			assert.Equal(t, time.Second, cfg.Ticker.BaseTickInterval)
@@ -180,6 +182,39 @@ func TestLoadRejectsAllocatorAndSchedulingBoundaries(t *testing.T) {
 			name: "negative reserve timeout",
 			values: map[string]any{
 				"allocator": map[string]any{"reserve_timeout": "-1s"},
+			},
+		},
+		{
+			name: "zero idle timeout",
+			values: map[string]any{
+				"allocator": map[string]any{"idle_timeout": "0s"},
+			},
+		},
+		{
+			name: "negative idle timeout",
+			values: map[string]any{
+				"allocator": map[string]any{"idle_timeout": "-1s"},
+			},
+		},
+		{
+			name: "zero cleanup interval",
+			values: map[string]any{
+				"allocator": map[string]any{"cleanup_interval": "0s"},
+			},
+		},
+		{
+			name: "negative cleanup interval",
+			values: map[string]any{
+				"allocator": map[string]any{"cleanup_interval": "-1s"},
+			},
+		},
+		{
+			name: "cleanup interval exceeds idle timeout",
+			values: map[string]any{
+				"allocator": map[string]any{
+					"idle_timeout":     "1m",
+					"cleanup_interval": "2m",
+				},
 			},
 		},
 		{name: "empty node", values: map[string]any{"node": map[string]any{"id": " "}}},
