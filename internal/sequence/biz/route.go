@@ -2,17 +2,19 @@ package biz
 
 import (
 	"context"
-	"hash/crc32"
 	"sync/atomic"
+
+	sequencepkg "github.com/codesjoy/skuld/pkg/sequence"
 )
 
 const (
-	SlotCount = 1 << 14
+	// SlotCount is the fixed number of routing slots.
+	SlotCount = sequencepkg.SlotCount
 )
 
 // SlotForKey hashes the original UTF-8 key bytes into the fixed slot space.
 func SlotForKey(key string) uint32 {
-	return crc32.ChecksumIEEE([]byte(key)) % SlotCount
+	return sequencepkg.SlotForKey(key)
 }
 
 // Route is a complete versioned assignment.
