@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package codesjoy.skuld.sequence.v1;
+
+import "buf/validate/validate.proto";
+
+// IDs are monotonic per key and may contain gaps
+// after a process restart or route handoff.
+
+option go_package = "github.com/codesjoy/skuld/gen/go/skuld/sequence/v1;sequencev1";
+
+service SequenceGenerator {
+  // Allocates the next id for key. route_version is the snapshot used by the
+  // caller; an owner rejects stale or misrouted requests.
+  rpc FetchNext(FetchNextRequest) returns (FetchNextResponse);
+
+  // Returns the active route snapshot. known_version allows a cheap
+  // not-modified response for SDK refresh loops.
+  rpc GetRoute(GetRouteRequest) returns (GetRouteResponse);
+}
+
+message FetchNextRequest {
+  string key = 1 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 256
+  }];
+}
+
+message FetchNextResponse {
+  // The allocated id. It is strictly increasing per key, but not necessarily
+  // contiguous across process or route ownership changes.
+  int64 id = 1;
+}
+
+message GetRouteRequest {
+  int64 known_version = 1;
+}
+
+message GetRouteResponse {
+  bool not_modified = 1;
+  RouteSnapshot route = 2;
+}
+
+message RouteSnapshot {
+  int64 version = 1;
+  repeated RouteNode nodes = 2;
+}
+
+message RouteNode {
+  string node_id = 1;
+  repeated uint32 slots = 2;
+}
