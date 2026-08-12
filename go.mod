@@ -6,12 +6,12 @@ replace github.com/codesjoy/skuld/gen/go => ./gen/go
 
 require (
 	github.com/codesjoy/pkg/basic/transaction/gorm v0.0.0-20260328013517-15736fbea914
-	github.com/codesjoy/pkg/basic/xerror v0.0.0-20260225033528-924cf61d0622
+	github.com/codesjoy/pkg/basic/xerror v0.0.0-20260812100337-f4b6f4ac7d17
 	github.com/codesjoy/pkg/basic/xgorm v0.0.0-20260514091847-8c522c350e05
 	github.com/codesjoy/skuld/gen/go v0.0.0-00010101000000-000000000000
 	github.com/codesjoy/yggdrasil-ecosystem/modules/otlp/v3 v3.0.0-20260429033927-d1bc68f367b9
 	github.com/codesjoy/yggdrasil-ecosystem/modules/protovalidate/v3 v3.0.0-20260429033927-d1bc68f367b9
-	github.com/codesjoy/yggdrasil/v3 v3.0.0-rc.2
+	github.com/codesjoy/yggdrasil/v3 v3.0.0-rc.4
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/google/wire v0.7.0
 	github.com/jackc/pgx/v5 v5.10.0
@@ -22,7 +22,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.40.0
 	go.opentelemetry.io/otel/metric v1.44.0
 	go.opentelemetry.io/otel/trace v1.44.0
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260720211330-0afa2a65878a
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260810153831-ec0a7760b754
 	google.golang.org/protobuf v1.36.12
 	gorm.io/driver/mysql v1.5.7
 	gorm.io/driver/postgres v1.5.2
@@ -44,7 +44,8 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/codesjoy/pkg/basic/transaction v0.0.0-20260328013517-15736fbea914 // indirect
 	github.com/codesjoy/pkg/proto/codesjoy/reason v0.0.0-20260514091847-8c522c350e05 // indirect
-	github.com/codesjoy/pkg/utils v0.0.0-20260227125603-faf7bfdf00a7 // indirect
+	github.com/codesjoy/pkg/utils v0.0.0-20260316022210-2e62ff5ff745 // indirect
+	github.com/codesjoy/skuld/pkg/sequence v0.0.0-00010101000000-000000000000
 	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
@@ -116,7 +117,6 @@ require (
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
-	google.golang.org/genproto v0.0.0-20251222181119-0a764e51fe1b // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 // indirect
 	google.golang.org/grpc v1.82.1 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
@@ -124,3 +124,5 @@ require (
 	gorm.io/plugin/dbresolver v1.6.2 // indirect
 	gorm.io/sharding v0.6.2 // indirect
 )
+
+replace github.com/codesjoy/skuld/pkg/sequence => ./pkg/sequence
