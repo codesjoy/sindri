@@ -3,9 +3,11 @@ GO := go
 
 GOCACHE ?= /tmp/skuld-gocache
 GOLANGCI_LINT_CACHE ?= /tmp/skuld-golangci-cache
+SEQUENCE_SYSTEM_IMAGE ?= skuld-sequence-system:local
+SEQUENCE_TEST_DIALECTS ?= postgres,mysql
 
 .PHONY: proto proto-lint proto-breaking-check \
-	fmt-check test test-race build  verify \
+	fmt-check test test-race build-sequence-test-image test-sequence-integration test-sequence-chaos build verify \
 	hooks.install
 
 proto: ## Generate the frozen contract Go contracts
@@ -36,6 +38,17 @@ test: ## Run contract and retained pure-algorithm tests
 
 test-race: ## Run race-enabled foundation and contract tests
 	$(GO) test -race ./internal/shared/... ./tools/... ./tests/...
+
+build-sequence-test-image: ## Build the real sequence process image used by system tests
+	mkdir -p artifacts/sequence
+	CGO_ENABLED=0 GOOS=linux $(GO) build -trimpath -o artifacts/sequence/sequence ./cmd/sequence
+	docker build --progress=plain -f tests/sequence/testdata/Dockerfile -t $(SEQUENCE_SYSTEM_IMAGE) .
+
+test-sequence-integration: build-sequence-test-image ## Run sequence store, E2E, and short failover tests
+	SKULD_SEQUENCE_TEST_DIALECTS=$(SEQUENCE_TEST_DIALECTS) SKULD_SEQUENCE_TEST_IMAGE=$(SEQUENCE_SYSTEM_IMAGE) $(GO) test -tags=integration -count=1 -timeout=20m ./tests/sequence/...
+
+test-sequence-chaos: build-sequence-test-image ## Run all deterministic sequence system and chaos tests
+	SKULD_SEQUENCE_TEST_DIALECTS=$(SEQUENCE_TEST_DIALECTS) SKULD_SEQUENCE_TEST_IMAGE=$(SEQUENCE_SYSTEM_IMAGE) $(GO) test -tags='integration chaos' -count=1 -timeout=40m ./tests/sequence/...
 
 build: ## Compile all retained packages and tools; no business binaries are produced
 	$(GO) build ./...

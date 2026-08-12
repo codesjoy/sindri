@@ -11,3 +11,8 @@ web/console/test-results
 **/dist
 **/test-results
 deploy/docker/certs
+
+# The sequence system-test image copies this host-built Linux binary.
+!artifacts
+!artifacts/sequence
+!artifacts/sequence/sequence

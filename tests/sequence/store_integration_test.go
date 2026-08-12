@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	mysqlc "github.com/testcontainers/testcontainers-go/modules/mysql"
 	postgresc "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/network"
 	"github.com/testcontainers/testcontainers-go/wait"
 	mysqlgorm "gorm.io/driver/mysql"
 	postgresgorm "gorm.io/driver/postgres"
@@ -40,42 +42,68 @@ import (
 )
 
 const (
-	postgresImage = "postgres:14-alpine"
-	mysqlImage    = "mysql:8.0"
-	databaseName  = "skuld_sequence"
-	databaseUser  = "skuld_sequence"
-	databasePass  = "skuld_sequence"
+	testDialectsEnv = "SKULD_SEQUENCE_TEST_DIALECTS"
+	postgresImage   = "postgres:14-alpine"
+	mysqlImage      = "mysql:8.0"
+	databaseName    = "skuld_sequence"
+	databaseUser    = "skuld_sequence"
+	databasePass    = "skuld_sequence"
 )
 
 type harness struct {
-	name      string
-	driver    string
-	sqlDriver string
-	dsn       string
-	dialect   goose.Dialect
-	dialector func(string) gorm.Dialector
-	terminate func(context.Context) error
+	name             string
+	driver           string
+	sqlDriver        string
+	dsn              string
+	dialect          goose.Dialect
+	dialector        func(string) gorm.Dialector
+	container        testcontainers.Container
+	network          *testcontainers.DockerNetwork
+	dbAlias          string
+	dbPort           string
+	connectionString func(context.Context) (string, error)
+	terminate        func(context.Context) error
 }
 
-var harnesses []*harness
+var (
+	enabledDialects map[string]bool
+	harnesses       []*harness
+)
 
 func TestMain(m *testing.M) {
+	var err error
+	enabledDialects, err = parseTestDialects(os.Getenv(testDialectsEnv))
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "%s: %v\n", testDialectsEnv, err)
+		os.Exit(2)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	postgresHarness, err := startPostgres(ctx)
-	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "start PostgreSQL integration container: %v\n", err)
-		os.Exit(1)
+	starters := []struct {
+		name  string
+		start func(context.Context) (*harness, error)
+	}{
+		{name: "postgres", start: startPostgres},
+		{name: "mysql", start: startMySQL},
 	}
-	mysqlHarness, err := startMySQL(ctx)
-	if err != nil {
-		_ = postgresHarness.terminate(context.Background())
-		_, _ = fmt.Fprintf(os.Stderr, "start MySQL integration container: %v\n", err)
-		os.Exit(1)
-	}
-	harnesses = []*harness{postgresHarness, mysqlHarness}
-	for _, item := range harnesses {
+	for _, dialect := range starters {
+		if !enabledDialects[dialect.name] {
+			continue
+		}
+		item, startErr := dialect.start(ctx)
+		if startErr != nil {
+			stopHarnesses(context.Background())
+			_, _ = fmt.Fprintf(
+				os.Stderr,
+				"start %s integration container: %v\n",
+				dialect.name,
+				startErr,
+			)
+			os.Exit(1)
+		}
+		harnesses = append(harnesses, item)
 		if err := applyMigrations(ctx, item); err != nil {
 			stopHarnesses(context.Background())
 			_, _ = fmt.Fprintf(os.Stderr, "apply %s migrations: %v\n", item.name, err)
@@ -93,6 +121,21 @@ func TestMain(m *testing.M) {
 		}
 	}
 	os.Exit(exitCode)
+}
+
+func parseTestDialects(value string) (map[string]bool, error) {
+	value = strings.TrimSpace(value)
+	switch value {
+	case "", "postgres,mysql":
+		return map[string]bool{"postgres": true, "mysql": true}, nil
+	case "postgres", "mysql":
+		return map[string]bool{value: true}, nil
+	default:
+		return nil, fmt.Errorf(
+			"unsupported value %q (supported: postgres, mysql, postgres,mysql)",
+			value,
+		)
+	}
 }
 
 func TestSequenceStoreContractAcrossDialects(t *testing.T) {
@@ -271,27 +314,36 @@ func applyMigrations(ctx context.Context, item *harness) error {
 }
 
 func startPostgres(ctx context.Context) (*harness, error) {
+	nw, err := network.New(ctx)
+	if err != nil {
+		return nil, err
+	}
+	const dbAlias = "postgres"
 	container, err := postgresc.Run(
 		ctx,
 		postgresImage,
 		postgresc.WithDatabase(databaseName),
 		postgresc.WithUsername(databaseUser),
 		postgresc.WithPassword(databasePass),
+		network.WithNetwork([]string{dbAlias}, nw),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
 				WithOccurrence(2).WithStartupTimeout(2*time.Minute),
 		),
 	)
 	if err != nil {
+		_ = nw.Remove(ctx)
 		return nil, err
 	}
 	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		_ = container.Terminate(ctx)
+		_ = nw.Remove(ctx)
 		return nil, err
 	}
 	if err := waitForDatabase(ctx, "pgx", dsn); err != nil {
 		_ = container.Terminate(ctx)
+		_ = nw.Remove(ctx)
 		return nil, err
 	}
 	return &harness{
@@ -299,17 +351,29 @@ func startPostgres(ctx context.Context) (*harness, error) {
 		dialect: goose.DialectPostgres, dialector: func(value string) gorm.Dialector {
 			return postgresgorm.Open(value)
 		},
-		terminate: func(stopCtx context.Context) error { return container.Terminate(stopCtx) },
+		container: container.Container, network: nw, dbAlias: dbAlias, dbPort: "5432",
+		connectionString: func(connectionCtx context.Context) (string, error) {
+			return container.ConnectionString(connectionCtx, "sslmode=disable")
+		},
+		terminate: func(stopCtx context.Context) error {
+			return errors.Join(container.Terminate(stopCtx), nw.Remove(stopCtx))
+		},
 	}, nil
 }
 
 func startMySQL(ctx context.Context) (*harness, error) {
+	nw, err := network.New(ctx)
+	if err != nil {
+		return nil, err
+	}
+	const dbAlias = "mysql"
 	container, err := mysqlc.Run(
 		ctx,
 		mysqlImage,
 		mysqlc.WithDatabase(databaseName),
 		mysqlc.WithUsername(databaseUser),
 		mysqlc.WithPassword(databasePass),
+		network.WithNetwork([]string{dbAlias}, nw),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("ready for connections").
 				WithOccurrence(1).
@@ -317,15 +381,18 @@ func startMySQL(ctx context.Context) (*harness, error) {
 		),
 	)
 	if err != nil {
+		_ = nw.Remove(ctx)
 		return nil, err
 	}
 	dsn, err := container.ConnectionString(ctx, "parseTime=true", "multiStatements=true")
 	if err != nil {
 		_ = container.Terminate(ctx)
+		_ = nw.Remove(ctx)
 		return nil, err
 	}
 	if err := waitForDatabase(ctx, "mysql", dsn); err != nil {
 		_ = container.Terminate(ctx)
+		_ = nw.Remove(ctx)
 		return nil, err
 	}
 	return &harness{
@@ -333,7 +400,17 @@ func startMySQL(ctx context.Context) (*harness, error) {
 		dialect: goose.DialectMySQL, dialector: func(value string) gorm.Dialector {
 			return mysqlgorm.Open(value)
 		},
-		terminate: func(stopCtx context.Context) error { return container.Terminate(stopCtx) },
+		container: container.Container, network: nw, dbAlias: dbAlias, dbPort: "3306",
+		connectionString: func(connectionCtx context.Context) (string, error) {
+			return container.ConnectionString(
+				connectionCtx,
+				"parseTime=true",
+				"multiStatements=true",
+			)
+		},
+		terminate: func(stopCtx context.Context) error {
+			return errors.Join(container.Terminate(stopCtx), nw.Remove(stopCtx))
+		},
 	}, nil
 }
 
