@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+
+ARG RUNTIME_IMAGE=gcr.io/distroless/base-debian12
+
+FROM golang:1.26.4 AS build
+
+ARG SERVICE
+WORKDIR /src
+
+COPY . .
+
+RUN go env -w GOPROXY=https://goproxy.cn,direct
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    test -n "${SERVICE}" && \
+    CGO_ENABLED=0 go build -trimpath -o "/out/${SERVICE}" "./cmd/${SERVICE}"
+
+FROM ${RUNTIME_IMAGE}
+
+ARG SERVICE
+WORKDIR /app
+
+COPY --from=build "/out/${SERVICE}" "/app/server"
+COPY --from=build "/src/configs/${SERVICE}.yaml" "/app/configs/${SERVICE}.yaml"
+
+EXPOSE 8080
+ENTRYPOINT ["/app/server"]

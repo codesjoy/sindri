@@ -1,0 +1,48 @@
+name: skuld
+
+x-sequence-image: &sequence-image
+  image: ${SKULD_SEQUENCE_IMAGE:-skuld-sequence:local}
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile.go-service
+
+x-sequence-environment: &sequence-environment
+  SKULD_SEQUENCE_DRIVER: ${SKULD_SEQUENCE_DRIVER:?set SKULD_SEQUENCE_DRIVER to postgres or mysql}
+  SKULD_SEQUENCE_DSN: ${SKULD_SEQUENCE_DSN:?set SKULD_SEQUENCE_DSN}
+  SKULD_OTLP_ENDPOINT: ${SKULD_OTLP_ENDPOINT:?set SKULD_OTLP_ENDPOINT}
+
+services:
+  migrate:
+    image: ${SKULD_MIGRATE_IMAGE:-skuld-sequence-migrate:local}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.goose
+    environment:
+      GOOSE_DRIVER: ${SKULD_SEQUENCE_DRIVER:?set SKULD_SEQUENCE_DRIVER to postgres or mysql}
+      GOOSE_DBSTRING: ${SKULD_SEQUENCE_DSN:?set SKULD_SEQUENCE_DSN}
+      GOOSE_MIGRATION_DIR: /app/migrations/${SKULD_SEQUENCE_DRIVER:?set SKULD_SEQUENCE_DRIVER to postgres or mysql}
+    command: [up]
+    restart: on-failure
+    networks: [external-dependencies]
+
+  sequence:
+    <<: *sequence-image
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.go-service
+      args:
+        SERVICE: sequence
+        RUNTIME_IMAGE: debian:bookworm-slim
+    environment:
+      <<: *sequence-environment
+      SKULD_SEQUENCE_NODE_ID: ${SKULD_SEQUENCE_NODE_ID:-sequence-1}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "${SKULD_SEQUENCE_GRPC_PORT:-19010}:19010"
+    restart: unless-stopped
+    networks: [external-dependencies]
+
+networks:
+  external-dependencies:

@@ -1,0 +1,134 @@
+name: skuld
+
+x-sequence-image: &sequence-image
+  image: ${SKULD_SEQUENCE_IMAGE:-skuld-sequence:local}
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile.go-service
+
+x-sequence-environment: &sequence-environment
+  SKULD_SEQUENCE_DRIVER: ${SKULD_SEQUENCE_DRIVER:-postgres}
+  SKULD_SEQUENCE_DSN: ${SKULD_SEQUENCE_DSN:-postgres://skuld_sequence:${SKULD_SEQUENCE_DB_PASSWORD:-skuld-local}@postgres:5432/skuld_sequence?sslmode=disable}
+  SKULD_OTLP_ENDPOINT: ${SKULD_OTLP_ENDPOINT:-otel-collector:4317}
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-postgres-local}
+      SKULD_SEQUENCE_DB_PASSWORD: ${SKULD_SEQUENCE_DB_PASSWORD:-skuld-local}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/initdb.d:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U $${POSTGRES_USER} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+    networks: [backend]
+
+  migrate:
+    image: ${SKULD_MIGRATE_IMAGE:-skuld-sequence-migrate:local}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.goose
+    environment:
+      GOOSE_DRIVER: ${SKULD_SEQUENCE_DRIVER:-postgres}
+      GOOSE_DBSTRING: ${SKULD_SEQUENCE_DSN:-postgres://skuld_sequence:${SKULD_SEQUENCE_DB_PASSWORD:-skuld-local}@postgres:5432/skuld_sequence?sslmode=disable}
+      GOOSE_MIGRATION_DIR: /app/migrations/${SKULD_SEQUENCE_DRIVER:-postgres}
+    command: [up]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+    networks: [backend]
+
+  sequence:
+    <<: *sequence-image
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.go-service
+      args:
+        SERVICE: sequence
+        RUNTIME_IMAGE: debian:bookworm-slim
+    environment:
+      <<: *sequence-environment
+      SKULD_SEQUENCE_NODE_ID: ${SKULD_SEQUENCE_NODE_ID:-sequence-1}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
+    ports:
+      - "${SKULD_SEQUENCE_GRPC_PORT:-19010}:19010"
+    restart: unless-stopped
+    networks: [backend, observability]
+
+  otel-collector:
+    image: ${OTEL_COLLECTOR_IMAGE:-otel/opentelemetry-collector-contrib:0.132.0}
+    command: [--config=/etc/otelcol-contrib/config.yaml]
+    volumes:
+      - ./otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      tempo:
+        condition: service_started
+    restart: unless-stopped
+    networks: [observability]
+
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      otel-collector:
+        condition: service_started
+    restart: unless-stopped
+    networks: [observability]
+
+  tempo:
+    image: ${TEMPO_IMAGE:-grafana/tempo:2.8.2}
+    command: [-config.file=/etc/tempo.yaml]
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    restart: unless-stopped
+    networks: [observability]
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:12.1.0}
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_started
+      tempo:
+        condition: service_started
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    restart: unless-stopped
+    networks: [observability]
+
+networks:
+  backend:
+    internal: true
+  observability:
+
+volumes:
+  postgres-data:
+  prometheus-data:
+  tempo-data:
+  grafana-data:

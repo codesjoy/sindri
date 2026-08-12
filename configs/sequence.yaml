@@ -8,8 +8,8 @@ yggdrasil:
       meter: otlp-grpc
       providers:
         otlp:
-          trace: {endpoint: localhost:4317, tls: {insecure: true}}
-          metric: {endpoint: localhost:4317, tls: {insecure: true}}
+          trace: {endpoint: "${SKULD_OTLP_ENDPOINT}", tls: {insecure: true}}
+          metric: {endpoint: "${SKULD_OTLP_ENDPOINT}", tls: {insecure: true}}
   server:
     transports: [grpc]
     interceptors: {unary: [protovalidate]}
@@ -20,7 +20,7 @@ yggdrasil:
 app:
   sequence:
     database:
-      driver: postgres
+      driver: "${SKULD_SEQUENCE_DRIVER}"
       dsn: "${SKULD_SEQUENCE_DSN}"
       expected_database: skuld_sequence
       expected_account: skuld_sequence
