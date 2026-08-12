@@ -29,7 +29,11 @@ func (s *sequenceStore) ReserveRange(
 
 func readyService(t *testing.T, key string) (*SequenceService, *biz.Allocator, *biz.RouteCache) {
 	t.Helper()
-	allocator := biz.NewAllocator(&biz.AllocatorConfig{Step: 10}, &sequenceStore{}, nil)
+	allocator := biz.NewAllocator(
+		&biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
+		&sequenceStore{},
+		nil,
+	)
 	allocator.Open(2, 0, []uint32{biz.SlotForKey(key)})
 	allocator.ApplyRoute(0)
 	route := biz.NewRouteCache()
@@ -114,7 +118,11 @@ func TestFetchNextStopsWaitingWhenContextIsCanceled(t *testing.T) {
 
 func TestGetRouteResponses(t *testing.T) {
 	empty := NewSequenceService(
-		biz.NewAllocator(&biz.AllocatorConfig{Step: 10}, &sequenceStore{}, nil),
+		biz.NewAllocator(
+			&biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
+			&sequenceStore{},
+			nil,
+		),
 		biz.NewRouteCache(),
 	)
 	_, err := empty.GetRoute(context.Background(), &sequencev1.GetRouteRequest{})

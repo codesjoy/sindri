@@ -199,7 +199,13 @@ app:
       max_open_conns: 20
       max_idle_conns: 5
       conn_max_lifetime: 30m
-    allocator: {step: 100}
+    allocator:
+      default_step: 100
+      max_step: 10000
+      prefetch_ratio: 0.5
+      step_increase_threshold: 15m
+      step_decrease_threshold: 30m
+      reserve_timeout: 1s
     node:
       id: %s
       heartbeat_timeout_ticks: 3

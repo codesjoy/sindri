@@ -35,11 +35,33 @@ func Load(rt yggdrasil.Runtime) (*Config, error) {
 	if err := section.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("decode sequence config: %w", err)
 	}
+	setAllocatorDefaults(&cfg.Allocator, section.Section("allocator").Map())
 	cfg.SetDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+func setAllocatorDefaults(cfg *biz.AllocatorConfig, values map[string]any) {
+	if _, ok := values["default_step"]; !ok {
+		cfg.DefaultStep = biz.DefaultStep
+	}
+	if _, ok := values["max_step"]; !ok {
+		cfg.MaxStep = biz.DefaultMaxStep
+	}
+	if _, ok := values["prefetch_ratio"]; !ok {
+		cfg.PrefetchRatio = biz.DefaultPrefetchRatio
+	}
+	if _, ok := values["step_increase_threshold"]; !ok {
+		cfg.StepIncreaseThreshold = biz.DefaultStepIncreaseThreshold
+	}
+	if _, ok := values["step_decrease_threshold"]; !ok {
+		cfg.StepDecreaseThreshold = biz.DefaultStepDecreaseThreshold
+	}
+	if _, ok := values["reserve_timeout"]; !ok {
+		cfg.ReserveTimeout = biz.DefaultReserveTimeout
+	}
 }
 
 // SetDefaults applies process defaults before the configuration becomes immutable.
@@ -50,9 +72,6 @@ func (c *Config) SetDefaults() {
 	c.Database.ExpectedAccount = strings.TrimSpace(c.Database.ExpectedAccount)
 	c.Database.SetDefaults()
 	c.Node.ID = strings.TrimSpace(c.Node.ID)
-	if c.Allocator.Step == 0 {
-		c.Allocator.Step = biz.DefaultStep
-	}
 	if c.Node.HeartbeatTimeoutTicks == 0 {
 		c.Node.HeartbeatTimeoutTicks = 3
 	}
@@ -75,12 +94,38 @@ func (c Config) Validate() error {
 	if c.Database.ExpectedDatabase != sequenceOwner || c.Database.ExpectedAccount != sequenceOwner {
 		return fmt.Errorf("sequence config: database identity must be %s", sequenceOwner)
 	}
-	if c.Allocator.Step < biz.MinStep || c.Allocator.Step > biz.MaxStep {
-		return fmt.Errorf(
-			"sequence config: allocator.step must be within %d..%d",
-			biz.MinStep,
-			biz.MaxStep,
+	if c.Allocator.LegacyStep != nil {
+		return errors.New(
+			"sequence config: allocator.step was removed; use allocator.default_step",
 		)
+	}
+	if c.Allocator.DefaultStep < biz.MinStep {
+		return fmt.Errorf(
+			"sequence config: allocator.default_step must be at least %d",
+			biz.MinStep,
+		)
+	}
+	if c.Allocator.MaxStep < c.Allocator.DefaultStep {
+		return errors.New(
+			"sequence config: allocator.max_step must not be less than default_step",
+		)
+	}
+	if c.Allocator.PrefetchRatio <= 0 || c.Allocator.PrefetchRatio >= 1 {
+		return errors.New("sequence config: allocator.prefetch_ratio must be within (0,1)")
+	}
+	if c.Allocator.StepIncreaseThreshold <= 0 {
+		return errors.New(
+			"sequence config: allocator.step_increase_threshold must be positive",
+		)
+	}
+	if c.Allocator.StepDecreaseThreshold <= c.Allocator.StepIncreaseThreshold {
+		return errors.New(
+			"sequence config: allocator.step_decrease_threshold must exceed " +
+				"step_increase_threshold",
+		)
+	}
+	if c.Allocator.ReserveTimeout <= 0 {
+		return errors.New("sequence config: allocator.reserve_timeout must be positive")
 	}
 	if c.Node.ID == "" || len(c.Node.ID) > 256 {
 		return errors.New("sequence config: node.id must contain 1..256 bytes")

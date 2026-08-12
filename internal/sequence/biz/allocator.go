@@ -14,15 +14,54 @@ import (
 )
 
 const (
-	// DefaultStep is the default number of IDs reserved per range.
+	// DefaultStep is the default and minimum range size for each key.
 	DefaultStep int64 = 100
-	MinStep     int64 = 10
-	MaxStep     int64 = 1000
+	// MinStep is the smallest configurable default range size.
+	MinStep int64 = 10
+	// DefaultMaxStep is the default upper bound for dynamically sized ranges.
+	DefaultMaxStep int64 = 10000
+
+	// DefaultPrefetchRatio starts reserving the next range halfway through the active range.
+	DefaultPrefetchRatio = 0.5
+	// DefaultStepIncreaseThreshold grows ranges expected to be exhausted quickly.
+	DefaultStepIncreaseThreshold = 15 * time.Minute
+	// DefaultStepDecreaseThreshold shrinks ranges expected to last a long time.
+	DefaultStepDecreaseThreshold = 30 * time.Minute
+	// DefaultReserveTimeout bounds each asynchronous range reservation.
+	DefaultReserveTimeout = time.Second
 )
 
 // AllocatorConfig contains immutable range allocation settings.
 type AllocatorConfig struct {
-	Step int64 `mapstructure:"step"`
+	// LegacyStep only detects the removed allocator.step configuration.
+	LegacyStep            *int64        `mapstructure:"step"`
+	DefaultStep           int64         `mapstructure:"default_step"`
+	MaxStep               int64         `mapstructure:"max_step"`
+	PrefetchRatio         float64       `mapstructure:"prefetch_ratio"`
+	StepIncreaseThreshold time.Duration `mapstructure:"step_increase_threshold"`
+	StepDecreaseThreshold time.Duration `mapstructure:"step_decrease_threshold"`
+	ReserveTimeout        time.Duration `mapstructure:"reserve_timeout"`
+}
+
+func (c *AllocatorConfig) setDefaults() {
+	if c.DefaultStep == 0 {
+		c.DefaultStep = DefaultStep
+	}
+	if c.MaxStep == 0 {
+		c.MaxStep = DefaultMaxStep
+	}
+	if c.PrefetchRatio == 0 {
+		c.PrefetchRatio = DefaultPrefetchRatio
+	}
+	if c.StepIncreaseThreshold == 0 {
+		c.StepIncreaseThreshold = DefaultStepIncreaseThreshold
+	}
+	if c.StepDecreaseThreshold == 0 {
+		c.StepDecreaseThreshold = DefaultStepDecreaseThreshold
+	}
+	if c.ReserveTimeout == 0 {
+		c.ReserveTimeout = DefaultReserveTimeout
+	}
 }
 
 const (
@@ -43,92 +82,279 @@ type SequenceRange struct {
 	End   int64
 }
 
+type rangeFetch struct {
+	done       chan struct{}
+	background bool
+	reserved   SequenceRange
+	err        error
+}
+
 type keyState struct {
 	next        atomic.Int64
 	start       atomic.Int64
 	end         atomic.Int64
 	generation  atomic.Uint64
 	initialized atomic.Bool
-	mu          sync.Mutex
 	lastUsed    atomic.Int64
+
+	mu          sync.Mutex
+	activeStep  int64
+	activatedAt time.Time
+	standby     *SequenceRange
+	fetch       *rangeFetch
+	retryAfter  time.Time
 }
 
 func (k *keyState) allocate(
 	ctx context.Context,
 	store SequenceRepo,
 	key string,
-	step int64,
+	cfg AllocatorConfig,
+	now func() time.Time,
 ) (int64, error) {
+	var (
+		candidate  int64
+		generation uint64
+		hadRange   bool
+	)
 	if k.initialized.Load() {
-		generation := k.generation.Load()
-		id := k.next.Add(1)
-		if k.inActiveRange(id) && generation == k.generation.Load() {
-			k.touch()
-			return id, nil
+		hadRange = true
+		generation = k.generation.Load()
+		candidate = k.next.Add(1)
+		if generation%2 == 0 && k.inActiveRange(candidate) &&
+			generation == k.generation.Load() {
+			k.afterAllocate(store, key, cfg, now, candidate, generation)
+			return candidate, nil
 		}
-		return k.allocateSlow(ctx, store, key, step, id, generation, true)
 	}
-	return k.allocateSlow(ctx, store, key, step, 0, 0, false)
+
+	id, idGeneration, err := k.allocateSlow(
+		ctx,
+		store,
+		key,
+		cfg,
+		now,
+		candidate,
+		generation,
+		hadRange,
+	)
+	if err != nil {
+		return 0, err
+	}
+	k.afterAllocate(store, key, cfg, now, id, idGeneration)
+	return id, nil
 }
 
 func (k *keyState) allocateSlow(
 	ctx context.Context,
 	store SequenceRepo,
 	key string,
-	step int64,
+	cfg AllocatorConfig,
+	now func() time.Time,
 	candidate int64,
 	generation uint64,
 	hadRange bool,
-) (int64, error) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
+) (int64, uint64, error) {
+	for {
+		k.mu.Lock()
+		if k.initialized.Load() {
+			currentGeneration := k.generation.Load()
+			if hadRange && generation == currentGeneration && k.inActiveRange(candidate) {
+				k.touch(now())
+				k.mu.Unlock()
+				return candidate, currentGeneration, nil
+			}
 
-	if k.initialized.Load() {
-		currentGeneration := k.generation.Load()
-		if hadRange && generation == currentGeneration && k.inActiveRange(candidate) {
-			k.touch()
-			return candidate, nil
-		}
-
-		// A caller that observed an uninitialized or superseded range must
-		// discard its optimistic candidate before consuming the active range.
-		if !hadRange || generation != currentGeneration || candidate < k.start.Load() {
 			candidate = k.next.Add(1)
 			if k.inActiveRange(candidate) {
-				k.touch()
-				return candidate, nil
+				k.touch(now())
+				k.mu.Unlock()
+				return candidate, currentGeneration, nil
 			}
 		}
+
+		if k.standby != nil {
+			id, nextGeneration := k.activateStandbyLocked(now())
+			k.mu.Unlock()
+			return id, nextGeneration, nil
+		}
+
+		if k.fetch != nil {
+			fetch := k.fetch
+			k.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return 0, 0, ctx.Err()
+			case <-fetch.done:
+				if fetch.err != nil && !fetch.background {
+					return 0, 0, fetch.err
+				}
+				continue
+			}
+		}
+
+		step := cfg.DefaultStep
+		if k.initialized.Load() {
+			activeSize := k.end.Load() - k.start.Load() + 1
+			step = k.nextStepLocked(now(), activeSize, activeSize, cfg)
+		}
+		fetch := &rangeFetch{done: make(chan struct{})}
+		k.fetch = fetch
+		k.mu.Unlock()
+
+		reserved, err := reserveRange(ctx, store, key, step)
+		k.completeFetch(fetch, reserved, err, cfg, now())
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+}
+
+func (k *keyState) afterAllocate(
+	store SequenceRepo,
+	key string,
+	cfg AllocatorConfig,
+	now func() time.Time,
+	id int64,
+	generation uint64,
+) {
+	k.touch(now())
+	start := k.start.Load()
+	end := k.end.Load()
+	if start <= 0 || end < start {
+		return
+	}
+	consumed := id - start + 1
+	size := end - start + 1
+	if consumed <= 0 || float64(consumed)/float64(size) < cfg.PrefetchRatio {
+		return
 	}
 
+	k.mu.Lock()
+	if generation != k.generation.Load() || k.standby != nil || k.fetch != nil {
+		k.mu.Unlock()
+		return
+	}
+	currentTime := now()
+	if currentTime.Before(k.retryAfter) {
+		k.mu.Unlock()
+		return
+	}
+	currentStart := k.start.Load()
+	currentEnd := k.end.Load()
+	currentConsumed := id - currentStart + 1
+	currentSize := currentEnd - currentStart + 1
+	if currentConsumed <= 0 || currentSize <= 0 ||
+		float64(currentConsumed)/float64(currentSize) < cfg.PrefetchRatio {
+		k.mu.Unlock()
+		return
+	}
+	step := k.nextStepLocked(currentTime, currentConsumed, currentSize, cfg)
+	fetch := &rangeFetch{
+		done:       make(chan struct{}),
+		background: true,
+	}
+	k.fetch = fetch
+	k.mu.Unlock()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.ReserveTimeout)
+		defer cancel()
+		reserved, err := reserveRange(ctx, store, key, step)
+		k.completeFetch(fetch, reserved, err, cfg, now())
+	}()
+}
+
+func (k *keyState) nextStepLocked(
+	now time.Time,
+	consumed int64,
+	size int64,
+	cfg AllocatorConfig,
+) int64 {
+	step := k.activeStep
+	if step < cfg.DefaultStep {
+		step = cfg.DefaultStep
+	}
+	consumedRatio := float64(consumed) / float64(size)
+	estimatedDuration := time.Duration(float64(now.Sub(k.activatedAt)) / consumedRatio)
+	switch {
+	case estimatedDuration <= cfg.StepIncreaseThreshold:
+		if step >= cfg.MaxStep/2 {
+			return cfg.MaxStep
+		}
+		return step * 2
+	case estimatedDuration >= cfg.StepDecreaseThreshold:
+		step /= 2
+		if step < cfg.DefaultStep {
+			return cfg.DefaultStep
+		}
+		return step
+	default:
+		return step
+	}
+}
+
+func (k *keyState) completeFetch(
+	fetch *rangeFetch,
+	reserved SequenceRange,
+	err error,
+	cfg AllocatorConfig,
+	now time.Time,
+) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.fetch != fetch {
+		return
+	}
+	fetch.reserved = reserved
+	fetch.err = err
+	if err == nil {
+		k.standby = &fetch.reserved
+		k.retryAfter = time.Time{}
+	} else if fetch.background {
+		k.retryAfter = now.Add(cfg.ReserveTimeout)
+	}
+	k.fetch = nil
+	close(fetch.done)
+}
+
+func (k *keyState) activateStandbyLocked(now time.Time) (int64, uint64) {
+	reserved := *k.standby
+	k.standby = nil
+	// Odd generations prevent optimistic readers from consuming partially
+	// published bounds while the active range is changing.
+	k.generation.Add(1)
+	k.next.Store(reserved.Start)
+	k.activeStep = reserved.End - reserved.Start + 1
+	k.activatedAt = now
+	k.start.Store(reserved.Start)
+	k.end.Store(reserved.End)
+	generation := k.generation.Add(1)
+	k.initialized.Store(true)
+	k.touch(now)
+	return reserved.Start, generation
+}
+
+func reserveRange(
+	ctx context.Context,
+	store SequenceRepo,
+	key string,
+	step int64,
+) (SequenceRange, error) {
 	reserved, err := store.ReserveRange(ctx, key, step)
 	if err != nil {
-		return 0, err
+		return SequenceRange{}, err
 	}
 	if reserved.Start <= 0 || reserved.End < reserved.Start ||
 		reserved.End-reserved.Start+1 != step {
-		return 0, fmt.Errorf(
+		return SequenceRange{}, fmt.Errorf(
 			"reserve sequence range for %q: invalid range [%d,%d]",
 			key,
 			reserved.Start,
 			reserved.End,
 		)
 	}
-
-	resetCursor := candidate < reserved.Start || candidate > reserved.End
-	if resetCursor {
-		// Invalidate optimistic readers before publishing a reset cursor.
-		k.generation.Add(1)
-		candidate = reserved.Start
-		k.next.Store(candidate)
-	}
-	// Publish the bounds after resetting next. Fast-path callers can only
-	// consume the new range after both bounds describe it.
-	k.start.Store(reserved.Start)
-	k.end.Store(reserved.End)
-	k.initialized.Store(true)
-	k.touch()
-	return candidate, nil
+	return reserved, nil
 }
 
 func (k *keyState) inActiveRange(id int64) bool {
@@ -137,8 +363,8 @@ func (k *keyState) inActiveRange(id int64) bool {
 	return id >= start && id <= end && start == k.start.Load()
 }
 
-func (k *keyState) touch() {
-	k.lastUsed.Store(time.Now().Unix())
+func (k *keyState) touch(now time.Time) {
+	k.lastUsed.Store(now.Unix())
 }
 
 // PrepareApply describes a route update scheduled for a future tick.
@@ -157,7 +383,8 @@ type Allocator struct {
 	version int64
 
 	store SequenceRepo
-	step  int64
+	cfg   AllocatorConfig
+	now   func() time.Time
 
 	prepareApply *PrepareApply
 
@@ -169,10 +396,13 @@ func NewAllocator(cfg *AllocatorConfig, store SequenceRepo, logger *slog.Logger)
 	if logger == nil {
 		logger = slog.Default()
 	}
+	allocatorConfig := *cfg
+	allocatorConfig.setDefaults()
 	obj := &Allocator{
 		slots:  make(map[uint32]*sync.Map),
 		store:  store,
-		step:   cfg.Step,
+		cfg:    allocatorConfig,
+		now:    time.Now,
 		logger: logger,
 	}
 	obj.state.Store(StatePaused)
@@ -196,7 +426,7 @@ func (obj *Allocator) FetchNext(ctx context.Context, key string) (int64, error) 
 		return 0, xerror.NewWithReason(reason.Reason_SEQUENCE_SLOT_NOT_OWNER, "slot not found", nil)
 	}
 	stateValue, _ := slot.LoadOrStore(key, &keyState{})
-	id, err := stateValue.(*keyState).allocate(ctx, obj.store, key, obj.step)
+	id, err := stateValue.(*keyState).allocate(ctx, obj.store, key, obj.cfg, obj.now)
 	if err != nil {
 		return 0, err
 	}

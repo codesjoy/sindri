@@ -157,7 +157,7 @@ func TestDatabaseIdentityAndAppInitializationAcrossDialects(t *testing.T) {
 					Driver: item.driver, DSN: item.dsn,
 					ExpectedDatabase: databaseName, ExpectedAccount: databaseUser,
 				},
-				Allocator: biz.AllocatorConfig{Step: 10},
+				Allocator: biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
 				Node: biz.NodeConfig{
 					ID: "node-a", HeartbeatTimeoutTicks: 3,
 					RouteQueryTimeout: time.Second,

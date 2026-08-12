@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	sequencev1 "github.com/codesjoy/skuld/gen/go/sequence/v1"
 	"github.com/codesjoy/skuld/internal/sequence/biz"
@@ -70,7 +71,7 @@ func TestGeneratedClientDrivesServiceAllocatorAndSQLiteRepo(t *testing.T) {
 
 	key := "orders"
 	repo := gormdata.NewSequenceData(db)
-	allocator := biz.NewAllocator(&biz.AllocatorConfig{Step: 10}, repo, nil)
+	allocator := biz.NewAllocator(&biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100}, repo, nil)
 	allocator.Open(1, 0, []uint32{biz.SlotForKey(key)})
 	allocator.ApplyRoute(0)
 	route := biz.NewRouteCache()
@@ -85,7 +86,11 @@ func TestGeneratedClientDrivesServiceAllocatorAndSQLiteRepo(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), first.Id)
 
-	restarted := biz.NewAllocator(&biz.AllocatorConfig{Step: 10}, gormdata.NewSequenceData(db), nil)
+	restarted := biz.NewAllocator(
+		&biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
+		gormdata.NewSequenceData(db),
+		nil,
+	)
 	restarted.Open(1, 0, []uint32{biz.SlotForKey(key)})
 	restarted.ApplyRoute(0)
 	restartedClient := sequencev1.NewSequenceGeneratorClient(&inProcessClient{
@@ -101,4 +106,50 @@ func TestGeneratedClientDrivesServiceAllocatorAndSQLiteRepo(t *testing.T) {
 	snapshot, err := restartedClient.GetRoute(context.Background(), &sequencev1.GetRouteRequest{})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), snapshot.Route.Version)
+}
+
+func TestAllocatorPrefetchesDatabaseRangeBeforeExhaustion(t *testing.T) {
+	db, err := gorm.Open(
+		sqlite.Open("file:sequence-prefetch-component?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&gormdata.SequenceModel{}))
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+
+	key := "orders-prefetch"
+	allocator := biz.NewAllocator(
+		&biz.AllocatorConfig{
+			DefaultStep:    10,
+			MaxStep:        20,
+			PrefetchRatio:  0.5,
+			ReserveTimeout: time.Second,
+		},
+		gormdata.NewSequenceData(db),
+		nil,
+	)
+	allocator.Open(1, 0, []uint32{biz.SlotForKey(key)})
+	allocator.ApplyRoute(0)
+
+	for want := int64(1); want <= 5; want++ {
+		got, fetchErr := allocator.FetchNext(context.Background(), key)
+		require.NoError(t, fetchErr)
+		assert.Equal(t, want, got)
+	}
+	require.Eventually(t, func() bool {
+		var model gormdata.SequenceModel
+		if queryErr := db.Where("sequence_key = ?", key).Take(&model).Error; queryErr != nil {
+			return false
+		}
+		return model.MaxID > 10
+	}, time.Second, 10*time.Millisecond)
+
+	for want := int64(6); want <= 11; want++ {
+		got, fetchErr := allocator.FetchNext(context.Background(), key)
+		require.NoError(t, fetchErr)
+		assert.Equal(t, want, got)
+	}
 }
