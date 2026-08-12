@@ -1,0 +1,140 @@
+name: sequence system tests
+
+on:
+  pull_request:
+    paths:
+      - "cmd/sequence/**"
+      - "internal/sequence/**"
+      - "internal/pkg/xgorm/**"
+      - "pkg/sequence/**"
+      - "api/skuld/sequence/**"
+      - "api/skuld/reason/**"
+      - "gen/go/sequence/**"
+      - "gen/go/reason/**"
+      - "migrations/sequence/**"
+      - "tests/sequence/**"
+      - "go.mod"
+      - "go.sum"
+      - "go.work"
+      - "go.work.sum"
+      - "Makefile"
+      - ".github/workflows/sequence-system-tests.yml"
+  schedule:
+    - cron: "17 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: sequence-system-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      mysql: ${{ steps.filter.outputs.mysql }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            mysql:
+              - 'internal/sequence/data/**'
+              - 'internal/pkg/xgorm/**'
+              - 'migrations/sequence/mysql/**'
+              - 'tests/sequence/*mysql*'
+              - 'tests/sequence/*MySQL*'
+              - 'tests/sequence/**/*mysql*'
+              - 'tests/sequence/**/*MySQL*'
+              - 'go.mod'
+              - 'go.sum'
+              - 'go.work'
+              - 'go.work.sum'
+
+  integration-postgres:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            gen/go/go.sum
+      - name: Run PostgreSQL sequence integration tests
+        shell: bash
+        run: |
+          mkdir -p artifacts/sequence
+          set -o pipefail
+          make test-sequence-integration SEQUENCE_TEST_DIALECTS=postgres 2>&1 | tee artifacts/sequence/integration-postgres.log
+      - name: Upload PostgreSQL sequence test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sequence-integration-postgres-${{ github.run_id }}
+          path: artifacts/sequence
+          if-no-files-found: warn
+
+  integration-mysql:
+    if: github.event_name == 'pull_request' && needs.changes.outputs.mysql == 'true'
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            gen/go/go.sum
+      - name: Run MySQL sequence integration tests
+        shell: bash
+        run: |
+          mkdir -p artifacts/sequence
+          set -o pipefail
+          make test-sequence-integration SEQUENCE_TEST_DIALECTS=mysql 2>&1 | tee artifacts/sequence/integration-mysql.log
+      - name: Upload MySQL sequence test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sequence-integration-mysql-${{ github.run_id }}
+          path: artifacts/sequence
+          if-no-files-found: warn
+
+  chaos:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        dialect: [postgres, mysql]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            gen/go/go.sum
+      - name: Run deterministic sequence chaos tests
+        shell: bash
+        run: |
+          mkdir -p artifacts/sequence
+          set -o pipefail
+          make test-sequence-chaos SEQUENCE_TEST_DIALECTS=${{ matrix.dialect }} 2>&1 | tee artifacts/sequence/chaos-${{ matrix.dialect }}.log
+      - name: Upload sequence test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sequence-chaos-${{ matrix.dialect }}-${{ github.run_id }}
+          path: artifacts/sequence
+          if-no-files-found: warn
