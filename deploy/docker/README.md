@@ -2,6 +2,10 @@
 
 The default stack is self-contained: PostgreSQL, migrations, sequence, an OpenTelemetry Collector, Prometheus, Tempo, and Grafana run in one Compose project.
 
+For a first local deployment, including initial route publication and RPC calls,
+follow the [Sequence quick start](../../docs/sequence.md). This document covers
+the deployment options and operational settings in more detail.
+
 From the repository root:
 
 ```sh
@@ -10,6 +14,9 @@ docker compose -f deploy/docker/compose.yaml up --build -d
 ```
 
 Sequence gRPC is available on `localhost:19010`; Grafana is available on `http://localhost:3000`.
+The migration job creates the Sequence tables but does not publish a route.
+Sequence starts successfully without a route, but allocation remains paused
+until an operator inserts a valid route snapshot as described in the quick start.
 The sequence container has a 1 GiB hard memory limit by default. With
 `app.sequence.runtime.memory_limit: auto`, sequence detects that cgroup limit
 and sets the Go runtime soft limit to 80% of it. The allocator stops admitting
