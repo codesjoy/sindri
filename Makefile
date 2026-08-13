@@ -1,5 +1,20 @@
+# Copyright 2026 Codesjoy
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 SHELL := /bin/bash
 GO := go
+PYTHON ?= python3
 
 SERVICE ?= sequence
 PROFILE ?= service
@@ -9,10 +24,103 @@ GOLANGCI_LINT_CACHE ?= /tmp/sindri-golangci-cache
 SEQUENCE_SYSTEM_IMAGE ?= skuld-sequence-system:local
 SEQUENCE_TEST_DIALECTS ?= postgres,mysql
 
-.PHONY: scaffold-service scaffold-test release-test proto proto-lint proto-breaking-check wire \
+TOOL_DIR := $(CURDIR)/bin
+TOOL_STAMP_DIR := $(TOOL_DIR)/.versions
+COPYRIGHT_YEAR ?= $(shell date +%Y)
+ADDLICENSE_VERSION := v1.2.0
+BUF_VERSION := v1.55.1
+WIRE_VERSION := v0.7.0
+GOLANGCI_LINT_VERSION := v2.12.2
+GOFUMPT_VERSION := v0.9.2
+GOIMPORTS_VERSION := v0.42.0
+GOLINES_VERSION := v0.13.0
+PRE_COMMIT_VERSION := 4.6.1
+
+ADDLICENSE := $(TOOL_DIR)/addlicense
+BUF := $(TOOL_DIR)/buf
+WIRE := $(TOOL_DIR)/wire
+GOLANGCI_LINT := $(TOOL_DIR)/golangci-lint
+GOFUMPT := $(TOOL_DIR)/gofumpt
+GOIMPORTS := $(TOOL_DIR)/goimports
+GOLINES := $(TOOL_DIR)/golines
+PRE_COMMIT := $(TOOL_DIR)/pre-commit-venv/bin/pre-commit
+
+LICENSE_SCAN_DIRS := cmd internal pkg gen tests api deploy scripts .github/workflows configs .golangci.yaml .pre-commit-config.yaml
+LICENSE_IGNORES := -ignore '**/*.pb.go' -ignore '**/wire_gen.go' -ignore '**/*.sum' \
+	-ignore '**/*.mod' -ignore '**/*.work' -ignore '**/*.lock' -ignore '**/*.tmpl' \
+	-ignore 'LICENSE'
+LICENSE_MANUAL_FILES := Makefile deploy/docker/Dockerfile.go-service deploy/docker/Dockerfile.goose \
+	scripts/templates/service/config.yaml.tmpl scripts/templates/service/main.go.tmpl \
+	scripts/templates/service/pkg.doc.go.tmpl scripts/templates/service/reason.proto.tmpl \
+	scripts/templates/service/service.proto.tmpl scripts/templates/service/workflow.client.yml.tmpl \
+	scripts/templates/service/workflow.contract.yml.tmpl scripts/templates/service/workflow.service.yml.tmpl
+
+define require-tool
+	@test -x "$(1)" && test -f "$(TOOL_STAMP_DIR)/$(2)-$(3)" || { echo '$(2) $(3) is missing; run make tools.install' >&2; exit 1; }
+endef
+
+.PHONY: scaffold-service scaffold-test release-test tools.install tools.check license license-check \
+	proto proto-lint proto-breaking-check wire \
 	fmt-check test test-race build modules-check release-check \
 	build-sequence-test-image test-sequence-integration test-sequence-chaos \
 	go-lint go-fix verify hooks.install
+
+tools.install: ## Install pinned development tools into ./bin
+	@test -x "$$(command -v $(GO) 2>/dev/null || true)" || { echo 'go is required to install tools' >&2; exit 1; }
+	@test -x "$$(command -v $(PYTHON) 2>/dev/null || true)" || { echo 'python3 is required to install pre-commit' >&2; exit 1; }
+	mkdir -p "$(TOOL_DIR)" "$(TOOL_STAMP_DIR)"
+	@set -e; \
+	install_go_tool() { \
+		name="$$1"; version="$$2"; package="$$3"; \
+		stamp="$(TOOL_STAMP_DIR)/$$name-$$version"; binary="$(TOOL_DIR)/$$name"; \
+		if [ ! -x "$$binary" ] || [ ! -f "$$stamp" ]; then \
+			echo "==> install $$name $$version"; \
+			GOBIN="$(TOOL_DIR)" $(GO) install "$$package"; \
+			find "$(TOOL_STAMP_DIR)" -maxdepth 1 -type f -name "$$name-*" -delete; \
+			: >"$$stamp"; \
+		fi; \
+	}; \
+	install_go_tool addlicense "$(ADDLICENSE_VERSION)" github.com/google/addlicense@$(ADDLICENSE_VERSION); \
+	install_go_tool buf "$(BUF_VERSION)" github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION); \
+	install_go_tool wire "$(WIRE_VERSION)" github.com/google/wire/cmd/wire@$(WIRE_VERSION); \
+	install_go_tool golangci-lint "$(GOLANGCI_LINT_VERSION)" github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
+	install_go_tool gofumpt "$(GOFUMPT_VERSION)" mvdan.cc/gofumpt@$(GOFUMPT_VERSION); \
+	install_go_tool goimports "$(GOIMPORTS_VERSION)" golang.org/x/tools/cmd/goimports@$(GOIMPORTS_VERSION); \
+	install_go_tool golines "$(GOLINES_VERSION)" github.com/segmentio/golines@$(GOLINES_VERSION)
+	@if [ ! -x "$(PRE_COMMIT)" ] || [ ! -f "$(TOOL_STAMP_DIR)/pre-commit-$(PRE_COMMIT_VERSION)" ]; then \
+		echo "==> install pre-commit $(PRE_COMMIT_VERSION)"; \
+		$(PYTHON) -m venv "$(TOOL_DIR)/pre-commit-venv"; \
+		"$(TOOL_DIR)/pre-commit-venv/bin/pip" install --disable-pip-version-check "pre-commit==$(PRE_COMMIT_VERSION)"; \
+		find "$(TOOL_STAMP_DIR)" -maxdepth 1 -type f -name 'pre-commit-*' -delete; \
+		: >"$(TOOL_STAMP_DIR)/pre-commit-$(PRE_COMMIT_VERSION)"; \
+	fi
+
+tools.check: ## Check pinned development tools in ./bin
+	@set -e; missing=0; \
+	for pair in \
+		"$(ADDLICENSE):$(ADDLICENSE_VERSION)" "$(BUF):$(BUF_VERSION)" "$(WIRE):$(WIRE_VERSION)" \
+		"$(GOLANGCI_LINT):$(GOLANGCI_LINT_VERSION)" "$(GOFUMPT):$(GOFUMPT_VERSION)" \
+		"$(GOIMPORTS):$(GOIMPORTS_VERSION)" "$(GOLINES):$(GOLINES_VERSION)" "$(PRE_COMMIT):$(PRE_COMMIT_VERSION)"; do \
+		binary="$${pair%%:*}"; version="$${pair##*:}"; name="$$(basename "$$binary")"; \
+		case "$$binary" in *pre-commit-venv/*) name=pre-commit;; esac; \
+		if [ ! -x "$$binary" ] || [ ! -f "$(TOOL_STAMP_DIR)/$$name-$$version" ]; then \
+			echo "missing tool or version stamp: $$name $$version (run make tools.install)" >&2; missing=1; \
+		fi; \
+	done; \
+	[ "$$missing" -eq 0 ]
+
+license: ## Add Apache 2.0 headers to supported source files
+	$(call require-tool,$(ADDLICENSE),addlicense,$(ADDLICENSE_VERSION))
+	$(ADDLICENSE) -l apache -c Codesjoy -y "$(COPYRIGHT_YEAR)" $(LICENSE_IGNORES) $(LICENSE_SCAN_DIRS)
+
+license-check: ## Check Apache 2.0 headers in supported source files
+	$(call require-tool,$(ADDLICENSE),addlicense,$(ADDLICENSE_VERSION))
+	$(ADDLICENSE) -check -l apache -c Codesjoy -y "$(COPYRIGHT_YEAR)" $(LICENSE_IGNORES) $(LICENSE_SCAN_DIRS)
+	@grep -q 'Apache License' LICENSE && grep -q 'Version 2.0' LICENSE || { echo 'LICENSE is not Apache License 2.0' >&2; exit 1; }
+	@set -e; for file in $(LICENSE_MANUAL_FILES); do \
+		grep -Eq 'Copyright (\{\{YEAR\}\}|[0-9]{4}) Codesjoy' "$$file" || { echo "missing license header: $$file" >&2; exit 1; }; \
+		grep -q 'Licensed under the Apache License, Version 2.0' "$$file" || { echo "missing Apache 2.0 header: $$file" >&2; exit 1; }; \
+	done
 
 scaffold-service: ## Create SERVICE with PROFILE=service|contract|client
 	@test -n "$(SERVICE)" || { echo "SERVICE is required" >&2; exit 2; }
@@ -25,33 +133,43 @@ release-test: ## Verify optional module release graph discovery
 	./scripts/test-module-release.sh
 
 proto: ## Generate contracts for SERVICE and tidy its generated module
+	$(call require-tool,$(BUF),buf,$(BUF_VERSION))
 	@test -f "gen/go/$(SERVICE)/go.mod" || { echo "service $(SERVICE) has no generated-contract module" >&2; exit 2; }
-	cd api && buf generate --path "sindri/$(SERVICE)"
+	cd api && "$(BUF)" generate --path "sindri/$(SERVICE)"
 	cd "gen/go/$(SERVICE)" && GOWORK=off $(GO) mod tidy
 
 proto-lint: ## Lint and build all Protocol Buffer modules
-	cd api && buf lint
-	cd api && buf build >/dev/null
+	$(call require-tool,$(BUF),buf,$(BUF_VERSION))
+	cd api && "$(BUF)" lint
+	cd api && "$(BUF)" build >/dev/null
 
 proto-breaking-check: ## Reject breaking Proto changes against main
-	buf breaking api --against '.git#branch=main,subdir=api'
+	$(call require-tool,$(BUF),buf,$(BUF_VERSION))
+	"$(BUF)" breaking api --against '.git#branch=main,subdir=api'
 
 wire: ## Regenerate Wire output for SERVICE
+	$(call require-tool,$(WIRE),wire,$(WIRE_VERSION))
+	@test -x "$$(command -v gofmt 2>/dev/null || true)" || { echo 'gofmt is required' >&2; exit 1; }
 	@test -d "internal/$(SERVICE)/app" || { echo "unknown service: $(SERVICE)" >&2; exit 2; }
-	cd "internal/$(SERVICE)/app" && GOCACHE=$(GOCACHE) sh ../../../scripts/generate-wire.sh
+	cd "internal/$(SERVICE)/app" && GOCACHE=$(GOCACHE) WIRE_BIN="$(WIRE)" sh ../../../scripts/generate-wire.sh
 
 go-lint: ## Run golangci-lint once per module
+	$(call require-tool,$(GOLANGCI_LINT),golangci-lint,$(GOLANGCI_LINT_VERSION))
 	@set -e; for module in $(MODULES); do \
 		echo "==> lint $$module"; \
-		(cd "$$module" && GOCACHE=$(GOCACHE) GOLANGCI_LINT_CACHE=$(GOLANGCI_LINT_CACHE) golangci-lint run ./...); \
+		(cd "$$module" && GOCACHE=$(GOCACHE) GOLANGCI_LINT_CACHE=$(GOLANGCI_LINT_CACHE) "$(GOLANGCI_LINT)" run ./...); \
 	done
 
 go-fix: ## Apply Go formatting and safe lint fixes once per module
-	gofumpt -w cmd internal pkg tests
-	goimports -w cmd internal pkg tests
-	golines -w cmd internal pkg tests
+	$(call require-tool,$(GOFUMPT),gofumpt,$(GOFUMPT_VERSION))
+	$(call require-tool,$(GOIMPORTS),goimports,$(GOIMPORTS_VERSION))
+	$(call require-tool,$(GOLINES),golines,$(GOLINES_VERSION))
+	$(call require-tool,$(GOLANGCI_LINT),golangci-lint,$(GOLANGCI_LINT_VERSION))
+	"$(GOFUMPT)" -w cmd internal pkg tests
+	"$(GOIMPORTS)" -w cmd internal pkg tests
+	"$(GOLINES)" -w cmd internal pkg tests
 	@set -e; for module in $(MODULES); do \
-		(cd "$$module" && GOCACHE=$(GOCACHE) GOLANGCI_LINT_CACHE=$(GOLANGCI_LINT_CACHE) golangci-lint run --fix ./...); \
+		(cd "$$module" && GOCACHE=$(GOCACHE) GOLANGCI_LINT_CACHE=$(GOLANGCI_LINT_CACHE) "$(GOLANGCI_LINT)" run --fix ./...); \
 	done
 
 fmt-check: ## Verify Go formatting without rewriting source
@@ -81,6 +199,7 @@ modules-check: ## Verify all publishable modules without workspace replacement
 release-check: proto-lint modules-check ## Validate SERVICE before creating module tags
 
 build-sequence-test-image: ## Build the real Sequence process image used by system tests
+	@test -x "$$(command -v docker 2>/dev/null || true)" || { echo 'docker is required for sequence system tests' >&2; exit 1; }
 	mkdir -p artifacts/sequence
 	GOCACHE=$(GOCACHE) CGO_ENABLED=0 GOOS=linux $(GO) build -trimpath -o artifacts/sequence/sequence ./cmd/sequence
 	docker build --progress=plain -f tests/sequence/testdata/Dockerfile -t $(SEQUENCE_SYSTEM_IMAGE) .
@@ -94,8 +213,5 @@ test-sequence-chaos: build-sequence-test-image ## Run deterministic Sequence sys
 verify: fmt-check proto-lint scaffold-test release-test test test-race build modules-check ## Run the complete merge gate
 
 hooks.install: ## Install pre-commit and commit-msg hooks
-	@if ! command -v pre-commit >/dev/null 2>&1; then \
-		echo "pre-commit not found, installing via pipx..."; \
-		pipx install pre-commit; \
-	fi
-	pre-commit install --install-hooks
+	$(call require-tool,$(PRE_COMMIT),pre-commit,$(PRE_COMMIT_VERSION))
+	"$(PRE_COMMIT)" install --install-hooks

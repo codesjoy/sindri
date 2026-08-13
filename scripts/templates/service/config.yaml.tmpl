@@ -1,4 +1,4 @@
-# Copyright 2026 Codesjoy
+# Copyright {{YEAR}} Codesjoy
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,30 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-server:
-  http_listen_port: 3200
-
-distributor:
-  receivers:
-    otlp:
-      protocols:
-        grpc:
-          endpoint: 0.0.0.0:4317
-        http:
-          endpoint: 0.0.0.0:4318
-
-storage:
-  trace:
-    backend: local
-    wal:
-      path: /var/tempo/wal
-    local:
-      path: /var/tempo/blocks
-
-compactor:
-  compaction:
-    block_retention: 48h
-
-usage_report:
-  reporting_enabled: false

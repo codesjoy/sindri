@@ -6,6 +6,8 @@
 package app
 
 import (
+	"log/slog"
+
 	"github.com/codesjoy/sindri/internal/pkg/xgorm"
 	"github.com/codesjoy/sindri/internal/sequence/biz"
 	"github.com/codesjoy/sindri/internal/sequence/conf"
@@ -14,14 +16,14 @@ import (
 	"github.com/codesjoy/sindri/internal/sequence/service"
 	"github.com/codesjoy/sindri/internal/sequence/task"
 	"github.com/codesjoy/yggdrasil/v3"
+	"github.com/codesjoy/yggdrasil/v3/app"
 	"go.opentelemetry.io/otel/metric"
-	"log/slog"
 )
 
 // Injectors from wire.go:
 
 // InitializeBundle builds the complete sequence process bundle.
-func InitializeBundle(rt yggdrasil.Runtime, cfg *conf.Config) (*yggdrasil.BusinessBundle, error) {
+func InitializeBundle(rt app.Runtime, cfg *conf.Config) (*app.BusinessBundle, error) {
 	config := cfg.Database
 	database, err := xgorm.New(rt, config)
 	if err != nil {
@@ -46,8 +48,8 @@ func InitializeBundle(rt yggdrasil.Runtime, cfg *conf.Config) (*yggdrasil.Busine
 	nodeManager := biz.NewNodeManager(bizNodeConfig, allocator, routeRepo, routeCache, logger)
 	ticker := task.NewTicker(taskConfig, nodeManager)
 	sequenceService := service.NewSequenceService(allocator, routeCache)
-	v := provideBundle(database, nodeConfig, metricsMetrics, ticker, sequenceService)
-	return v, nil
+	businessBundle := provideBundle(database, nodeConfig, metricsMetrics, ticker, sequenceService)
+	return businessBundle, nil
 }
 
 // wire.go:
