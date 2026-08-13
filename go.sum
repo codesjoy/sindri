@@ -646,6 +646,8 @@ github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/testcontainers/testcontainers-go v0.40.0 h1:pSdJYLOVgLE8YdUY2FHQ1Fxu+aMnb6JfVz1mxk7OeMU=
 github.com/testcontainers/testcontainers-go v0.40.0/go.mod h1:FSXV5KQtX2HAMlm7U3APNyLkkap35zNLxukw9oBi/MY=
+github.com/testcontainers/testcontainers-go/modules/etcd v0.40.0 h1:9uZrotowD6Z9qgpd8w46UXi1x5bkhOcpveK5rvWy5u0=
+github.com/testcontainers/testcontainers-go/modules/etcd v0.40.0/go.mod h1:z5saei5a/cpuXYz3MJqJ91RMBYOqw7OXDueN8XKoALA=
 github.com/testcontainers/testcontainers-go/modules/mysql v0.40.0 h1:P9Txfy5Jothx2wFdcus0QoSmX/PKSIXZxrTbZPVJswA=
 github.com/testcontainers/testcontainers-go/modules/mysql v0.40.0/go.mod h1:oZPHHqJqXG7FD8OB/yWH7gLnDvZUlFHAVJNrGftL+eg=
 github.com/testcontainers/testcontainers-go/modules/postgres v0.40.0 h1:s2bIayFXlbDFexo96y+htn7FzuhpXLYJNnIuglNKqOk=
