@@ -69,7 +69,7 @@ Go module or an `internal/pkg/...` tag. Create the service Git release marker
 after all modules referenced by its manifest have been published and verified.
 
 For Sequence v0.1.0, run `make proto SERVICE=sequence`, `make proto-lint`,
-`make modules-check SERVICE=sequence`, and
+`make modules-check SERVICE=sequence`,
 `make service-release-check SERVICE=sequence VERSION=v0.1.0`, then publish in
 this order:
 
@@ -82,7 +82,11 @@ service/sequence/v0.1.0
 After publishing the SDK, verify a temporary repository-external module can run
 `go get github.com/codesjoy/sindri/pkg/sequence@v0.1.0` and compile a minimal
 import. Publishing remains an explicit manual operation; repository checks do not
-push or create tags.
+push or create tags. After publishing, run `make chglog` or
+`make chglog MONTH=YYYY-MM` and commit the updated repository changelog at
+`CHANGELOG.md`. The changelog is a monthly repository summary and is not release
+evidence for a service or module. Module tags and service tags remain the
+release evidence for consumers and deployable services.
 
 Create an annotated service tag whose message repeats the manifest mapping:
 

@@ -34,6 +34,7 @@ printf 'go 1.26.4\n' >"$fixture/go.work"
 	test -f configs/alpha.yaml
 	test -f releases/services/alpha.yaml
 	grep -q '^service: alpha$' releases/services/alpha.yaml
+	test ! -e releases/services/alpha.md
 	test -f migrations/alpha/postgres/.gitkeep
 	test -f tests/alpha/.gitkeep
 	test -f .github/workflows/alpha.yml

@@ -33,18 +33,21 @@ BUF_VERSION := v1.55.1
 WIRE_VERSION := v0.7.0
 GOLANGCI_LINT_VERSION := v2.12.2
 PRE_COMMIT_VERSION := 4.6.1
+GIT_CLIFF_VERSION := 2.13.1
 
 ADDLICENSE := $(TOOL_DIR)/addlicense
 BUF := $(TOOL_DIR)/buf
 WIRE := $(TOOL_DIR)/wire
 GOLANGCI_LINT := $(TOOL_DIR)/golangci-lint
 PRE_COMMIT := $(TOOL_DIR)/pre-commit-venv/bin/pre-commit
+GIT_CLIFF := $(TOOL_DIR)/git-cliff
 
-LICENSE_SCAN_DIRS := cmd internal pkg gen tests tools api deploy releases scripts .github/workflows configs .golangci.yaml .pre-commit-config.yaml
+LICENSE_SCAN_DIRS := cmd internal pkg gen tests tools api deploy releases scripts .github/workflows configs .golangci.yaml .pre-commit-config.yaml cliff.toml
 LICENSE_IGNORES := -ignore '**/*.pb.go' -ignore '**/wire_gen.go' -ignore '**/*.sum' \
 	-ignore '**/*.mod' -ignore '**/*.work' -ignore '**/*.lock' -ignore '**/*.tmpl' \
 	-ignore 'LICENSE'
 LICENSE_MANUAL_FILES := Makefile deploy/docker/Dockerfile.go-service deploy/docker/Dockerfile.goose \
+	scripts/install-tools.sh \
 	scripts/templates/service/config.yaml.tmpl scripts/templates/service/main.go.tmpl \
 	scripts/templates/service/pkg.doc.go.tmpl scripts/templates/service/reason.proto.tmpl \
 	scripts/templates/service/release.yaml.tmpl \
@@ -55,7 +58,7 @@ define require-tool
 	@test -x "$(1)" && test -f "$(TOOL_STAMP_DIR)/$(2)-$(3)" || { echo '$(2) $(3) is missing; run make tools.install' >&2; exit 1; }
 endef
 
-.PHONY: scaffold-service scaffold-test release-test tools.install tools.check license license-check \
+.PHONY: scaffold-service scaffold-test release-test chglog chglog-init chglog-test tools.install tools.check license license-check \
 	proto proto-lint proto-breaking-check wire \
 	fmt-check test test-race build modules-check service-release-check release-check \
 	build-sequence-test-image test-sequence-integration test-sequence-chaos \
@@ -64,35 +67,19 @@ endef
 tools.install: ## Install pinned development tools into ./bin
 	@test -x "$$(command -v $(GO) 2>/dev/null || true)" || { echo 'go is required to install tools' >&2; exit 1; }
 	@test -x "$$(command -v $(PYTHON) 2>/dev/null || true)" || { echo 'python3 is required to install pre-commit' >&2; exit 1; }
-	mkdir -p "$(TOOL_DIR)" "$(TOOL_STAMP_DIR)"
-	@set -e; \
-	install_go_tool() { \
-		name="$$1"; version="$$2"; package="$$3"; \
-		stamp="$(TOOL_STAMP_DIR)/$$name-$$version"; binary="$(TOOL_DIR)/$$name"; \
-		if [ ! -x "$$binary" ] || [ ! -f "$$stamp" ]; then \
-			echo "==> install $$name $$version"; \
-			GOBIN="$(TOOL_DIR)" $(GO) install "$$package"; \
-			find "$(TOOL_STAMP_DIR)" -maxdepth 1 -type f -name "$$name-*" -delete; \
-			: >"$$stamp"; \
-		fi; \
-	}; \
-	install_go_tool addlicense "$(ADDLICENSE_VERSION)" github.com/google/addlicense@$(ADDLICENSE_VERSION); \
-	install_go_tool buf "$(BUF_VERSION)" github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION); \
-	install_go_tool wire "$(WIRE_VERSION)" github.com/google/wire/cmd/wire@$(WIRE_VERSION); \
-	install_go_tool golangci-lint "$(GOLANGCI_LINT_VERSION)" github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
-	@if [ ! -x "$(PRE_COMMIT)" ] || [ ! -f "$(TOOL_STAMP_DIR)/pre-commit-$(PRE_COMMIT_VERSION)" ]; then \
-		echo "==> install pre-commit $(PRE_COMMIT_VERSION)"; \
-		$(PYTHON) -m venv "$(TOOL_DIR)/pre-commit-venv"; \
-		"$(TOOL_DIR)/pre-commit-venv/bin/pip" install --disable-pip-version-check "pre-commit==$(PRE_COMMIT_VERSION)"; \
-		find "$(TOOL_STAMP_DIR)" -maxdepth 1 -type f -name 'pre-commit-*' -delete; \
-		: >"$(TOOL_STAMP_DIR)/pre-commit-$(PRE_COMMIT_VERSION)"; \
-	fi
+	@test -x "$$(command -v curl 2>/dev/null || true)" || { echo 'curl is required to install binary tools' >&2; exit 1; }
+	@test -x "$$(command -v tar 2>/dev/null || true)" || { echo 'tar is required to install binary tools' >&2; exit 1; }
+	TOOL_DIR="$(TOOL_DIR)" TOOL_STAMP_DIR="$(TOOL_STAMP_DIR)" GO_BIN="$(GO)" PYTHON_BIN="$(PYTHON)" \
+		ADDLICENSE_VERSION="$(ADDLICENSE_VERSION)" BUF_VERSION="$(BUF_VERSION)" WIRE_VERSION="$(WIRE_VERSION)" \
+		GOLANGCI_LINT_VERSION="$(GOLANGCI_LINT_VERSION)" PRE_COMMIT_VERSION="$(PRE_COMMIT_VERSION)" \
+		GIT_CLIFF_VERSION="$(GIT_CLIFF_VERSION)" ./scripts/install-tools.sh
 
 tools.check: ## Check pinned development tools in ./bin
 	@set -e; missing=0; \
 	for pair in \
 		"$(ADDLICENSE):$(ADDLICENSE_VERSION)" "$(BUF):$(BUF_VERSION)" "$(WIRE):$(WIRE_VERSION)" \
-		"$(GOLANGCI_LINT):$(GOLANGCI_LINT_VERSION)" "$(PRE_COMMIT):$(PRE_COMMIT_VERSION)"; do \
+		"$(GOLANGCI_LINT):$(GOLANGCI_LINT_VERSION)" "$(GIT_CLIFF):$(GIT_CLIFF_VERSION)" \
+		"$(PRE_COMMIT):$(PRE_COMMIT_VERSION)"; do \
 		binary="$${pair%%:*}"; version="$${pair##*:}"; name="$$(basename "$$binary")"; \
 		case "$$binary" in *pre-commit-venv/*) name=pre-commit;; esac; \
 		if [ ! -x "$$binary" ] || [ ! -f "$(TOOL_STAMP_DIR)/$$name-$$version" ]; then \
@@ -124,6 +111,17 @@ scaffold-test: ## Verify scaffold validation and rollback behavior
 release-test: ## Verify optional module release graph discovery
 	./scripts/test-module-release.sh
 	GOCACHE=$(GOCACHE) $(GO) test ./tools/service-release-check
+
+chglog: ## Update the monthly repository changelog section
+	$(call require-tool,$(GIT_CLIFF),git-cliff,$(GIT_CLIFF_VERSION))
+	GIT_CLIFF_BIN="$(GIT_CLIFF)" ./scripts/chglog.sh month "$(MONTH)"
+
+chglog-init: ## Rebuild repository changelog from commit months
+	$(call require-tool,$(GIT_CLIFF),git-cliff,$(GIT_CLIFF_VERSION))
+	GIT_CLIFF_BIN="$(GIT_CLIFF)" ./scripts/chglog.sh init
+
+chglog-test: ## Verify monthly repository changelog scaffolding
+	./scripts/test-chglog.sh
 
 proto: ## Generate contracts for SERVICE and tidy its generated module
 	$(call require-tool,$(BUF),buf,$(BUF_VERSION))
@@ -203,7 +201,7 @@ test-sequence-integration: build-sequence-test-image ## Run Sequence store and E
 test-sequence-chaos: build-sequence-test-image ## Run deterministic Sequence system and chaos tests
 	GOCACHE=$(GOCACHE) SKULD_SEQUENCE_TEST_DIALECTS=$(SEQUENCE_TEST_DIALECTS) SKULD_SEQUENCE_TEST_IMAGE=$(SEQUENCE_SYSTEM_IMAGE) $(GO) test -tags='integration chaos' -count=1 -timeout=40m ./tests/sequence/...
 
-verify: fmt-check proto-lint scaffold-test release-test test test-race build modules-check ## Run the complete merge gate
+verify: fmt-check proto-lint scaffold-test release-test chglog-test test test-race build modules-check ## Run the complete merge gate
 
 hooks.install: ## Install pre-commit and commit-msg hooks
 	$(call require-tool,$(PRE_COMMIT),pre-commit,$(PRE_COMMIT_VERSION))
