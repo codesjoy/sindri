@@ -32,18 +32,12 @@ ADDLICENSE_VERSION := v1.2.0
 BUF_VERSION := v1.55.1
 WIRE_VERSION := v0.7.0
 GOLANGCI_LINT_VERSION := v2.12.2
-GOFUMPT_VERSION := v0.9.2
-GOIMPORTS_VERSION := v0.42.0
-GOLINES_VERSION := v0.13.0
 PRE_COMMIT_VERSION := 4.6.1
 
 ADDLICENSE := $(TOOL_DIR)/addlicense
 BUF := $(TOOL_DIR)/buf
 WIRE := $(TOOL_DIR)/wire
 GOLANGCI_LINT := $(TOOL_DIR)/golangci-lint
-GOFUMPT := $(TOOL_DIR)/gofumpt
-GOIMPORTS := $(TOOL_DIR)/goimports
-GOLINES := $(TOOL_DIR)/golines
 PRE_COMMIT := $(TOOL_DIR)/pre-commit-venv/bin/pre-commit
 
 LICENSE_SCAN_DIRS := cmd internal pkg gen tests tools api deploy releases scripts .github/workflows configs .golangci.yaml .pre-commit-config.yaml
@@ -85,10 +79,7 @@ tools.install: ## Install pinned development tools into ./bin
 	install_go_tool addlicense "$(ADDLICENSE_VERSION)" github.com/google/addlicense@$(ADDLICENSE_VERSION); \
 	install_go_tool buf "$(BUF_VERSION)" github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION); \
 	install_go_tool wire "$(WIRE_VERSION)" github.com/google/wire/cmd/wire@$(WIRE_VERSION); \
-	install_go_tool golangci-lint "$(GOLANGCI_LINT_VERSION)" github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
-	install_go_tool gofumpt "$(GOFUMPT_VERSION)" mvdan.cc/gofumpt@$(GOFUMPT_VERSION); \
-	install_go_tool goimports "$(GOIMPORTS_VERSION)" golang.org/x/tools/cmd/goimports@$(GOIMPORTS_VERSION); \
-	install_go_tool golines "$(GOLINES_VERSION)" github.com/segmentio/golines@$(GOLINES_VERSION)
+	install_go_tool golangci-lint "$(GOLANGCI_LINT_VERSION)" github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 	@if [ ! -x "$(PRE_COMMIT)" ] || [ ! -f "$(TOOL_STAMP_DIR)/pre-commit-$(PRE_COMMIT_VERSION)" ]; then \
 		echo "==> install pre-commit $(PRE_COMMIT_VERSION)"; \
 		$(PYTHON) -m venv "$(TOOL_DIR)/pre-commit-venv"; \
@@ -101,8 +92,7 @@ tools.check: ## Check pinned development tools in ./bin
 	@set -e; missing=0; \
 	for pair in \
 		"$(ADDLICENSE):$(ADDLICENSE_VERSION)" "$(BUF):$(BUF_VERSION)" "$(WIRE):$(WIRE_VERSION)" \
-		"$(GOLANGCI_LINT):$(GOLANGCI_LINT_VERSION)" "$(GOFUMPT):$(GOFUMPT_VERSION)" \
-		"$(GOIMPORTS):$(GOIMPORTS_VERSION)" "$(GOLINES):$(GOLINES_VERSION)" "$(PRE_COMMIT):$(PRE_COMMIT_VERSION)"; do \
+		"$(GOLANGCI_LINT):$(GOLANGCI_LINT_VERSION)" "$(PRE_COMMIT):$(PRE_COMMIT_VERSION)"; do \
 		binary="$${pair%%:*}"; version="$${pair##*:}"; name="$$(basename "$$binary")"; \
 		case "$$binary" in *pre-commit-venv/*) name=pre-commit;; esac; \
 		if [ ! -x "$$binary" ] || [ ! -f "$(TOOL_STAMP_DIR)/$$name-$$version" ]; then \
@@ -164,19 +154,15 @@ go-lint: ## Run golangci-lint once per module
 	done
 
 go-fix: ## Apply Go formatting and safe lint fixes once per module
-	$(call require-tool,$(GOFUMPT),gofumpt,$(GOFUMPT_VERSION))
-	$(call require-tool,$(GOIMPORTS),goimports,$(GOIMPORTS_VERSION))
-	$(call require-tool,$(GOLINES),golines,$(GOLINES_VERSION))
 	$(call require-tool,$(GOLANGCI_LINT),golangci-lint,$(GOLANGCI_LINT_VERSION))
-	"$(GOFUMPT)" -w cmd internal pkg tests tools
-	"$(GOIMPORTS)" -w cmd internal pkg tests tools
-	"$(GOLINES)" -w cmd internal pkg tests tools
+	"$(GOLANGCI_LINT)" fmt
 	@set -e; for module in $(MODULES); do \
 		(cd "$$module" && GOCACHE=$(GOCACHE) GOLANGCI_LINT_CACHE=$(GOLANGCI_LINT_CACHE) "$(GOLANGCI_LINT)" run --fix ./...); \
 	done
 
 fmt-check: ## Verify Go formatting without rewriting source
-	@test -z "$$(gofmt -l $$(find cmd internal pkg tests tools -name '*.go' -type f -print))" || { echo 'gofmt: unformatted Go files' >&2; exit 1; }
+	$(call require-tool,$(GOLANGCI_LINT),golangci-lint,$(GOLANGCI_LINT_VERSION))
+	"$(GOLANGCI_LINT)" fmt --diff
 
 test: ## Run unit and component tests in every workspace module
 	@set -e; for module in $(MODULES); do \
