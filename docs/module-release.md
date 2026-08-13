@@ -28,6 +28,34 @@ users and are not release evidence. Run
 `make modules-check SERVICE=<service>` to test the service's independent modules
 with `GOWORK=off` and to compile an external SDK consumer when an SDK exists.
 
+## Service release manifests
+
+Deployable services remain in the root Go module but have independent Git
+release markers named `service/<service>/vX.Y.Z`. A service tag is not a Go
+module tag and does not make `cmd/<service>` or `internal/<service>` importable.
+
+Service, contract, and client versions evolve independently. Their authoritative
+compatibility mapping lives in `releases/services/<service>.yaml`:
+
+```yaml
+service: sequence
+releases:
+  - version: v0.1.0
+    contract: gen/go/sequence/v0.1.0
+    tested_clients:
+      - pkg/sequence/v0.1.0
+```
+
+`contract` is optional and `tested_clients` may be empty. A client requires a
+contract. The contract assigned to a service version is immutable; additional
+exact client versions may be appended after the service is released, but an
+existing tested client must not be removed.
+
+Run `make service-release-check SERVICE=<service> VERSION=<version>` before
+creating a service tag. The check validates referenced tags and module
+dependencies, rejects unpublished module source drift, and tests the service
+with `GOWORK=off` after removing root-module local replacements.
+
 ## Release order
 
 Publish only nested modules that exist:
@@ -36,18 +64,38 @@ Publish only nested modules that exist:
 2. Wait until that tag resolves remotely, then update and tag a dependent
    `pkg/<name>/vX.Y.Z`.
 
-Services and `internal/pkg` are part of the root module. Do not create
-per-service or `internal/pkg/...` module tags.
+Services and `internal/pkg` are part of the root module. Do not create a service
+Go module or an `internal/pkg/...` tag. Create the service Git release marker
+after all modules referenced by its manifest have been published and verified.
 
-For Sequence v0.1.0, run `make proto SERVICE=sequence`, `make proto-lint`, and
-`make modules-check SERVICE=sequence`, then publish in this order:
+For Sequence v0.1.0, run `make proto SERVICE=sequence`, `make proto-lint`,
+`make modules-check SERVICE=sequence`, and
+`make service-release-check SERVICE=sequence VERSION=v0.1.0`, then publish in
+this order:
 
 ```text
 gen/go/sequence/v0.1.0
 pkg/sequence/v0.1.0
+service/sequence/v0.1.0
 ```
 
 After publishing the SDK, verify a temporary repository-external module can run
 `go get github.com/codesjoy/sindri/pkg/sequence@v0.1.0` and compile a minimal
 import. Publishing remains an explicit manual operation; repository checks do not
 push or create tags.
+
+Create an annotated service tag whose message repeats the manifest mapping:
+
+```text
+release service/sequence v0.1.0
+
+Contract: gen/go/sequence/v0.1.0
+Tested-Client: pkg/sequence/v0.1.0
+```
+
+A service-only patch can reuse the existing contract and tested clients. A
+client-only patch needs no new service tag: publish the client, verify it against
+the existing service, and append its exact tag to that service release entry.
+Compatible RPC changes publish contract, then client, then service. Breaking RPC
+changes bump each affected artifact independently; equal version numbers do not
+imply compatibility.

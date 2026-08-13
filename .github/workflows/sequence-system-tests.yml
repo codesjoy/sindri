@@ -36,6 +36,8 @@ on:
       - "scripts/scaffold-service.sh"
       - "scripts/test-scaffold-service.sh"
       - "scripts/templates/service/**"
+      - "tools/service-release-check/**"
+      - "releases/services/sequence.yaml"
       - ".github/workflows/sequence-system-tests.yml"
   schedule:
     - cron: "17 18 * * *"
@@ -57,6 +59,8 @@ jobs:
       mysql: ${{ steps.filter.outputs.mysql }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - id: filter
         uses: dorny/paths-filter@v3
         with:
@@ -79,6 +83,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -87,7 +93,9 @@ jobs:
             gen/go/sequence/go.sum
             pkg/sequence/go.sum
       - name: Verify workspace modules
-        run: make scaffold-test release-test test build modules-check SERVICE=sequence
+        run: >-
+          make scaffold-test release-test test build modules-check
+          service-release-check SERVICE=sequence VERSION=v0.1.0
 
   integration-postgres:
     if: github.event_name == 'pull_request'

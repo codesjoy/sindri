@@ -18,6 +18,7 @@ PYTHON ?= python3
 
 SERVICE ?= sequence
 PROFILE ?= service
+VERSION ?=
 MODULES := . $(shell find gen/go pkg -name go.mod -type f -print 2>/dev/null | sed 's|/go.mod$$||' | sort)
 GOCACHE ?= /tmp/sindri-gocache
 GOLANGCI_LINT_CACHE ?= /tmp/sindri-golangci-cache
@@ -45,13 +46,14 @@ GOIMPORTS := $(TOOL_DIR)/goimports
 GOLINES := $(TOOL_DIR)/golines
 PRE_COMMIT := $(TOOL_DIR)/pre-commit-venv/bin/pre-commit
 
-LICENSE_SCAN_DIRS := cmd internal pkg gen tests api deploy scripts .github/workflows configs .golangci.yaml .pre-commit-config.yaml
+LICENSE_SCAN_DIRS := cmd internal pkg gen tests tools api deploy releases scripts .github/workflows configs .golangci.yaml .pre-commit-config.yaml
 LICENSE_IGNORES := -ignore '**/*.pb.go' -ignore '**/wire_gen.go' -ignore '**/*.sum' \
 	-ignore '**/*.mod' -ignore '**/*.work' -ignore '**/*.lock' -ignore '**/*.tmpl' \
 	-ignore 'LICENSE'
 LICENSE_MANUAL_FILES := Makefile deploy/docker/Dockerfile.go-service deploy/docker/Dockerfile.goose \
 	scripts/templates/service/config.yaml.tmpl scripts/templates/service/main.go.tmpl \
 	scripts/templates/service/pkg.doc.go.tmpl scripts/templates/service/reason.proto.tmpl \
+	scripts/templates/service/release.yaml.tmpl \
 	scripts/templates/service/service.proto.tmpl scripts/templates/service/workflow.client.yml.tmpl \
 	scripts/templates/service/workflow.contract.yml.tmpl scripts/templates/service/workflow.service.yml.tmpl
 
@@ -61,7 +63,7 @@ endef
 
 .PHONY: scaffold-service scaffold-test release-test tools.install tools.check license license-check \
 	proto proto-lint proto-breaking-check wire \
-	fmt-check test test-race build modules-check release-check \
+	fmt-check test test-race build modules-check service-release-check release-check \
 	build-sequence-test-image test-sequence-integration test-sequence-chaos \
 	go-lint go-fix verify hooks.install
 
@@ -131,6 +133,7 @@ scaffold-test: ## Verify scaffold validation and rollback behavior
 
 release-test: ## Verify optional module release graph discovery
 	./scripts/test-module-release.sh
+	GOCACHE=$(GOCACHE) $(GO) test ./tools/service-release-check
 
 proto: ## Generate contracts for SERVICE and tidy its generated module
 	$(call require-tool,$(BUF),buf,$(BUF_VERSION))
@@ -165,15 +168,15 @@ go-fix: ## Apply Go formatting and safe lint fixes once per module
 	$(call require-tool,$(GOIMPORTS),goimports,$(GOIMPORTS_VERSION))
 	$(call require-tool,$(GOLINES),golines,$(GOLINES_VERSION))
 	$(call require-tool,$(GOLANGCI_LINT),golangci-lint,$(GOLANGCI_LINT_VERSION))
-	"$(GOFUMPT)" -w cmd internal pkg tests
-	"$(GOIMPORTS)" -w cmd internal pkg tests
-	"$(GOLINES)" -w cmd internal pkg tests
+	"$(GOFUMPT)" -w cmd internal pkg tests tools
+	"$(GOIMPORTS)" -w cmd internal pkg tests tools
+	"$(GOLINES)" -w cmd internal pkg tests tools
 	@set -e; for module in $(MODULES); do \
 		(cd "$$module" && GOCACHE=$(GOCACHE) GOLANGCI_LINT_CACHE=$(GOLANGCI_LINT_CACHE) "$(GOLANGCI_LINT)" run --fix ./...); \
 	done
 
 fmt-check: ## Verify Go formatting without rewriting source
-	@test -z "$$(gofmt -l $$(find cmd internal pkg tests -name '*.go' -type f -print))" || { echo 'gofmt: unformatted Go files' >&2; exit 1; }
+	@test -z "$$(gofmt -l $$(find cmd internal pkg tests tools -name '*.go' -type f -print))" || { echo 'gofmt: unformatted Go files' >&2; exit 1; }
 
 test: ## Run unit and component tests in every workspace module
 	@set -e; for module in $(MODULES); do \
@@ -196,7 +199,11 @@ build: ## Build every workspace module
 modules-check: ## Verify all publishable modules without workspace replacement
 	./scripts/check-module-release.sh "$(SERVICE)"
 
-release-check: proto-lint modules-check ## Validate SERVICE before creating module tags
+service-release-check: ## Validate SERVICE VERSION against published modules
+	@test -n "$(VERSION)" || { echo "VERSION is required" >&2; exit 2; }
+	GOCACHE=$(GOCACHE) $(GO) run ./tools/service-release-check -service "$(SERVICE)" -version "$(VERSION)"
+
+release-check: proto-lint modules-check ## Validate SERVICE modules before creating module tags
 
 build-sequence-test-image: ## Build the real Sequence process image used by system tests
 	@test -x "$$(command -v docker 2>/dev/null || true)" || { echo 'docker is required for sequence system tests' >&2; exit 1; }

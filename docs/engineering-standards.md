@@ -192,9 +192,15 @@ module-isolation, and protocol-generation checks (normally `make build`,
 
 - Nested module tags MUST include the module directory, for example
   `gen/go/sequence/v0.1.0` and `pkg/sequence/v0.1.0`.
-- Services and `internal/pkg` remain in the root module and are not released with
-  per-directory module tags. Release only independent modules that exist. The
-  dependency order is generated contracts first, then a dependent public client.
+- Services remain in the root module but use `service/<service>/vX.Y.Z` Git tags
+  as deployment release markers. Service tags are not Go module versions and do
+  not make `internal/<service>` independently importable. `internal/pkg` is not
+  tagged independently.
+- Every service release MUST have a `releases/services/<service>.yaml` entry that
+  records its immutable contract tag and exact tested client tags. Tested clients
+  MAY be appended after service publication; existing clients MUST NOT be removed.
+- Release only independent modules that exist. The dependency order is generated
+  contracts first, then a dependent public client, then the service.
   A downstream `go.mod` may reference a version only after that upstream version
   is available from the remote module source.
 - A dependency module's `replace` directive is ignored by its consumers. Local

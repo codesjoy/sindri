@@ -35,7 +35,7 @@ esac
 repo_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
 
-targets="cmd/$service internal/$service configs/$service.yaml migrations/$service tests/$service .github/workflows/$service.yml"
+targets="cmd/$service internal/$service configs/$service.yaml migrations/$service tests/$service releases/services/$service.yaml .github/workflows/$service.yml"
 if [ "$profile" != service ]; then
 	targets="api/sindri/$service gen/go/$service $targets"
 fi
@@ -81,10 +81,12 @@ mkdir -p \
 	"$stage/migrations/$service/postgres" \
 	"$stage/migrations/$service/mysql" \
 	"$stage/tests/$service" \
+	"$stage/releases/services" \
 	"$stage/.github/workflows"
 
 render scripts/templates/service/main.go.tmpl "$stage/cmd/$service/main.go"
 render scripts/templates/service/config.yaml.tmpl "$stage/configs/$service.yaml"
+render scripts/templates/service/release.yaml.tmpl "$stage/releases/services/$service.yaml"
 render "scripts/templates/service/workflow.$profile.yml.tmpl" "$stage/.github/workflows/$service.yml"
 for directory in \
 	"$stage/internal/$service/app" \

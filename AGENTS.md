@@ -24,6 +24,8 @@ migrations and integration tests live under `migrations/<service>` and
 - `make test`: run unit and component tests in every module.
 - `make modules-check SERVICE=sequence`: verify publishable modules with
   `GOWORK=off` and without local replacements.
+- `make service-release-check SERVICE=sequence VERSION=v0.1.0`: verify a
+  deployable service release against its published contract and tested clients.
 - `make proto SERVICE=sequence`: regenerate and tidy one service's contracts.
 - `make proto-lint`: lint and build all Protocol Buffer definitions.
 - `make wire SERVICE=sequence`: refresh the service's Wire output.
@@ -65,10 +67,11 @@ testcontainers. Put package tests beside code, component tests in
 Follow `.gitlint` Conventional Commit rules: `feat(sequence): add route refresh`,
 with a lowercase subject, no trailing period, and at most 72 characters. Nested
 module tags include the module directory, for example
-`gen/go/sequence/v0.1.0` and `pkg/sequence/v0.1.0`. The root module contains the
-services and shared internal code; it is not tagged per service. Release only
-independent modules, in dependency order as documented in
-`docs/module-release.md`.
+`gen/go/sequence/v0.1.0` and `pkg/sequence/v0.1.0`. Deployable services use
+`service/<service>/vX.Y.Z` tags; these are Git release markers, not Go module
+versions. Record the exact contract and tested clients in
+`releases/services/<service>.yaml` and release in dependency order as documented
+in `docs/module-release.md`.
 
 Pull requests should explain behavior and architecture impact, identify
 config/schema/API changes, and list commands run. Include generated files and
