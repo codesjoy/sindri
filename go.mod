@@ -1,10 +1,10 @@
-module github.com/codesjoy/skuld
+module github.com/codesjoy/sindri
 
 go 1.26.4
 
 replace (
-	github.com/codesjoy/skuld/gen/go => ./gen/go
-	github.com/codesjoy/skuld/pkg/sequence => ./pkg/sequence
+	github.com/codesjoy/sindri/gen/go/sequence => ./gen/go/sequence
+	github.com/codesjoy/sindri/pkg/sequence => ./pkg/sequence
 )
 
 require (
@@ -13,14 +13,15 @@ require (
 	github.com/codesjoy/pkg/basic/transaction/gorm v0.0.0-20260328013517-15736fbea914
 	github.com/codesjoy/pkg/basic/xerror v0.0.0-20260812100337-f4b6f4ac7d17
 	github.com/codesjoy/pkg/basic/xgorm v0.0.0-20260514091847-8c522c350e05
-	github.com/codesjoy/skuld/gen/go v0.0.0-00010101000000-000000000000
-	github.com/codesjoy/skuld/pkg/sequence v0.0.0-00010101000000-000000000000
+	github.com/codesjoy/sindri/gen/go/sequence v0.1.0
+	github.com/codesjoy/sindri/pkg/sequence v0.1.0
 	github.com/codesjoy/yggdrasil-ecosystem/modules/etcd/v3 v3.0.0-20260429033927-d1bc68f367b9
 	github.com/codesjoy/yggdrasil-ecosystem/modules/otlp/v3 v3.0.0-20260429033927-d1bc68f367b9
 	github.com/codesjoy/yggdrasil-ecosystem/modules/polaris/v3 v3.0.0-20260429033927-d1bc68f367b9
 	github.com/codesjoy/yggdrasil-ecosystem/modules/protovalidate/v3 v3.0.0-20260429033927-d1bc68f367b9
 	github.com/codesjoy/yggdrasil/v3 v3.0.0-rc.4
 	github.com/docker/docker v28.5.1+incompatible
+	github.com/docker/go-connections v0.7.0
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/google/wire v0.7.0
 	github.com/jackc/pgx/v5 v5.10.0
@@ -42,7 +43,7 @@ require (
 )
 
 require (
-	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.11-20260415201107-50325440f8f2.1 // indirect
+	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.12-20260709200747-435963d16310.1 // indirect
 	buf.build/go/protovalidate v1.1.3 // indirect
 	cel.dev/expr v0.25.1 // indirect
 	dario.cat/mergo v1.0.2 // indirect
@@ -56,7 +57,7 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/codesjoy/pkg/basic/transaction v0.0.0-20260328013517-15736fbea914 // indirect
-	github.com/codesjoy/pkg/proto/codesjoy/reason v0.0.0-20260514091847-8c522c350e05 // indirect
+	github.com/codesjoy/pkg/proto/codesjoy/reason v0.0.0-20260812100337-f4b6f4ac7d17 // indirect
 	github.com/codesjoy/pkg/utils v0.0.0-20260316022210-2e62ff5ff745 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
@@ -69,7 +70,6 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/distribution/reference v0.6.0 // indirect
 	github.com/dlclark/regexp2 v1.7.0 // indirect
-	github.com/docker/go-connections v0.7.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/ebitengine/purego v0.8.4 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect

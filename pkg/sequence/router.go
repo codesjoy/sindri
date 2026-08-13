@@ -7,7 +7,7 @@ import (
 	"hash/crc32"
 	"sync"
 
-	sequencev1 "github.com/codesjoy/skuld/gen/go/sequence/v1"
+	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
 	"google.golang.org/protobuf/proto"
 )
 

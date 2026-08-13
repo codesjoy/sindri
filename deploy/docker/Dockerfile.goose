@@ -4,9 +4,7 @@ FROM golang:1.26.4 AS build
 
 WORKDIR /src
 
-COPY go.mod go.sum go.work go.work.sum ./
-COPY gen/go/go.mod gen/go/go.sum ./gen/go/
-COPY pkg/sequence/go.mod pkg/sequence/go.sum ./pkg/sequence/
+COPY . .
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \

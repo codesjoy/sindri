@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/codesjoy/skuld/internal/sequence/biz"
+	"github.com/codesjoy/sindri/internal/sequence/biz"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )

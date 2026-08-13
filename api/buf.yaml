@@ -1,8 +1,8 @@
 version: v2
 
 modules:
-  - path: ./skuld
-    name: buf.build/codesjoy/skuld
+  - path: ./sindri
+    name: buf.build/codesjoy/sindri
 
 lint:
   use:
@@ -17,7 +17,7 @@ lint:
     - ENUM_ZERO_VALUE_SUFFIX
   ignore_only:
     PACKAGE_VERSION_SUFFIX:
-      - skuld/common/reason.proto
+      - sindri/sequence/reason/reason.proto
 
 breaking:
   use:

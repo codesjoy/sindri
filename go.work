@@ -2,6 +2,6 @@ go 1.26.4
 
 use (
 	.
-	./gen/go
+	./gen/go/sequence
 	./pkg/sequence
 )

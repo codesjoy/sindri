@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	fetchNextFullMethod = "/codesjoy.skuld.sequence.v1.SequenceGenerator/FetchNext"
-	getRouteFullMethod  = "/codesjoy.skuld.sequence.v1.SequenceGenerator/GetRoute"
+	fetchNextFullMethod = "/codesjoy.sindri.sequence.v1.SequenceGenerator/FetchNext"
+	getRouteFullMethod  = "/codesjoy.sindri.sequence.v1.SequenceGenerator/GetRoute"
 )
 
 var (

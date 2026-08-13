@@ -10,8 +10,8 @@ import (
 
 	toxiclient "github.com/Shopify/toxiproxy/v2/client"
 	"github.com/codesjoy/pkg/basic/xerror"
-	"github.com/codesjoy/skuld/gen/go/reason"
-	sequencev1 "github.com/codesjoy/skuld/gen/go/sequence/v1"
+	"github.com/codesjoy/sindri/gen/go/sequence/reason"
+	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
 )
 
 func (s *SequenceSystemSuite) TestOwnerTimeoutDuringRouteHandoff() {

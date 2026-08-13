@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package codesjoy.sindri.{{SERVICE}}.reason.v1;
+
+import "codesjoy/reason/v1/reason.proto";
+
+option go_package = "github.com/codesjoy/sindri/gen/go/{{SERVICE}}/reason;reason";
+
+enum Reason {
+  option (codesjoy.reason.v1.default_reason) = 10000;
+
+  REASON_UNSPECIFIED = 0;
+}

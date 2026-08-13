@@ -1,10 +1,10 @@
 syntax = "proto3";
 
-package codesjoy.skuld.reason;
+package codesjoy.sindri.sequence.reason;
 
 import "codesjoy/reason/v1/reason.proto";
 
-option go_package = "skuld/reason;reason";
+option go_package = "github.com/codesjoy/sindri/gen/go/sequence/reason;reason";
 
 enum Reason {
   option (codesjoy.reason.v1.default_reason) = 10000;

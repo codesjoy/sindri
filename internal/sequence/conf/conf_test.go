@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	testkit "github.com/codesjoy/skuld/internal/pkg/tests"
-	"github.com/codesjoy/skuld/internal/pkg/xgorm"
-	"github.com/codesjoy/skuld/internal/sequence/biz"
+	testkit "github.com/codesjoy/sindri/internal/pkg/tests"
+	"github.com/codesjoy/sindri/internal/pkg/xgorm"
+	"github.com/codesjoy/sindri/internal/sequence/biz"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

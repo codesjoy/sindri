@@ -23,7 +23,7 @@ func (r Reason) Reason() string {
 }
 
 func (r Reason) Domain() string {
-	return "codesjoy.skuld.reason"
+	return "codesjoy.sindri.sequence.reason"
 }
 
 func (r Reason) Code() code.Code {

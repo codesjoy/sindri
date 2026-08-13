@@ -31,7 +31,7 @@ func NewSequenceGeneratorClient(cc client.Client) SequenceGeneratorClient {
 
 func (c *sequencegeneratorClient) FetchNext(ctx context.Context, in *FetchNextRequest) (*FetchNextResponse, error) {
 	out := new(FetchNextResponse)
-	err := c.cc.Invoke(ctx, "/codesjoy.skuld.sequence.v1.SequenceGenerator/FetchNext", in, out)
+	err := c.cc.Invoke(ctx, "/codesjoy.sindri.sequence.v1.SequenceGenerator/FetchNext", in, out)
 	if err != nil {
 		return nil, err
 	}
@@ -40,7 +40,7 @@ func (c *sequencegeneratorClient) FetchNext(ctx context.Context, in *FetchNextRe
 
 func (c *sequencegeneratorClient) GetRoute(ctx context.Context, in *GetRouteRequest) (*GetRouteResponse, error) {
 	out := new(GetRouteResponse)
-	err := c.cc.Invoke(ctx, "/codesjoy.skuld.sequence.v1.SequenceGenerator/GetRoute", in, out)
+	err := c.cc.Invoke(ctx, "/codesjoy.sindri.sequence.v1.SequenceGenerator/GetRoute", in, out)
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +57,7 @@ func _SequenceGenerator_FetchNext_Handler(srv interface{}, ctx context.Context, 
 	}
 	info := &interceptor.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: "/codesjoy.skuld.sequence.v1.SequenceGenerator/FetchNext",
+		FullMethod: "/codesjoy.sindri.sequence.v1.SequenceGenerator/FetchNext",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SequenceGeneratorServer).FetchNext(ctx, req.(*FetchNextRequest))
@@ -75,7 +75,7 @@ func _SequenceGenerator_GetRoute_Handler(srv interface{}, ctx context.Context, d
 	}
 	info := &interceptor.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: "/codesjoy.skuld.sequence.v1.SequenceGenerator/GetRoute",
+		FullMethod: "/codesjoy.sindri.sequence.v1.SequenceGenerator/GetRoute",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SequenceGeneratorServer).GetRoute(ctx, req.(*GetRouteRequest))
@@ -108,7 +108,7 @@ func (UnimplementedSequenceGeneratorServer) GetRoute(context.Context, *GetRouteR
 func (UnimplementedSequenceGeneratorServer) mustEmbedUnimplementedSequenceGeneratorServer() {}
 
 var SequenceGeneratorServiceDesc = server.ServiceDesc{
-	ServiceName: "codesjoy.skuld.sequence.v1.SequenceGenerator",
+	ServiceName: "codesjoy.sindri.sequence.v1.SequenceGenerator",
 	HandlerType: (*SequenceGeneratorServer)(nil),
 	Methods: []server.MethodDesc{
 		{
@@ -120,5 +120,5 @@ var SequenceGeneratorServiceDesc = server.ServiceDesc{
 			Handler:    _SequenceGenerator_GetRoute_Handler,
 		},
 	},
-	Metadata: "github.com/codesjoy/skuld/gen/go/sequence/v1/sequence.proto",
+	Metadata: "github.com/codesjoy/sindri/gen/go/sequence/v1/sequence.proto",
 }

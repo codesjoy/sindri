@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	sequencev1 "github.com/codesjoy/skuld/gen/go/sequence/v1"
+	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

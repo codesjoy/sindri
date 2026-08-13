@@ -317,27 +317,27 @@ var File_sequence_v1_sequence_proto protoreflect.FileDescriptor
 
 const file_sequence_v1_sequence_proto_rawDesc = "" +
 	"\n" +
-	"\x1asequence/v1/sequence.proto\x12\x1acodesjoy.skuld.sequence.v1\x1a\x1bbuf/validate/validate.proto\"0\n" +
+	"\x1asequence/v1/sequence.proto\x12\x1bcodesjoy.sindri.sequence.v1\x1a\x1bbuf/validate/validate.proto\"0\n" +
 	"\x10FetchNextRequest\x12\x1c\n" +
 	"\x03key\x18\x01 \x01(\tB\n" +
 	"\xbaH\ar\x05\x10\x01\x18\x80\x02R\x03key\"#\n" +
 	"\x11FetchNextResponse\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x03R\x02id\"6\n" +
 	"\x0fGetRouteRequest\x12#\n" +
-	"\rknown_version\x18\x01 \x01(\x03R\fknownVersion\"v\n" +
+	"\rknown_version\x18\x01 \x01(\x03R\fknownVersion\"w\n" +
 	"\x10GetRouteResponse\x12!\n" +
-	"\fnot_modified\x18\x01 \x01(\bR\vnotModified\x12?\n" +
-	"\x05route\x18\x02 \x01(\v2).codesjoy.skuld.sequence.v1.RouteSnapshotR\x05route\"f\n" +
+	"\fnot_modified\x18\x01 \x01(\bR\vnotModified\x12@\n" +
+	"\x05route\x18\x02 \x01(\v2*.codesjoy.sindri.sequence.v1.RouteSnapshotR\x05route\"g\n" +
 	"\rRouteSnapshot\x12\x18\n" +
-	"\aversion\x18\x01 \x01(\x03R\aversion\x12;\n" +
-	"\x05nodes\x18\x02 \x03(\v2%.codesjoy.skuld.sequence.v1.RouteNodeR\x05nodes\":\n" +
+	"\aversion\x18\x01 \x01(\x03R\aversion\x12<\n" +
+	"\x05nodes\x18\x02 \x03(\v2&.codesjoy.sindri.sequence.v1.RouteNodeR\x05nodes\":\n" +
 	"\tRouteNode\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x14\n" +
-	"\x05slots\x18\x02 \x03(\rR\x05slots2\xe4\x01\n" +
-	"\x11SequenceGenerator\x12h\n" +
-	"\tFetchNext\x12,.codesjoy.skuld.sequence.v1.FetchNextRequest\x1a-.codesjoy.skuld.sequence.v1.FetchNextResponse\x12e\n" +
-	"\bGetRoute\x12+.codesjoy.skuld.sequence.v1.GetRouteRequest\x1a,.codesjoy.skuld.sequence.v1.GetRouteResponseB\xf3\x01\n" +
-	"\x1ecom.codesjoy.skuld.sequence.v1B\rSequenceProtoP\x01Z7github.com/codesjoy/skuld/gen/go/sequence/v1;sequencev1\xa2\x02\x03CSS\xaa\x02\x1aCodesjoy.Skuld.Sequence.V1\xca\x02\x1aCodesjoy\\Skuld\\Sequence\\V1\xe2\x02&Codesjoy\\Skuld\\Sequence\\V1\\GPBMetadata\xea\x02\x1dCodesjoy::Skuld::Sequence::V1b\x06proto3"
+	"\x05slots\x18\x02 \x03(\rR\x05slots2\xe8\x01\n" +
+	"\x11SequenceGenerator\x12j\n" +
+	"\tFetchNext\x12-.codesjoy.sindri.sequence.v1.FetchNextRequest\x1a..codesjoy.sindri.sequence.v1.FetchNextResponse\x12g\n" +
+	"\bGetRoute\x12,.codesjoy.sindri.sequence.v1.GetRouteRequest\x1a-.codesjoy.sindri.sequence.v1.GetRouteResponseB\xf9\x01\n" +
+	"\x1fcom.codesjoy.sindri.sequence.v1B\rSequenceProtoP\x01Z8github.com/codesjoy/sindri/gen/go/sequence/v1;sequencev1\xa2\x02\x03CSS\xaa\x02\x1bCodesjoy.Sindri.Sequence.V1\xca\x02\x1bCodesjoy\\Sindri\\Sequence\\V1\xe2\x02'Codesjoy\\Sindri\\Sequence\\V1\\GPBMetadata\xea\x02\x1eCodesjoy::Sindri::Sequence::V1b\x06proto3"
 
 var (
 	file_sequence_v1_sequence_proto_rawDescOnce sync.Once
@@ -353,20 +353,20 @@ func file_sequence_v1_sequence_proto_rawDescGZIP() []byte {
 
 var file_sequence_v1_sequence_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_sequence_v1_sequence_proto_goTypes = []any{
-	(*FetchNextRequest)(nil),  // 0: codesjoy.skuld.sequence.v1.FetchNextRequest
-	(*FetchNextResponse)(nil), // 1: codesjoy.skuld.sequence.v1.FetchNextResponse
-	(*GetRouteRequest)(nil),   // 2: codesjoy.skuld.sequence.v1.GetRouteRequest
-	(*GetRouteResponse)(nil),  // 3: codesjoy.skuld.sequence.v1.GetRouteResponse
-	(*RouteSnapshot)(nil),     // 4: codesjoy.skuld.sequence.v1.RouteSnapshot
-	(*RouteNode)(nil),         // 5: codesjoy.skuld.sequence.v1.RouteNode
+	(*FetchNextRequest)(nil),  // 0: codesjoy.sindri.sequence.v1.FetchNextRequest
+	(*FetchNextResponse)(nil), // 1: codesjoy.sindri.sequence.v1.FetchNextResponse
+	(*GetRouteRequest)(nil),   // 2: codesjoy.sindri.sequence.v1.GetRouteRequest
+	(*GetRouteResponse)(nil),  // 3: codesjoy.sindri.sequence.v1.GetRouteResponse
+	(*RouteSnapshot)(nil),     // 4: codesjoy.sindri.sequence.v1.RouteSnapshot
+	(*RouteNode)(nil),         // 5: codesjoy.sindri.sequence.v1.RouteNode
 }
 var file_sequence_v1_sequence_proto_depIdxs = []int32{
-	4, // 0: codesjoy.skuld.sequence.v1.GetRouteResponse.route:type_name -> codesjoy.skuld.sequence.v1.RouteSnapshot
-	5, // 1: codesjoy.skuld.sequence.v1.RouteSnapshot.nodes:type_name -> codesjoy.skuld.sequence.v1.RouteNode
-	0, // 2: codesjoy.skuld.sequence.v1.SequenceGenerator.FetchNext:input_type -> codesjoy.skuld.sequence.v1.FetchNextRequest
-	2, // 3: codesjoy.skuld.sequence.v1.SequenceGenerator.GetRoute:input_type -> codesjoy.skuld.sequence.v1.GetRouteRequest
-	1, // 4: codesjoy.skuld.sequence.v1.SequenceGenerator.FetchNext:output_type -> codesjoy.skuld.sequence.v1.FetchNextResponse
-	3, // 5: codesjoy.skuld.sequence.v1.SequenceGenerator.GetRoute:output_type -> codesjoy.skuld.sequence.v1.GetRouteResponse
+	4, // 0: codesjoy.sindri.sequence.v1.GetRouteResponse.route:type_name -> codesjoy.sindri.sequence.v1.RouteSnapshot
+	5, // 1: codesjoy.sindri.sequence.v1.RouteSnapshot.nodes:type_name -> codesjoy.sindri.sequence.v1.RouteNode
+	0, // 2: codesjoy.sindri.sequence.v1.SequenceGenerator.FetchNext:input_type -> codesjoy.sindri.sequence.v1.FetchNextRequest
+	2, // 3: codesjoy.sindri.sequence.v1.SequenceGenerator.GetRoute:input_type -> codesjoy.sindri.sequence.v1.GetRouteRequest
+	1, // 4: codesjoy.sindri.sequence.v1.SequenceGenerator.FetchNext:output_type -> codesjoy.sindri.sequence.v1.FetchNextResponse
+	3, // 5: codesjoy.sindri.sequence.v1.SequenceGenerator.GetRoute:output_type -> codesjoy.sindri.sequence.v1.GetRouteResponse
 	4, // [4:6] is the sub-list for method output_type
 	2, // [2:4] is the sub-list for method input_type
 	2, // [2:2] is the sub-list for extension type_name

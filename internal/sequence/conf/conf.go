@@ -6,10 +6,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/codesjoy/skuld/internal/pkg/xgorm"
-	"github.com/codesjoy/skuld/internal/sequence/biz"
-	sequencemetrics "github.com/codesjoy/skuld/internal/sequence/metrics"
-	"github.com/codesjoy/skuld/internal/sequence/task"
+	"github.com/codesjoy/sindri/internal/pkg/xgorm"
+	"github.com/codesjoy/sindri/internal/sequence/biz"
+	sequencemetrics "github.com/codesjoy/sindri/internal/sequence/metrics"
+	"github.com/codesjoy/sindri/internal/sequence/task"
 	"github.com/codesjoy/yggdrasil/v3"
 )
 

@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/codesjoy/pkg/basic/xerror"
-	"github.com/codesjoy/skuld/gen/go/reason"
+	"github.com/codesjoy/sindri/gen/go/sequence/reason"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/genproto/googleapis/rpc/code"

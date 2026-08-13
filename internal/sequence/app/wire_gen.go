@@ -6,13 +6,13 @@
 package app
 
 import (
-	"github.com/codesjoy/skuld/internal/pkg/xgorm"
-	"github.com/codesjoy/skuld/internal/sequence/biz"
-	"github.com/codesjoy/skuld/internal/sequence/conf"
-	"github.com/codesjoy/skuld/internal/sequence/data/gorm"
-	"github.com/codesjoy/skuld/internal/sequence/metrics"
-	"github.com/codesjoy/skuld/internal/sequence/service"
-	"github.com/codesjoy/skuld/internal/sequence/task"
+	"github.com/codesjoy/sindri/internal/pkg/xgorm"
+	"github.com/codesjoy/sindri/internal/sequence/biz"
+	"github.com/codesjoy/sindri/internal/sequence/conf"
+	"github.com/codesjoy/sindri/internal/sequence/data/gorm"
+	"github.com/codesjoy/sindri/internal/sequence/metrics"
+	"github.com/codesjoy/sindri/internal/sequence/service"
+	"github.com/codesjoy/sindri/internal/sequence/task"
 	"github.com/codesjoy/yggdrasil/v3"
 	"go.opentelemetry.io/otel/metric"
 	"log/slog"
@@ -57,5 +57,5 @@ func provideLogger(rt yggdrasil.Runtime) *slog.Logger {
 }
 
 func provideAllocatorMeter(rt yggdrasil.Runtime) metric.Meter {
-	return rt.MeterProvider().Meter("github.com/codesjoy/skuld/sequence")
+	return rt.MeterProvider().Meter("github.com/codesjoy/sindri/sequence")
 }

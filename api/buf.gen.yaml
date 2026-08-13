@@ -8,23 +8,23 @@ managed:
     - module: buf.build/codesjoy/reason
   override:
     - file_option: go_package_prefix
-      value: github.com/codesjoy/skuld/gen/go
+      value: github.com/codesjoy/sindri/gen/go
 
 plugins:
   - local: protoc-gen-go
     out: ../gen/go
     opt:
       - paths=import
-      - module=github.com/codesjoy/skuld/gen/go
+      - module=github.com/codesjoy/sindri/gen/go
 
   - local: protoc-gen-yggdrasil-rpc
     out: ../gen/go
     opt:
       - paths=import
-      - module=github.com/codesjoy/skuld/gen/go
+      - module=github.com/codesjoy/sindri/gen/go
 
   - local: protoc-gen-codesjoy-reason
     out: ../gen/go
     opt:
       - paths=import
-      - module=github.com/codesjoy/skuld/gen/go
+      - module=github.com/codesjoy/sindri/gen/go

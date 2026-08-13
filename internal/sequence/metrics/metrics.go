@@ -5,7 +5,7 @@ import (
 	"errors"
 	"math"
 
-	"github.com/codesjoy/skuld/internal/sequence/biz"
+	"github.com/codesjoy/sindri/internal/sequence/biz"
 	"go.opentelemetry.io/otel/metric"
 )
 

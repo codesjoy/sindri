@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	"github.com/codesjoy/pkg/basic/xerror"
-	"github.com/codesjoy/skuld/gen/go/reason"
-	sequencev1 "github.com/codesjoy/skuld/gen/go/sequence/v1"
+	"github.com/codesjoy/sindri/gen/go/sequence/reason"
+	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
 	"github.com/codesjoy/yggdrasil/v3/rpc/interceptor"
 	"github.com/codesjoy/yggdrasil/v3/rpc/metadata"
 	"github.com/codesjoy/yggdrasil/v3/rpc/status"

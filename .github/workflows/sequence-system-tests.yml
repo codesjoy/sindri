@@ -4,20 +4,24 @@ on:
   pull_request:
     paths:
       - "cmd/sequence/**"
+      - "configs/sequence.yaml"
       - "internal/sequence/**"
-      - "internal/pkg/xgorm/**"
-      - "pkg/sequence/**"
-      - "api/skuld/sequence/**"
-      - "api/skuld/reason/**"
-      - "gen/go/sequence/**"
-      - "gen/go/reason/**"
       - "migrations/sequence/**"
       - "tests/sequence/**"
+      - "pkg/sequence/**"
+      - "api/sindri/sequence/**"
+      - "gen/go/sequence/**"
+      - "internal/pkg/**"
       - "go.mod"
       - "go.sum"
       - "go.work"
       - "go.work.sum"
       - "Makefile"
+      - "scripts/check-module-release.sh"
+      - "scripts/test-module-release.sh"
+      - "scripts/scaffold-service.sh"
+      - "scripts/test-scaffold-service.sh"
+      - "scripts/templates/service/**"
       - ".github/workflows/sequence-system-tests.yml"
   schedule:
     - cron: "17 18 * * *"
@@ -56,6 +60,21 @@ jobs:
               - 'go.work'
               - 'go.work.sum'
 
+  modules:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            gen/go/sequence/go.sum
+            pkg/sequence/go.sum
+      - name: Verify workspace modules
+        run: make scaffold-test release-test test build modules-check SERVICE=sequence
+
   integration-postgres:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -67,7 +86,8 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: |
             go.sum
-            gen/go/go.sum
+            gen/go/sequence/go.sum
+            pkg/sequence/go.sum
       - name: Run PostgreSQL sequence integration tests
         shell: bash
         run: |
@@ -94,7 +114,8 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: |
             go.sum
-            gen/go/go.sum
+            gen/go/sequence/go.sum
+            pkg/sequence/go.sum
       - name: Run MySQL sequence integration tests
         shell: bash
         run: |
@@ -124,7 +145,8 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: |
             go.sum
-            gen/go/go.sum
+            gen/go/sequence/go.sum
+            pkg/sequence/go.sum
       - name: Run deterministic sequence chaos tests
         shell: bash
         run: |

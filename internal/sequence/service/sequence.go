@@ -6,10 +6,10 @@ import (
 	"strconv"
 
 	"github.com/codesjoy/pkg/basic/xerror"
-	"github.com/codesjoy/skuld/gen/go/reason"
-	sequencev1 "github.com/codesjoy/skuld/gen/go/sequence/v1"
-	"github.com/codesjoy/skuld/internal/sequence/biz"
-	"github.com/codesjoy/skuld/pkg/sequence"
+	"github.com/codesjoy/sindri/gen/go/sequence/reason"
+	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
+	"github.com/codesjoy/sindri/internal/sequence/biz"
+	"github.com/codesjoy/sindri/pkg/sequence"
 	"github.com/codesjoy/yggdrasil/v3/rpc/metadata"
 	"google.golang.org/genproto/googleapis/rpc/code"
 )

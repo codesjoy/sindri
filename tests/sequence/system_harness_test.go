@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"sort"
 	"strings"
@@ -17,11 +16,11 @@ import (
 
 	toxiclient "github.com/Shopify/toxiproxy/v2/client"
 	"github.com/codesjoy/pkg/basic/xerror"
-	"github.com/codesjoy/skuld/gen/go/reason"
-	sequencev1 "github.com/codesjoy/skuld/gen/go/sequence/v1"
-	"github.com/codesjoy/skuld/internal/sequence/biz"
-	gormdata "github.com/codesjoy/skuld/internal/sequence/data/gorm"
-	sequencepkg "github.com/codesjoy/skuld/pkg/sequence"
+	"github.com/codesjoy/sindri/gen/go/sequence/reason"
+	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
+	"github.com/codesjoy/sindri/internal/sequence/biz"
+	gormdata "github.com/codesjoy/sindri/internal/sequence/data/gorm"
+	sequencepkg "github.com/codesjoy/sindri/pkg/sequence"
 	yapp "github.com/codesjoy/yggdrasil/v3/app"
 	"github.com/codesjoy/yggdrasil/v3/config"
 	"github.com/codesjoy/yggdrasil/v3/config/source/memory"
@@ -30,6 +29,7 @@ import (
 	"github.com/codesjoy/yggdrasil/v3/rpc/metadata"
 	transportclient "github.com/codesjoy/yggdrasil/v3/transport/runtime/client"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/go-connections/nat"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
@@ -40,7 +40,7 @@ import (
 )
 
 const (
-	sequenceServiceName = "codesjoy.skuld.sequence.v1.SequenceGenerator"
+	sequenceServiceName = "codesjoy.sindri.sequence.v1.SequenceGenerator"
 	recoveryDeadline    = 5 * time.Second
 )
 
@@ -97,16 +97,31 @@ func (s *SequenceSystemSuite) SetupTest() {
 	s.proxyContainer, err = tctoxiproxy.Run(
 		s.ctx,
 		"ghcr.io/shopify/toxiproxy:2.12.0",
-		tctoxiproxy.WithProxy("db-a", fmt.Sprintf("%s:%s", s.h.dbAlias, s.h.dbPort)),
-		tctoxiproxy.WithProxy("db-b", fmt.Sprintf("%s:%s", s.h.dbAlias, s.h.dbPort)),
-		tctoxiproxy.WithProxy("grpc-a", "node-a:19010"),
-		tctoxiproxy.WithProxy("grpc-b", "node-b:19010"),
+		testcontainers.WithExposedPorts("8668/tcp", "8669/tcp"),
 		network.WithNetwork([]string{"toxiproxy"}, s.h.network),
 	)
 	s.Require().NoError(err)
 	uri, err := s.proxyContainer.URI(s.ctx)
 	s.Require().NoError(err)
 	s.proxyClient = toxiclient.NewClient(uri)
+	proxyConfigs := []struct {
+		name     string
+		listen   string
+		upstream string
+	}{
+		{name: "db-a", listen: "0.0.0.0:8666", upstream: fmt.Sprintf("%s:%s", s.h.dbAlias, s.h.dbPort)},
+		{name: "db-b", listen: "0.0.0.0:8667", upstream: fmt.Sprintf("%s:%s", s.h.dbAlias, s.h.dbPort)},
+		{name: "grpc-a", listen: "0.0.0.0:8668", upstream: "node-a:19010"},
+		{name: "grpc-b", listen: "0.0.0.0:8669", upstream: "node-b:19010"},
+	}
+	for _, proxyConfig := range proxyConfigs {
+		_, err = s.proxyClient.CreateProxy(
+			proxyConfig.name,
+			proxyConfig.listen,
+			proxyConfig.upstream,
+		)
+		s.Require().NoError(err)
+	}
 	s.proxies, err = s.proxyClient.Proxies()
 	s.Require().NoError(err)
 	s.nodes = make(map[string]*systemNode, 2)
@@ -224,7 +239,7 @@ app:
 		os.Getenv("SKULD_SEQUENCE_TEST_IMAGE"),
 		testcontainers.WithEnv(map[string]string{
 			// etcd and Polaris currently ship legacy descriptors with the same
-			// filename. Keep the real cmd/sequence module set while protobuf
+			// filename. Keep the real Sequence module set while protobuf
 			// reports that ecosystem conflict as a warning in system tests.
 			"GOLANG_PROTOBUF_REGISTRATION_CONFLICT": "warn",
 		}),
@@ -255,9 +270,13 @@ app:
 		}
 		s.Require().NoError(err)
 	}
-	host, port, err := s.proxyContainer.ProxiedEndpoint(grpcProxyPort)
+	endpoint, err := s.proxyContainer.PortEndpoint(
+		s.ctx,
+		nat.Port(fmt.Sprintf("%d/tcp", grpcProxyPort)),
+		"",
+	)
 	s.Require().NoError(err)
-	return &systemNode{id: id, container: container, grpcAddr: net.JoinHostPort(host, port)}
+	return &systemNode{id: id, container: container, grpcAddr: endpoint}
 }
 
 func (s *SequenceSystemSuite) restartNode(id string) {

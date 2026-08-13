@@ -14,26 +14,40 @@ business-neutral wrappers that hide capabilities or become a second source of
 truth.
 
 ```text
-api/             Protocol Buffer and API definitions
-gen/             Generated contracts; never edit by hand
-cmd/             Executable entry points (for example, cmd/sequence)
-internal/        Service-private implementation
-pkg/             Reusable code with no business-resource ownership
-migrations/      Database-owner migrations, split by dialect
-configs/         Runtime configuration
-deploy/          Deployment and infrastructure definitions
-tests/           Repository-level integration, end-to-end, and security tests
-docs/            Architecture and engineering documentation
+api/sindri/<service>/   Service-owned Protocol Buffer and reason definitions
+gen/go/<service>/      Independently published generated-contract Go module
+internal/pkg/           Root-module packages shared by Sindri services
+pkg/<name>/             Public package; an independent module only when required
+cmd/<service>/          Root-module service entry point
+internal/<service>/     Root-module private service implementation
+configs/                Runtime configuration
+migrations/<service>/   Service-owned database migrations
+tests/<service>/        Service integration and system tests
+docs/                  Architecture and engineering documentation
 ```
 
 - Generated code MUST be reproducible from the repository toolchain. Regeneration
   MUST be followed by a clean-tree or generated-diff check. Never hand-edit
   `*.pb.go` or `wire_gen.go`.
-- A service's `internal/<service>` package MUST NOT be imported by another service.
-  Cross-service calls use generated private protocol clients.
+- A service's `internal/<service>` packages MUST NOT be imported by
+  another service. Cross-service calls use generated private protocol clients.
+- Every service MUST own `cmd/<service>` and `internal/<service>` in the root
+  module. A generated
+  contract module is created only when contracts are published, and a public
+  client module is created only when an SDK is published; an SDK requires its
+  generated-contract module.
+- Infrastructure and test helpers genuinely shared by Sindri services belong in
+  root-module `internal/pkg`. Go's `internal` visibility prevents repositories
+  outside `github.com/codesjoy/sindri` from importing it. Shared code must not be
+  copied or hidden in a service directory.
+- Independent `gen/go/<service>` and `pkg/<name>` modules MUST NOT contain
+  `replace` directives or placeholder versions. The committed `go.work` is for
+  repository development only; release validation MUST run with `GOWORK=off`.
+  The non-published root application module may replace nested modules with their
+  local paths to keep root-module tooling reproducible before tags exist.
 - Name paths by content or responsibility. Do not use phase, milestone, or version
   labels such as `step1`, `phase2`, or `v2` in directory and file names.
-- `pkg/` and shared packages may contain protocols, cryptographic or event
+- `pkg/`, `internal/pkg`, and shared packages may contain protocols, cryptographic or event
   infrastructure, and real infrastructure adapters, but MUST NOT own product
   resources, domain state machines, or copied cross-service facts.
 
@@ -152,8 +166,8 @@ Release gates MUST NOT be satisfied by skipping tests, registering empty handler
 or sharing an uncontrolled temporary database.
 
 - Put unit tests beside the package under test. Put service component tests in
-  `internal/<service>/tests`; put repository-level integration, end-to-end, and
-  security tests in `tests/`.
+  `internal/<service>/tests`; put integration, end-to-end, and security
+  tests in `tests/<service>`.
 - Component tests should drive the public RPC through the complete service,
   use-case, repository, and publisher path, checking wiring, contracts, event
   order, and persistence round trips without repeating lower-layer unit tests.
@@ -166,9 +180,22 @@ or sharing an uncontrolled temporary database.
   testcontainers-go; in-memory substitutes are not sufficient.
 - Use `testify/require` for prerequisites and `testify/assert` for independent
   checks. New tests should follow `Test<Behavior>` naming.
-- Shared test helpers belong in `internal/pkg/tests`; do not duplicate them across
-  service test packages.
+- Service-local test helpers belong under that service's `internal`. Helpers
+  genuinely shared across services belong in `internal/pkg/tests`.
 
-Before review, run the repository's configured build, test, lint, formatting, and
-protocol-generation checks (normally `make build`, `make test`, `make go-lint`,
-`make go-fix`, and `make proto` as applicable).
+Before review, run the repository's configured build, test, lint, formatting,
+module-isolation, and protocol-generation checks (normally `make build`,
+`make test`, `make modules-check SERVICE=<service>`, `make go-lint`,
+`make go-fix`, and `make proto SERVICE=<service>` as applicable).
+
+## 7. Module release rules
+
+- Nested module tags MUST include the module directory, for example
+  `gen/go/sequence/v0.1.0` and `pkg/sequence/v0.1.0`.
+- Services and `internal/pkg` remain in the root module and are not released with
+  per-directory module tags. Release only independent modules that exist. The
+  dependency order is generated contracts first, then a dependent public client.
+  A downstream `go.mod` may reference a version only after that upstream version
+  is available from the remote module source.
+- A dependency module's `replace` directive is ignored by its consumers. Local
+  development replacement belongs in `go.work`, never in a published module.

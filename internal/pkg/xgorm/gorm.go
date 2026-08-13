@@ -106,11 +106,11 @@ func New(rt yggdrasil.Runtime, cfg Config) (*Database, error) {
 	logger := rt.Logger()
 	var tracer trace.Tracer
 	if rt.TracerProvider() != nil {
-		tracer = rt.TracerProvider().Tracer("github.com/codesjoy/skuld/shared/database")
+		tracer = rt.TracerProvider().Tracer("github.com/codesjoy/sindri/shared/database")
 	}
 	var meter metric.Meter
 	if rt.MeterProvider() != nil {
-		meter = rt.MeterProvider().Meter("github.com/codesjoy/skuld/shared/database")
+		meter = rt.MeterProvider().Meter("github.com/codesjoy/sindri/shared/database")
 	}
 
 	opts := append([]xgorm.Option(nil), cfg.Options...)

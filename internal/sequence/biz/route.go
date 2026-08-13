@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync/atomic"
 
-	sequencepkg "github.com/codesjoy/skuld/pkg/sequence"
+	sequencepkg "github.com/codesjoy/sindri/pkg/sequence"
 )
 
 const (

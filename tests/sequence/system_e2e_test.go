@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/codesjoy/pkg/basic/xerror"
-	"github.com/codesjoy/skuld/gen/go/reason"
-	sequencev1 "github.com/codesjoy/skuld/gen/go/sequence/v1"
+	"github.com/codesjoy/sindri/gen/go/sequence/reason"
+	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/genproto/googleapis/rpc/code"

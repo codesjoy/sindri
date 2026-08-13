@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/codesjoy/pkg/basic/xerror"
-	"github.com/codesjoy/skuld/gen/go/reason"
+	"github.com/codesjoy/sindri/gen/go/sequence/reason"
 )
 
 const (

@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        (unknown)
-// source: reason/reason.proto
+// source: sequence/reason/reason.proto
 
 package reason
 
@@ -64,11 +64,11 @@ func (x Reason) String() string {
 }
 
 func (Reason) Descriptor() protoreflect.EnumDescriptor {
-	return file_reason_reason_proto_enumTypes[0].Descriptor()
+	return file_sequence_reason_reason_proto_enumTypes[0].Descriptor()
 }
 
 func (Reason) Type() protoreflect.EnumType {
-	return &file_reason_reason_proto_enumTypes[0]
+	return &file_sequence_reason_reason_proto_enumTypes[0]
 }
 
 func (x Reason) Number() protoreflect.EnumNumber {
@@ -77,40 +77,40 @@ func (x Reason) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Reason.Descriptor instead.
 func (Reason) EnumDescriptor() ([]byte, []int) {
-	return file_reason_reason_proto_rawDescGZIP(), []int{0}
+	return file_sequence_reason_reason_proto_rawDescGZIP(), []int{0}
 }
 
-var File_reason_reason_proto protoreflect.FileDescriptor
+var File_sequence_reason_reason_proto protoreflect.FileDescriptor
 
-const file_reason_reason_proto_rawDesc = "" +
+const file_sequence_reason_reason_proto_rawDesc = "" +
 	"\n" +
-	"\x13reason/reason.proto\x12\x15codesjoy.skuld.reason\x1a\x1fcodesjoy/reason/v1/reason.proto*\xdd\x01\n" +
+	"\x1csequence/reason/reason.proto\x12\x1fcodesjoy.sindri.sequence.reason\x1a\x1fcodesjoy/reason/v1/reason.proto*\xdd\x01\n" +
 	"\x06Reason\x12\x16\n" +
 	"\x12REASON_UNSPECIFIED\x10\x00\x12#\n" +
 	"\x19SEQUENCE_ALLOCATOR_PAUSED\x10\x96\x01\x1a\x03\xa8E\x0e\x12!\n" +
 	"\x17SEQUENCE_SLOT_NOT_OWNER\x10\x97\x01\x1a\x03\xa8E\t\x12 \n" +
 	"\x16SEQUENCE_ROUTE_EXPIRED\x10\x98\x01\x1a\x03\xa8E\t\x12%\n" +
 	"\x1bSEQUENCE_CAPACITY_EXHAUSTED\x10\x99\x01\x1a\x03\xa8E\b\x12$\n" +
-	"\x1aSEQUENCE_ROUTE_UNAVAILABLE\x10\x9a\x01\x1a\x03\xa8E\t\x1a\x04\xa0E\x90NB\xc7\x01\n" +
-	"\x19com.codesjoy.skuld.reasonB\vReasonProtoP\x01Z'github.com/codesjoy/skuld/gen/go/reason\xa2\x02\x03CSR\xaa\x02\x15Codesjoy.Skuld.Reason\xca\x02\x15Codesjoy\\Skuld\\Reason\xe2\x02!Codesjoy\\Skuld\\Reason\\GPBMetadata\xea\x02\x17Codesjoy::Skuld::Reasonb\x06proto3"
+	"\x1aSEQUENCE_ROUTE_UNAVAILABLE\x10\x9a\x01\x1a\x03\xa8E\t\x1a\x04\xa0E\x90NB\x85\x02\n" +
+	"#com.codesjoy.sindri.sequence.reasonB\vReasonProtoP\x01Z1github.com/codesjoy/sindri/gen/go/sequence/reason\xa2\x02\x04CSSR\xaa\x02\x1fCodesjoy.Sindri.Sequence.Reason\xca\x02\x1fCodesjoy\\Sindri\\Sequence\\Reason\xe2\x02+Codesjoy\\Sindri\\Sequence\\Reason\\GPBMetadata\xea\x02\"Codesjoy::Sindri::Sequence::Reasonb\x06proto3"
 
 var (
-	file_reason_reason_proto_rawDescOnce sync.Once
-	file_reason_reason_proto_rawDescData []byte
+	file_sequence_reason_reason_proto_rawDescOnce sync.Once
+	file_sequence_reason_reason_proto_rawDescData []byte
 )
 
-func file_reason_reason_proto_rawDescGZIP() []byte {
-	file_reason_reason_proto_rawDescOnce.Do(func() {
-		file_reason_reason_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_reason_reason_proto_rawDesc), len(file_reason_reason_proto_rawDesc)))
+func file_sequence_reason_reason_proto_rawDescGZIP() []byte {
+	file_sequence_reason_reason_proto_rawDescOnce.Do(func() {
+		file_sequence_reason_reason_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_sequence_reason_reason_proto_rawDesc), len(file_sequence_reason_reason_proto_rawDesc)))
 	})
-	return file_reason_reason_proto_rawDescData
+	return file_sequence_reason_reason_proto_rawDescData
 }
 
-var file_reason_reason_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_reason_reason_proto_goTypes = []any{
-	(Reason)(0), // 0: codesjoy.skuld.reason.Reason
+var file_sequence_reason_reason_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_sequence_reason_reason_proto_goTypes = []any{
+	(Reason)(0), // 0: codesjoy.sindri.sequence.reason.Reason
 }
-var file_reason_reason_proto_depIdxs = []int32{
+var file_sequence_reason_reason_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for method output_type
 	0, // [0:0] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
@@ -118,26 +118,26 @@ var file_reason_reason_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for field type_name
 }
 
-func init() { file_reason_reason_proto_init() }
-func file_reason_reason_proto_init() {
-	if File_reason_reason_proto != nil {
+func init() { file_sequence_reason_reason_proto_init() }
+func file_sequence_reason_reason_proto_init() {
+	if File_sequence_reason_reason_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_reason_reason_proto_rawDesc), len(file_reason_reason_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_sequence_reason_reason_proto_rawDesc), len(file_sequence_reason_reason_proto_rawDesc)),
 			NumEnums:      1,
 			NumMessages:   0,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_reason_reason_proto_goTypes,
-		DependencyIndexes: file_reason_reason_proto_depIdxs,
-		EnumInfos:         file_reason_reason_proto_enumTypes,
+		GoTypes:           file_sequence_reason_reason_proto_goTypes,
+		DependencyIndexes: file_sequence_reason_reason_proto_depIdxs,
+		EnumInfos:         file_sequence_reason_reason_proto_enumTypes,
 	}.Build()
-	File_reason_reason_proto = out.File
-	file_reason_reason_proto_goTypes = nil
-	file_reason_reason_proto_depIdxs = nil
+	File_sequence_reason_reason_proto = out.File
+	file_sequence_reason_reason_proto_goTypes = nil
+	file_sequence_reason_reason_proto_depIdxs = nil
 }

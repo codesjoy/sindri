@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/codesjoy/skuld/internal/sequence/app"
+	"github.com/codesjoy/sindri/internal/sequence/app"
 	"github.com/codesjoy/yggdrasil-ecosystem/modules/etcd/v3"
 	otlp "github.com/codesjoy/yggdrasil-ecosystem/modules/otlp/v3"
 	"github.com/codesjoy/yggdrasil-ecosystem/modules/polaris/v3"

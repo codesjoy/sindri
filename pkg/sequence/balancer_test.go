@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	sequencev1 "github.com/codesjoy/skuld/gen/go/sequence/v1"
+	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
 	"github.com/codesjoy/yggdrasil/v3/discovery/resolver"
 	"github.com/codesjoy/yggdrasil/v3/transport/runtime/client/balancer"
 	"github.com/stretchr/testify/assert"

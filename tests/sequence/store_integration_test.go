@@ -32,13 +32,13 @@ import (
 	postgresgorm "gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
-	testkit "github.com/codesjoy/skuld/internal/pkg/tests"
-	sharedgorm "github.com/codesjoy/skuld/internal/pkg/xgorm"
-	"github.com/codesjoy/skuld/internal/sequence/app"
-	"github.com/codesjoy/skuld/internal/sequence/biz"
-	"github.com/codesjoy/skuld/internal/sequence/conf"
-	gormdata "github.com/codesjoy/skuld/internal/sequence/data/gorm"
-	"github.com/codesjoy/skuld/internal/sequence/task"
+	testkit "github.com/codesjoy/sindri/internal/pkg/tests"
+	sharedgorm "github.com/codesjoy/sindri/internal/pkg/xgorm"
+	"github.com/codesjoy/sindri/internal/sequence/app"
+	"github.com/codesjoy/sindri/internal/sequence/biz"
+	"github.com/codesjoy/sindri/internal/sequence/conf"
+	gormdata "github.com/codesjoy/sindri/internal/sequence/data/gorm"
+	"github.com/codesjoy/sindri/internal/sequence/task"
 )
 
 const (

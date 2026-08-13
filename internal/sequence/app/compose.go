@@ -5,13 +5,13 @@ import (
 	"context"
 	"fmt"
 
-	sequencev1 "github.com/codesjoy/skuld/gen/go/sequence/v1"
-	"github.com/codesjoy/skuld/internal/pkg/xgorm"
-	"github.com/codesjoy/skuld/internal/sequence/biz"
-	"github.com/codesjoy/skuld/internal/sequence/conf"
-	"github.com/codesjoy/skuld/internal/sequence/metrics"
-	"github.com/codesjoy/skuld/internal/sequence/service"
-	"github.com/codesjoy/skuld/internal/sequence/task"
+	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
+	"github.com/codesjoy/sindri/internal/pkg/xgorm"
+	"github.com/codesjoy/sindri/internal/sequence/biz"
+	"github.com/codesjoy/sindri/internal/sequence/conf"
+	"github.com/codesjoy/sindri/internal/sequence/metrics"
+	"github.com/codesjoy/sindri/internal/sequence/service"
+	"github.com/codesjoy/sindri/internal/sequence/task"
 	"github.com/codesjoy/yggdrasil/v3"
 )
 

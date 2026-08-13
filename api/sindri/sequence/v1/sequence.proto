@@ -1,13 +1,13 @@
 syntax = "proto3";
 
-package codesjoy.skuld.sequence.v1;
+package codesjoy.sindri.sequence.v1;
 
 import "buf/validate/validate.proto";
 
 // IDs are monotonic per key and may contain gaps
 // after a process restart, route handoff, or idle state eviction.
 
-option go_package = "github.com/codesjoy/skuld/gen/go/skuld/sequence/v1;sequencev1";
+option go_package = "github.com/codesjoy/sindri/gen/go/sequence/v1;sequencev1";
 
 service SequenceGenerator {
   // Allocates the next id for key. route_version is the snapshot used by the

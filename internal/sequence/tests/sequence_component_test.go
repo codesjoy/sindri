@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	sequencev1 "github.com/codesjoy/skuld/gen/go/sequence/v1"
-	"github.com/codesjoy/skuld/internal/sequence/biz"
-	gormdata "github.com/codesjoy/skuld/internal/sequence/data/gorm"
-	"github.com/codesjoy/skuld/internal/sequence/service"
+	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
+	"github.com/codesjoy/sindri/internal/sequence/biz"
+	gormdata "github.com/codesjoy/sindri/internal/sequence/data/gorm"
+	"github.com/codesjoy/sindri/internal/sequence/service"
 	"github.com/codesjoy/yggdrasil/v3/rpc/stream"
 	transportclient "github.com/codesjoy/yggdrasil/v3/transport/runtime/client"
 	"github.com/stretchr/testify/assert"
@@ -33,13 +33,13 @@ func (c *inProcessClient) Invoke(
 	args, reply interface{},
 ) error {
 	switch method {
-	case "/codesjoy.skuld.sequence.v1.SequenceGenerator/FetchNext":
+	case "/codesjoy.sindri.sequence.v1.SequenceGenerator/FetchNext":
 		response, err := c.service.FetchNext(ctx, args.(*sequencev1.FetchNextRequest))
 		if err == nil {
 			proto.Merge(reply.(*sequencev1.FetchNextResponse), response)
 		}
 		return err
-	case "/codesjoy.skuld.sequence.v1.SequenceGenerator/GetRoute":
+	case "/codesjoy.sindri.sequence.v1.SequenceGenerator/GetRoute":
 		response, err := c.service.GetRoute(ctx, args.(*sequencev1.GetRouteRequest))
 		if err == nil {
 			proto.Merge(reply.(*sequencev1.GetRouteResponse), response)

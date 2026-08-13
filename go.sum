@@ -1,5 +1,5 @@
-buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.11-20260415201107-50325440f8f2.1 h1:s6hzCXtND/ICdGPTMGk7C+/BFlr2Jg5GyH0NKf4XGXg=
-buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.11-20260415201107-50325440f8f2.1/go.mod h1:tvtbpgaVXZX4g6Pn+AnzFycuRK3MOz5HJfEGeEllXYM=
+buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.12-20260709200747-435963d16310.1 h1:6nlcxMOui23ZRVAfJM451duu79P1npA5JRdZqMilrrQ=
+buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.12-20260709200747-435963d16310.1/go.mod h1:TCt1lluMFnctISJXvkIQ4x3ABrPuUKCWKyjKdkJNBpw=
 buf.build/go/protovalidate v1.1.3 h1:m2GVEgQWd7rk+vIoAZ+f0ygGjvQTuqPQapBBdcpWVPE=
 buf.build/go/protovalidate v1.1.3/go.mod h1:9XIuohWz+kj+9JVn3WQneHA5LZP50mjvneZMnbLkiIE=
 cel.dev/expr v0.25.1 h1:1KrZg61W6TWSxuNZ37Xy49ps13NUovb66QLprthtwi4=
@@ -240,8 +240,8 @@ github.com/codesjoy/pkg/basic/xerror v0.0.0-20260812100337-f4b6f4ac7d17 h1:C4Pe2
 github.com/codesjoy/pkg/basic/xerror v0.0.0-20260812100337-f4b6f4ac7d17/go.mod h1:rSC6hpUrM9NheRIidDaMT7zZCPA5Xpdm13MNf7tYbls=
 github.com/codesjoy/pkg/basic/xgorm v0.0.0-20260514091847-8c522c350e05 h1:SV6oXf85rEb8mGjKsNlKPWbJB6tnhEIDAVy3E0Q+S88=
 github.com/codesjoy/pkg/basic/xgorm v0.0.0-20260514091847-8c522c350e05/go.mod h1:wuxp5WV1n/E3Spbs8YDPVZTP2WtcrcZ4ltkawdh8e00=
-github.com/codesjoy/pkg/proto/codesjoy/reason v0.0.0-20260514091847-8c522c350e05 h1:p9yFM2aFAmO0L4Z2pOcUsu0GyBOzsMtQtGx+2ARObKk=
-github.com/codesjoy/pkg/proto/codesjoy/reason v0.0.0-20260514091847-8c522c350e05/go.mod h1:LC0g7vwj6i3fUmxhJTU5wKIDKjjPIy+xpTrkrnnAHP0=
+github.com/codesjoy/pkg/proto/codesjoy/reason v0.0.0-20260812100337-f4b6f4ac7d17 h1:uwmuEbVAuKQoROcEWfZ+x1kQ05shvHwmg+JVAig+GJY=
+github.com/codesjoy/pkg/proto/codesjoy/reason v0.0.0-20260812100337-f4b6f4ac7d17/go.mod h1:LC0g7vwj6i3fUmxhJTU5wKIDKjjPIy+xpTrkrnnAHP0=
 github.com/codesjoy/pkg/utils v0.0.0-20260316022210-2e62ff5ff745 h1:v3THuZpCYs2+Ud8Y9Wgw3aGEdOn7/oxRpyq9GUXQk7U=
 github.com/codesjoy/pkg/utils v0.0.0-20260316022210-2e62ff5ff745/go.mod h1:U0/UABf9bPmj2mjbDvXvE3emANneRnHgrzB8yEctqow=
 github.com/codesjoy/yggdrasil-ecosystem/modules/etcd/v3 v3.0.0-20260429033927-d1bc68f367b9 h1:ReCCgpRYjIFtLMFaIBn2E19Auje4rRCrrGPQIyBln4U=

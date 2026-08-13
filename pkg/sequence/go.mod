@@ -1,12 +1,10 @@
-module github.com/codesjoy/skuld/pkg/sequence
+module github.com/codesjoy/sindri/pkg/sequence
 
 go 1.26.4
 
-replace github.com/codesjoy/skuld/gen/go => ../../gen/go
-
 require (
 	github.com/codesjoy/pkg/basic/xerror v0.0.0-20260812100337-f4b6f4ac7d17
-	github.com/codesjoy/skuld/gen/go v0.0.0-00010101000000-000000000000
+	github.com/codesjoy/sindri/gen/go/sequence v0.1.0
 	github.com/codesjoy/yggdrasil/v3 v3.0.0-rc.4
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260810153831-ec0a7760b754
