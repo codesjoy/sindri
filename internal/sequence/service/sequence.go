@@ -3,7 +3,6 @@ package service
 
 import (
 	"context"
-	"runtime"
 	"strconv"
 
 	"github.com/codesjoy/pkg/basic/xerror"
@@ -61,16 +60,8 @@ func (s *SequenceService) FetchNext(
 		return nil, xerror.NewWithReason(reason.Reason_SEQUENCE_ROUTE_EXPIRED, "", nil)
 	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-		if rv <= s.allocator.CurrentVersion() {
-			break
-		}
-		runtime.Gosched()
+	if err = s.allocator.WaitForVersion(ctx, rv); err != nil {
+		return nil, err
 	}
 
 	val, err = s.allocator.FetchNext(ctx, req.Key)

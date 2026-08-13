@@ -3,6 +3,7 @@ package sequence
 import (
 	"context"
 	"errors"
+	"hash/crc32"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSlotForKeyMatchesIEEECRC32(t *testing.T) {
+	for _, key := range []string{"", "orders", "sequence-key-123", "\xe4\xb8\xad\xe6\x96\x87"} {
+		assert.Equal(t, crc32.ChecksumIEEE([]byte(key))%SlotCount, SlotForKey(key))
+	}
+}
 
 func TestRouterUpdateValidatesCopiesAndOrdersVersions(t *testing.T) {
 	router, err := NewRouter(func(context.Context, int64) (*sequencev1.GetRouteResponse, error) {

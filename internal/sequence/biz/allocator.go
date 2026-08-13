@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,8 +33,12 @@ const (
 	DefaultReserveTimeout = time.Second
 	// DefaultIdleTimeout evicts key state that has not allocated an ID for a day.
 	DefaultIdleTimeout = 24 * time.Hour
-	// DefaultCleanupInterval checks for idle key state every ten minutes.
-	DefaultCleanupInterval = 10 * time.Minute
+	// DefaultCleanupInterval advances incremental idle cleanup once per second.
+	DefaultCleanupInterval = time.Second
+	// DefaultCleanupSlotsPerRun bounds routing slots scanned in one cleanup pass.
+	DefaultCleanupSlotsPerRun = 64
+	// DefaultMemoryHighWatermarkRatio leaves headroom below GOMEMLIMIT.
+	DefaultMemoryHighWatermarkRatio = 0.9
 
 	maxCleanupCandidates = 1024
 )
@@ -40,15 +46,17 @@ const (
 // AllocatorConfig contains immutable range allocation settings.
 type AllocatorConfig struct {
 	// LegacyStep only detects the removed allocator.step configuration.
-	LegacyStep            *int64        `mapstructure:"step"`
-	DefaultStep           int64         `mapstructure:"default_step"`
-	MaxStep               int64         `mapstructure:"max_step"`
-	PrefetchRatio         float64       `mapstructure:"prefetch_ratio"`
-	StepIncreaseThreshold time.Duration `mapstructure:"step_increase_threshold"`
-	StepDecreaseThreshold time.Duration `mapstructure:"step_decrease_threshold"`
-	ReserveTimeout        time.Duration `mapstructure:"reserve_timeout"`
-	IdleTimeout           time.Duration `mapstructure:"idle_timeout"`
-	CleanupInterval       time.Duration `mapstructure:"cleanup_interval"`
+	LegacyStep               *int64        `mapstructure:"step"`
+	DefaultStep              int64         `mapstructure:"default_step"`
+	MaxStep                  int64         `mapstructure:"max_step"`
+	PrefetchRatio            float64       `mapstructure:"prefetch_ratio"`
+	StepIncreaseThreshold    time.Duration `mapstructure:"step_increase_threshold"`
+	StepDecreaseThreshold    time.Duration `mapstructure:"step_decrease_threshold"`
+	ReserveTimeout           time.Duration `mapstructure:"reserve_timeout"`
+	IdleTimeout              time.Duration `mapstructure:"idle_timeout"`
+	CleanupInterval          time.Duration `mapstructure:"cleanup_interval"`
+	CleanupSlotsPerRun       int           `mapstructure:"cleanup_slots_per_run"`
+	MemoryHighWatermarkRatio float64       `mapstructure:"memory_high_watermark_ratio"`
 }
 
 func (c *AllocatorConfig) setDefaults() {
@@ -76,6 +84,12 @@ func (c *AllocatorConfig) setDefaults() {
 	if c.CleanupInterval == 0 {
 		c.CleanupInterval = DefaultCleanupInterval
 	}
+	if c.CleanupSlotsPerRun == 0 {
+		c.CleanupSlotsPerRun = DefaultCleanupSlotsPerRun
+	}
+	if c.MemoryHighWatermarkRatio == 0 {
+		c.MemoryHighWatermarkRatio = DefaultMemoryHighWatermarkRatio
+	}
 }
 
 const (
@@ -88,6 +102,11 @@ const (
 // SequenceRepo persists ranges reserved for sequence keys.
 type SequenceRepo interface {
 	ReserveRange(ctx context.Context, key string, step int64) (SequenceRange, error)
+}
+
+// MemorySampler reports Go-managed memory and the configured Go memory limit.
+type MemorySampler interface {
+	MemoryUsage() (managedBytes, limitBytes uint64)
 }
 
 // SequenceRange is a database-reserved inclusive range.
@@ -393,9 +412,39 @@ func (k *keyState) recordReturned(id int64) {
 
 type cleanupCandidate struct {
 	slotID uint32
-	slot   *sync.Map
+	slot   *allocationSlot
 	key    string
 	state  *keyState
+}
+
+type allocationSlot struct {
+	missMu sync.Mutex
+	states sync.Map
+	count  atomic.Int64
+}
+
+func (s *allocationSlot) Load(key string) (*keyState, bool) {
+	value, ok := s.states.Load(key)
+	if !ok {
+		return nil, false
+	}
+	return value.(*keyState), true
+}
+
+func (s *allocationSlot) Store(key string, state *keyState) {
+	s.states.Store(key, state)
+}
+
+func (s *allocationSlot) Delete(key string) { s.states.Delete(key) }
+
+func (s *allocationSlot) Range(f func(key, value any) bool) { s.states.Range(f) }
+
+// AllocatorStats is a low-cardinality snapshot for allocator telemetry.
+type AllocatorStats struct {
+	CachedKeys        int64
+	AdmissionRejected int64
+	CleanupScanned    int64
+	CleanupEvicted    int64
 }
 
 type cleanupStats struct {
@@ -417,33 +466,51 @@ type PrepareApply struct {
 type Allocator struct {
 	state atomic.Uint32
 
-	slotsMu sync.RWMutex
-	slots   map[uint32]*sync.Map
-	version int64
+	slotsMu       sync.RWMutex
+	slots         map[uint32]*allocationSlot
+	version       int64
+	versionCh     chan struct{}
+	cleanupSlots  []uint32
+	cleanupCursor int
 
-	store SequenceRepo
-	cfg   AllocatorConfig
-	now   func() time.Time
+	store         SequenceRepo
+	cfg           AllocatorConfig
+	now           func() time.Time
+	memorySampler MemorySampler
 
-	prepareApply *PrepareApply
-	lastCleanup  atomic.Int64
+	prepareApply      *PrepareApply
+	lastCleanup       atomic.Int64
+	cachedKeys        atomic.Int64
+	admissionRejected atomic.Int64
+	cleanupScanned    atomic.Int64
+	cleanupEvicted    atomic.Int64
 
 	logger *slog.Logger
 }
 
 // NewAllocator constructs a paused allocator with no locally owned slots.
-func NewAllocator(cfg *AllocatorConfig, store SequenceRepo, logger *slog.Logger) *Allocator {
+func NewAllocator(
+	cfg *AllocatorConfig,
+	store SequenceRepo,
+	memorySampler MemorySampler,
+	logger *slog.Logger,
+) *Allocator {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if memorySampler == nil {
+		panic("sequence allocator memory sampler is required")
 	}
 	allocatorConfig := *cfg
 	allocatorConfig.setDefaults()
 	obj := &Allocator{
-		slots:  make(map[uint32]*sync.Map),
-		store:  store,
-		cfg:    allocatorConfig,
-		now:    time.Now,
-		logger: logger,
+		slots:         make(map[uint32]*allocationSlot),
+		versionCh:     make(chan struct{}),
+		store:         store,
+		cfg:           allocatorConfig,
+		now:           time.Now,
+		memorySampler: memorySampler,
+		logger:        logger,
 	}
 	obj.state.Store(StatePaused)
 	return obj
@@ -465,12 +532,48 @@ func (obj *Allocator) FetchNext(ctx context.Context, key string) (int64, error) 
 	if !ok {
 		return 0, xerror.NewWithReason(reason.Reason_SEQUENCE_SLOT_NOT_OWNER, "slot not found", nil)
 	}
-	stateValue, _ := slot.LoadOrStore(key, &keyState{})
-	id, err := stateValue.(*keyState).allocate(ctx, obj.store, key, obj.cfg, obj.now)
+	state, ok := slot.Load(key)
+	if !ok {
+		var err error
+		state, err = obj.loadOrCreateState(key, slot)
+		if err != nil {
+			return 0, err
+		}
+	}
+	id, err := state.allocate(ctx, obj.store, key, obj.cfg, obj.now)
 	if err != nil {
 		return 0, err
 	}
 	return id, nil
+}
+
+func (obj *Allocator) loadOrCreateState(key string, slot *allocationSlot) (*keyState, error) {
+	slot.missMu.Lock()
+	defer slot.missMu.Unlock()
+	if state, ok := slot.Load(key); ok {
+		return state, nil
+	}
+	if obj.memoryHighWatermarkReached() {
+		obj.admissionRejected.Add(1)
+		return nil, xerror.NewWithReason(
+			reason.Reason_SEQUENCE_CAPACITY_EXHAUSTED,
+			"sequence allocator memory capacity is exhausted",
+			nil,
+		)
+	}
+	state := &keyState{}
+	slot.Store(key, state)
+	slot.count.Add(1)
+	obj.cachedKeys.Add(1)
+	return state, nil
+}
+
+func (obj *Allocator) memoryHighWatermarkReached() bool {
+	managed, limit := obj.memorySampler.MemoryUsage()
+	if limit == 0 || limit >= math.MaxInt64 {
+		return false
+	}
+	return float64(managed) >= float64(limit)*obj.cfg.MemoryHighWatermarkRatio
 }
 
 func (obj *Allocator) cleanupIdle() {
@@ -487,25 +590,41 @@ func (obj *Allocator) cleanupIdle() {
 	candidates, scanned := obj.collectIdleCandidates(cutoff)
 	stats := obj.evictIdleCandidates(candidates, cutoff)
 	stats.scanned = scanned
-	obj.logger.Info(
-		"cleaned idle sequence key state",
-		slog.Int("scanned", stats.scanned),
-		slog.Int("evicted", stats.evicted),
-		slog.Int("inflight", stats.inflight),
-		slog.Int64("discarded_active", stats.discardedActive),
-		slog.Int64("discarded_standby", stats.discardedStandby),
-	)
+	obj.cleanupScanned.Add(int64(scanned))
+	obj.cleanupEvicted.Add(int64(stats.evicted))
+	if stats.evicted > 0 || stats.inflight > 0 ||
+		stats.discardedActive > 0 || stats.discardedStandby > 0 {
+		obj.logger.Info(
+			"cleaned idle sequence key state",
+			slog.Int("scanned", stats.scanned),
+			slog.Int("evicted", stats.evicted),
+			slog.Int("inflight", stats.inflight),
+			slog.Int64("discarded_active", stats.discardedActive),
+			slog.Int64("discarded_standby", stats.discardedStandby),
+		)
+	}
 }
 
 func (obj *Allocator) collectIdleCandidates(cutoff int64) ([]cleanupCandidate, int) {
-	obj.slotsMu.RLock()
-	slots := make([]cleanupCandidate, 0, len(obj.slots))
-	for slotID, slot := range obj.slots {
-		slots = append(slots, cleanupCandidate{slotID: slotID, slot: slot})
+	obj.slotsMu.Lock()
+	count := min(obj.cfg.CleanupSlotsPerRun, len(obj.cleanupSlots))
+	slots := make([]cleanupCandidate, 0, count)
+	candidateCapacity := 0
+	for range count {
+		if obj.cleanupCursor >= len(obj.cleanupSlots) {
+			obj.cleanupCursor = 0
+		}
+		slotID := obj.cleanupSlots[obj.cleanupCursor]
+		obj.cleanupCursor++
+		if slot := obj.slots[slotID]; slot != nil {
+			slots = append(slots, cleanupCandidate{slotID: slotID, slot: slot})
+			candidateCapacity += int(min(slot.count.Load(), maxCleanupCandidates))
+			candidateCapacity = min(candidateCapacity, maxCleanupCandidates)
+		}
 	}
-	obj.slotsMu.RUnlock()
+	obj.slotsMu.Unlock()
 
-	candidates := make([]cleanupCandidate, 0, maxCleanupCandidates)
+	candidates := make([]cleanupCandidate, 0, candidateCapacity)
 	scanned := 0
 	for _, ownedSlot := range slots {
 		ownedSlot.slot.Range(func(key, value any) bool {
@@ -580,6 +699,8 @@ func (obj *Allocator) evictIdleCandidates(
 				candidate.state.standby.Start + 1
 		}
 		currentSlot.Delete(candidate.key)
+		currentSlot.count.Add(-1)
+		obj.cachedKeys.Add(-1)
 		stats.evicted++
 		candidate.state.mu.Unlock()
 		obj.slotsMu.Unlock()
@@ -592,6 +713,34 @@ func (obj *Allocator) CurrentVersion() int64 {
 	obj.slotsMu.RLock()
 	defer obj.slotsMu.RUnlock()
 	return obj.version
+}
+
+// WaitForVersion waits until the allocator has applied at least version.
+func (obj *Allocator) WaitForVersion(ctx context.Context, version int64) error {
+	for {
+		obj.slotsMu.RLock()
+		current := obj.version
+		changed := obj.versionCh
+		obj.slotsMu.RUnlock()
+		if current >= version {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+// Stats returns allocator telemetry.
+func (obj *Allocator) Stats() AllocatorStats {
+	return AllocatorStats{
+		CachedKeys:        obj.cachedKeys.Load(),
+		AdmissionRejected: obj.admissionRejected.Load(),
+		CleanupScanned:    obj.cleanupScanned.Load(),
+		CleanupEvicted:    obj.cleanupEvicted.Load(),
+	}
 }
 
 // Pause disables allocation while retaining already reserved local ranges.
@@ -608,8 +757,10 @@ func (obj *Allocator) Open(version int64, applyTick int64, slots []uint32) {
 	defer obj.slotsMu.Unlock()
 	if version > obj.version {
 		for slot := range obj.slots {
+			obj.cachedKeys.Add(-obj.slots[slot].count.Load())
 			delete(obj.slots, slot)
 		}
+		obj.rebuildCleanupSlotsLocked()
 	}
 	obj.commitRoute(version, applyTick, slots)
 	obj.state.Store(StateReady)
@@ -630,8 +781,10 @@ func (obj *Allocator) commitRoute(version int64, applyTick int64, slots []uint32
 		}
 	}
 	for _, slot := range needDel {
+		obj.cachedKeys.Add(-obj.slots[slot].count.Load())
 		delete(obj.slots, slot)
 	}
+	obj.rebuildCleanupSlotsLocked()
 
 	prepareApply := &PrepareApply{
 		Version:   version,
@@ -653,7 +806,7 @@ func (obj *Allocator) commitRoute(version int64, applyTick int64, slots []uint32
 		obj.logger.Info(
 			"slot change",
 			slog.Int64("version", version),
-			slog.Any("slots", prepareApply.Slots),
+			slog.Int("new_slot_count", len(prepareApply.Slots)),
 		)
 	}
 }
@@ -672,9 +825,25 @@ func (obj *Allocator) ApplyRoute(tick int64) {
 		return
 	}
 	for _, slot := range obj.prepareApply.Slots {
-		obj.slots[slot] = &sync.Map{}
+		obj.slots[slot] = &allocationSlot{}
 	}
 	obj.version = obj.prepareApply.Version
+	obj.rebuildCleanupSlotsLocked()
+	close(obj.versionCh)
+	obj.versionCh = make(chan struct{})
 	obj.logger.Info("apply route change", slog.Int64("version", obj.prepareApply.Version))
 	obj.prepareApply = nil
+}
+
+func (obj *Allocator) rebuildCleanupSlotsLocked() {
+	obj.cleanupSlots = obj.cleanupSlots[:0]
+	for slot := range obj.slots {
+		obj.cleanupSlots = append(obj.cleanupSlots, slot)
+	}
+	sort.Slice(obj.cleanupSlots, func(i, j int) bool {
+		return obj.cleanupSlots[i] < obj.cleanupSlots[j]
+	})
+	if obj.cleanupCursor >= len(obj.cleanupSlots) {
+		obj.cleanupCursor = 0
+	}
 }

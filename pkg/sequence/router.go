@@ -25,6 +25,8 @@ var (
 	ErrRouteUnavailable = errors.New("sequence route is unavailable")
 )
 
+var ieeeCRC32Table = crc32.MakeTable(crc32.IEEE)
+
 // RouteLoader fetches a route newer than knownVersion, or a not-modified response.
 type RouteLoader func(
 	ctx context.Context,
@@ -66,7 +68,11 @@ func NewRouter(loader RouteLoader) (*Router, error) {
 
 // SlotForKey hashes the original UTF-8 key bytes into the fixed slot space.
 func SlotForKey(key string) uint32 {
-	return crc32.ChecksumIEEE([]byte(key)) % SlotCount
+	crc := ^uint32(0)
+	for i := 0; i < len(key); i++ {
+		crc = ieeeCRC32Table[byte(crc)^key[i]] ^ crc>>8
+	}
+	return ^crc % SlotCount
 }
 
 // Version returns the current route version, or zero before the first route is loaded.

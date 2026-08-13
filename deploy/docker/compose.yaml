@@ -66,6 +66,7 @@ services:
     ports:
       - "${SKULD_SEQUENCE_GRPC_PORT:-19010}:19010"
     restart: unless-stopped
+    mem_limit: ${SKULD_SEQUENCE_MEMORY_LIMIT:-1g}
     networks: [backend, observability]
 
   otel-collector:

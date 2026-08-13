@@ -7,13 +7,12 @@
 package reason
 
 import (
-	reflect "reflect"
-	sync "sync"
-	unsafe "unsafe"
-
 	_ "github.com/codesjoy/pkg/proto/codesjoy/reason/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	reflect "reflect"
+	sync "sync"
+	unsafe "unsafe"
 )
 
 const (
@@ -26,11 +25,12 @@ const (
 type Reason int32
 
 const (
-	Reason_REASON_UNSPECIFIED         Reason = 0
-	Reason_SEQUENCE_ALLOCATOR_PAUSED  Reason = 150
-	Reason_SEQUENCE_SLOT_NOT_OWNER    Reason = 151
-	Reason_SEQUENCE_ROUTE_EXPIRED     Reason = 152
-	Reason_SEQUENCE_ROUTE_UNAVAILABLE Reason = 154
+	Reason_REASON_UNSPECIFIED          Reason = 0
+	Reason_SEQUENCE_ALLOCATOR_PAUSED   Reason = 150
+	Reason_SEQUENCE_SLOT_NOT_OWNER     Reason = 151
+	Reason_SEQUENCE_ROUTE_EXPIRED      Reason = 152
+	Reason_SEQUENCE_CAPACITY_EXHAUSTED Reason = 153
+	Reason_SEQUENCE_ROUTE_UNAVAILABLE  Reason = 154
 )
 
 // Enum value maps for Reason.
@@ -40,14 +40,16 @@ var (
 		150: "SEQUENCE_ALLOCATOR_PAUSED",
 		151: "SEQUENCE_SLOT_NOT_OWNER",
 		152: "SEQUENCE_ROUTE_EXPIRED",
+		153: "SEQUENCE_CAPACITY_EXHAUSTED",
 		154: "SEQUENCE_ROUTE_UNAVAILABLE",
 	}
 	Reason_value = map[string]int32{
-		"REASON_UNSPECIFIED":         0,
-		"SEQUENCE_ALLOCATOR_PAUSED":  150,
-		"SEQUENCE_SLOT_NOT_OWNER":    151,
-		"SEQUENCE_ROUTE_EXPIRED":     152,
-		"SEQUENCE_ROUTE_UNAVAILABLE": 154,
+		"REASON_UNSPECIFIED":          0,
+		"SEQUENCE_ALLOCATOR_PAUSED":   150,
+		"SEQUENCE_SLOT_NOT_OWNER":     151,
+		"SEQUENCE_ROUTE_EXPIRED":      152,
+		"SEQUENCE_CAPACITY_EXHAUSTED": 153,
+		"SEQUENCE_ROUTE_UNAVAILABLE":  154,
 	}
 )
 
@@ -82,12 +84,13 @@ var File_reason_reason_proto protoreflect.FileDescriptor
 
 const file_reason_reason_proto_rawDesc = "" +
 	"\n" +
-	"\x13reason/reason.proto\x12\x15codesjoy.skuld.reason\x1a\x1fcodesjoy/reason/v1/reason.proto*\xb6\x01\n" +
+	"\x13reason/reason.proto\x12\x15codesjoy.skuld.reason\x1a\x1fcodesjoy/reason/v1/reason.proto*\xdd\x01\n" +
 	"\x06Reason\x12\x16\n" +
 	"\x12REASON_UNSPECIFIED\x10\x00\x12#\n" +
 	"\x19SEQUENCE_ALLOCATOR_PAUSED\x10\x96\x01\x1a\x03\xa8E\x0e\x12!\n" +
 	"\x17SEQUENCE_SLOT_NOT_OWNER\x10\x97\x01\x1a\x03\xa8E\t\x12 \n" +
-	"\x16SEQUENCE_ROUTE_EXPIRED\x10\x98\x01\x1a\x03\xa8E\t\x12$\n" +
+	"\x16SEQUENCE_ROUTE_EXPIRED\x10\x98\x01\x1a\x03\xa8E\t\x12%\n" +
+	"\x1bSEQUENCE_CAPACITY_EXHAUSTED\x10\x99\x01\x1a\x03\xa8E\b\x12$\n" +
 	"\x1aSEQUENCE_ROUTE_UNAVAILABLE\x10\x9a\x01\x1a\x03\xa8E\t\x1a\x04\xa0E\x90NB\xc7\x01\n" +
 	"\x19com.codesjoy.skuld.reasonB\vReasonProtoP\x01Z'github.com/codesjoy/skuld/gen/go/reason\xa2\x02\x03CSR\xaa\x02\x15Codesjoy.Skuld.Reason\xca\x02\x15Codesjoy\\Skuld\\Reason\xe2\x02!Codesjoy\\Skuld\\Reason\\GPBMetadata\xea\x02\x17Codesjoy::Skuld::Reasonb\x06proto3"
 

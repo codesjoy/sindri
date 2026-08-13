@@ -14,6 +14,7 @@ var Reason_code = map[int32]code.Code{
 	150: code.Code_UNAVAILABLE,
 	151: code.Code_FAILED_PRECONDITION,
 	152: code.Code_FAILED_PRECONDITION,
+	153: code.Code_RESOURCE_EXHAUSTED,
 	154: code.Code_FAILED_PRECONDITION,
 }
 

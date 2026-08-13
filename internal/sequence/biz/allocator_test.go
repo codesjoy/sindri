@@ -4,12 +4,18 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/codesjoy/pkg/basic/xerror"
+	"github.com/codesjoy/skuld/gen/go/reason"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/genproto/googleapis/rpc/code"
 )
 
 func testAllocatorConfig() AllocatorConfig {
@@ -27,6 +33,14 @@ type rangeStore struct {
 	mu  sync.Mutex
 	max map[string]int64
 }
+
+type memorySamplerFunc func() (uint64, uint64)
+
+func (f memorySamplerFunc) MemoryUsage() (uint64, uint64) { return f() }
+
+var unlimitedMemorySampler = memorySamplerFunc(func() (uint64, uint64) {
+	return 1, math.MaxInt64
+})
 
 func (s *rangeStore) ReserveRange(
 	_ context.Context,
@@ -437,6 +451,7 @@ func TestAllocatorAppliesRouteVersionWithoutNewSlots(t *testing.T) {
 			allocator := NewAllocator(
 				&AllocatorConfig{DefaultStep: 10, MaxStep: 100},
 				&rangeStore{max: make(map[string]int64)},
+				unlimitedMemorySampler,
 				slog.Default(),
 			)
 			for _, route := range test.routes {
@@ -452,6 +467,247 @@ func TestAllocatorAppliesRouteVersionWithoutNewSlots(t *testing.T) {
 	}
 }
 
+func readyAllocatorForKeys(t testing.TB, keys ...string) *Allocator {
+	t.Helper()
+	slots := make([]uint32, 0, len(keys))
+	seen := make(map[uint32]struct{}, len(keys))
+	for _, key := range keys {
+		slot := SlotForKey(key)
+		if _, ok := seen[slot]; ok {
+			continue
+		}
+		seen[slot] = struct{}{}
+		slots = append(slots, slot)
+	}
+	allocator := NewAllocator(
+		&AllocatorConfig{DefaultStep: 10, MaxStep: 100},
+		&rangeStore{max: make(map[string]int64)},
+		unlimitedMemorySampler,
+		slog.Default(),
+	)
+	allocator.Open(1, 0, slots)
+	allocator.ApplyRoute(0)
+	return allocator
+}
+
+func TestAllocatorMemoryAdmissionOnlyRejectsNewKeys(t *testing.T) {
+	allocator := readyAllocatorForKeys(t, "orders", "invoices")
+	var pressured atomic.Bool
+	allocator.memorySampler = memorySamplerFunc(func() (uint64, uint64) {
+		if pressured.Load() {
+			return 90, 100
+		}
+		return 89, 100
+	})
+
+	_, err := allocator.FetchNext(context.Background(), "orders")
+	require.NoError(t, err)
+	pressured.Store(true)
+	_, err = allocator.FetchNext(context.Background(), "orders")
+	require.NoError(t, err, "existing keys remain available above the watermark")
+	_, err = allocator.FetchNext(context.Background(), "invoices")
+	assert.True(t, xerror.IsReason(err, reason.Reason_SEQUENCE_CAPACITY_EXHAUSTED))
+	assert.True(t, xerror.IsCode(err, code.Code_RESOURCE_EXHAUSTED))
+	assert.Equal(t, int64(1), allocator.Stats().CachedKeys)
+	assert.Equal(t, int64(1), allocator.Stats().AdmissionRejected)
+}
+
+func TestAllocatorConcurrentMissCreatesOneState(t *testing.T) {
+	const workers = 64
+	allocator := readyAllocatorForKeys(t, "orders")
+	allocator.memorySampler = memorySamplerFunc(func() (uint64, uint64) { return 1, 100 })
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := allocator.FetchNext(context.Background(), "orders")
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	assert.Equal(t, int64(1), allocator.Stats().CachedKeys)
+	slot := allocator.slots[SlotForKey("orders")]
+	assert.Equal(t, int64(1), slot.count.Load())
+}
+
+func TestAllocatorRouteRemovalUpdatesCachedKeyCount(t *testing.T) {
+	keyA, keyB := "orders", "invoices"
+	for SlotForKey(keyA) == SlotForKey(keyB) {
+		keyB += "x"
+	}
+	allocator := readyAllocatorForKeys(t, keyA, keyB)
+	_, err := allocator.FetchNext(context.Background(), keyA)
+	require.NoError(t, err)
+	_, err = allocator.FetchNext(context.Background(), keyB)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), allocator.Stats().CachedKeys)
+
+	allocator.CommitRoute(2, 0, []uint32{SlotForKey(keyA)})
+	assert.Equal(t, int64(1), allocator.Stats().CachedKeys)
+	allocator.ApplyRoute(0)
+	assert.Equal(t, int64(1), allocator.Stats().CachedKeys)
+}
+
+func TestAllocatorWaitForVersion(t *testing.T) {
+	allocator := readyAllocatorForKeys(t, "orders")
+	done := make(chan error, 1)
+	go func() { done <- allocator.WaitForVersion(context.Background(), 3) }()
+	select {
+	case err := <-done:
+		t.Fatalf("WaitForVersion returned before route application: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	allocator.CommitRoute(3, 0, []uint32{SlotForKey("orders")})
+	allocator.ApplyRoute(0)
+	require.NoError(t, <-done)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.ErrorIs(t, allocator.WaitForVersion(ctx, 4), context.Canceled)
+}
+
+func TestAllocatorCleanupScansConfiguredSlotsPerRun(t *testing.T) {
+	keys := distinctSlotKeys(4)
+	allocator := readyAllocatorForKeys(t, keys...)
+	allocator.cfg.CleanupSlotsPerRun = 2
+	for _, key := range keys {
+		_, err := allocator.FetchNext(context.Background(), key)
+		require.NoError(t, err)
+	}
+	cutoff := time.Now().Add(time.Hour).UnixNano()
+	first, scanned := allocator.collectIdleCandidates(cutoff)
+	assert.Len(t, first, 2)
+	assert.Equal(t, 2, scanned)
+	second, scanned := allocator.collectIdleCandidates(cutoff)
+	assert.Len(t, second, 2)
+	assert.Equal(t, 2, scanned)
+}
+
+func distinctSlotKeys(count int) []string {
+	keys := make([]string, 0, count)
+	slots := make(map[uint32]struct{}, count)
+	for candidate := 0; len(keys) < count; candidate++ {
+		key := "cleanup-key-" + strconv.Itoa(candidate)
+		slot := SlotForKey(key)
+		if _, exists := slots[slot]; exists {
+			continue
+		}
+		slots[slot] = struct{}{}
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func BenchmarkAllocatorExistingKey(b *testing.B) {
+	allocator := readyAllocatorForKeys(b, "orders")
+	slot := allocator.slots[SlotForKey("orders")]
+	state := &keyState{activeStep: math.MaxInt64, activatedAt: time.Now()}
+	state.initialized.Store(true)
+	state.start.Store(1)
+	state.end.Store(math.MaxInt64)
+	slot.Store("orders", state)
+	slot.count.Store(1)
+	allocator.cachedKeys.Store(1)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := allocator.FetchNext(context.Background(), "orders"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkAllocatorExistingKeyParallel(b *testing.B) {
+	allocator := readyAllocatorForKeys(b, "orders")
+	slot := allocator.slots[SlotForKey("orders")]
+	state := &keyState{activeStep: math.MaxInt64, activatedAt: time.Now()}
+	state.initialized.Store(true)
+	state.start.Store(1)
+	state.end.Store(math.MaxInt64)
+	slot.Store("orders", state)
+	slot.count.Store(1)
+	allocator.cachedKeys.Store(1)
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := allocator.FetchNext(context.Background(), "orders"); err != nil {
+				b.Error(err)
+			}
+		}
+	})
+}
+
+func BenchmarkAllocatorNewKeys(b *testing.B) {
+	keys := make([]string, b.N)
+	for i := range keys {
+		keys[i] = "key-" + strconv.Itoa(i)
+	}
+	slots := make([]uint32, SlotCount)
+	for i := range slots {
+		slots[i] = uint32(i)
+	}
+	allocator := NewAllocator(
+		&AllocatorConfig{DefaultStep: 100, MaxStep: 100},
+		&rangeStore{max: make(map[string]int64)},
+		unlimitedMemorySampler,
+		slog.Default(),
+	)
+	allocator.Open(1, 0, slots)
+	allocator.ApplyRoute(0)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		if _, err := allocator.FetchNext(context.Background(), keys[i]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkAllocatorRangeTransition(b *testing.B) {
+	allocator := readyAllocatorForKeys(b, "orders")
+	allocator.cfg.DefaultStep = math.MaxInt64 / 4
+	allocator.cfg.MaxStep = math.MaxInt64 / 4
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := allocator.FetchNext(context.Background(), "orders"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkAllocatorIncrementalCleanup(b *testing.B) {
+	keys := make([]string, 4096)
+	for i := range keys {
+		keys[i] = "cleanup-key-" + strconv.Itoa(i)
+	}
+	allocator := readyAllocatorForKeys(b, keys...)
+	allocator.cfg.CleanupSlotsPerRun = 64
+	for _, key := range keys {
+		slot := allocator.slots[SlotForKey(key)]
+		if _, loaded := slot.Load(key); loaded {
+			continue
+		}
+		state := &keyState{}
+		state.lastUsed.Store(1)
+		slot.Store(key, state)
+		slot.count.Add(1)
+		allocator.cachedKeys.Add(1)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		allocator.collectIdleCandidates(math.MaxInt64)
+	}
+}
+
 func readyAllocatorForCleanup(
 	t *testing.T,
 	store SequenceRepo,
@@ -464,14 +720,18 @@ func readyAllocatorForCleanup(
 		MaxStep:         100,
 		IdleTimeout:     10 * time.Minute,
 		CleanupInterval: time.Minute,
-	}, store, slog.Default())
+	}, store, unlimitedMemorySampler, slog.Default())
 	allocator.now = clock.Now
 	allocator.Open(1, 0, []uint32{SlotForKey(key)})
 	allocator.ApplyRoute(0)
 	return allocator
 }
 
-func allocatorKeyState(t *testing.T, allocator *Allocator, key string) (*sync.Map, *keyState) {
+func allocatorKeyState(
+	t *testing.T,
+	allocator *Allocator,
+	key string,
+) (*allocationSlot, *keyState) {
 	t.Helper()
 	allocator.slotsMu.RLock()
 	defer allocator.slotsMu.RUnlock()
@@ -479,7 +739,7 @@ func allocatorKeyState(t *testing.T, allocator *Allocator, key string) (*sync.Ma
 	require.NotNil(t, slot)
 	value, ok := slot.Load(key)
 	require.True(t, ok)
-	return slot, value.(*keyState)
+	return slot, value
 }
 
 func TestAllocatorCleanupEvictsIdleStateAndContinuesFromWatermark(t *testing.T) {
@@ -645,7 +905,7 @@ func TestAllocatorCleanupIgnoresReplacedSlotMap(t *testing.T) {
 	cutoff := clock.Now().Add(-10 * time.Minute).UnixNano()
 	candidates, _ := allocator.collectIdleCandidates(cutoff)
 
-	newSlot := &sync.Map{}
+	newSlot := &allocationSlot{}
 	newState := &keyState{}
 	newSlot.Store(key, newState)
 	allocator.slotsMu.Lock()

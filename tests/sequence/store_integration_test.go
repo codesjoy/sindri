@@ -157,7 +157,18 @@ func TestDatabaseIdentityAndAppInitializationAcrossDialects(t *testing.T) {
 					Driver: item.driver, DSN: item.dsn,
 					ExpectedDatabase: databaseName, ExpectedAccount: databaseUser,
 				},
-				Allocator: biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
+				Allocator: biz.AllocatorConfig{
+					DefaultStep:              10,
+					MaxStep:                  100,
+					PrefetchRatio:            biz.DefaultPrefetchRatio,
+					StepIncreaseThreshold:    biz.DefaultStepIncreaseThreshold,
+					StepDecreaseThreshold:    biz.DefaultStepDecreaseThreshold,
+					ReserveTimeout:           biz.DefaultReserveTimeout,
+					IdleTimeout:              biz.DefaultIdleTimeout,
+					CleanupInterval:          biz.DefaultCleanupInterval,
+					CleanupSlotsPerRun:       biz.DefaultCleanupSlotsPerRun,
+					MemoryHighWatermarkRatio: biz.DefaultMemoryHighWatermarkRatio,
+				},
 				Node: biz.NodeConfig{
 					ID: "node-a", HeartbeatTimeoutTicks: 3,
 					RouteQueryTimeout: time.Second,
@@ -170,8 +181,10 @@ func TestDatabaseIdentityAndAppInitializationAcrossDialects(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, bundle.RPCBindings, 1)
 			require.Len(t, bundle.Tasks, 1)
-			require.Len(t, bundle.Hooks, 1)
-			require.NoError(t, bundle.Hooks[0].Func(context.Background()))
+			require.Len(t, bundle.Hooks, 2)
+			for _, hook := range bundle.Hooks {
+				require.NoError(t, hook.Func(context.Background()))
+			}
 		})
 	}
 }

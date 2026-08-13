@@ -14,5 +14,6 @@ enum Reason {
   SEQUENCE_ALLOCATOR_PAUSED = 150 [(codesjoy.reason.v1.code) = UNAVAILABLE];
   SEQUENCE_SLOT_NOT_OWNER = 151 [(codesjoy.reason.v1.code) = FAILED_PRECONDITION];
   SEQUENCE_ROUTE_EXPIRED = 152 [(codesjoy.reason.v1.code) = FAILED_PRECONDITION];
+  SEQUENCE_CAPACITY_EXHAUSTED = 153 [(codesjoy.reason.v1.code) = RESOURCE_EXHAUSTED];
   SEQUENCE_ROUTE_UNAVAILABLE = 154 [(codesjoy.reason.v1.code) = FAILED_PRECONDITION];
 }

@@ -17,6 +17,10 @@ import (
 
 type sequenceStore struct{ max int64 }
 
+type testMemorySampler struct{}
+
+func (testMemorySampler) MemoryUsage() (uint64, uint64) { return 1, 100 }
+
 func (s *sequenceStore) ReserveRange(
 	_ context.Context,
 	_ string,
@@ -32,6 +36,7 @@ func readyService(t *testing.T, key string) (*SequenceService, *biz.Allocator, *
 	allocator := biz.NewAllocator(
 		&biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
 		&sequenceStore{},
+		testMemorySampler{},
 		nil,
 	)
 	allocator.Open(2, 0, []uint32{biz.SlotForKey(key)})
@@ -121,6 +126,7 @@ func TestGetRouteResponses(t *testing.T) {
 		biz.NewAllocator(
 			&biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
 			&sequenceStore{},
+			testMemorySampler{},
 			nil,
 		),
 		biz.NewRouteCache(),

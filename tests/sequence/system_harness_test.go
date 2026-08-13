@@ -29,6 +29,7 @@ import (
 	"github.com/codesjoy/yggdrasil/v3/module"
 	"github.com/codesjoy/yggdrasil/v3/rpc/metadata"
 	transportclient "github.com/codesjoy/yggdrasil/v3/transport/runtime/client"
+	"github.com/docker/docker/api/types/container"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
@@ -191,6 +192,9 @@ func (s *SequenceSystemSuite) startNode(id string, dbProxyPort, grpcProxyPort in
       server: {address: ":19010"}
 app:
   sequence:
+    runtime:
+      memory_limit: 512MiB
+      auto_memory_limit_ratio: 0.8
     database:
       driver: %s
       dsn: %q
@@ -223,6 +227,9 @@ app:
 			// filename. Keep the real cmd/sequence module set while protobuf
 			// reports that ecosystem conflict as a warning in system tests.
 			"GOLANG_PROTOBUF_REGISTRATION_CONFLICT": "warn",
+		}),
+		testcontainers.WithHostConfigModifier(func(config *container.HostConfig) {
+			config.Memory = 640 << 20
 		}),
 		testcontainers.WithExposedPorts("19010/tcp"),
 		testcontainers.WithFiles(testcontainers.ContainerFile{

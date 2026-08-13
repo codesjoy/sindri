@@ -8,6 +8,7 @@ replace (
 )
 
 require (
+	github.com/KimMachineGun/automemlimit v0.7.5
 	github.com/Shopify/toxiproxy/v2 v2.12.0
 	github.com/codesjoy/pkg/basic/transaction/gorm v0.0.0-20260328013517-15736fbea914
 	github.com/codesjoy/pkg/basic/xerror v0.0.0-20260812100337-f4b6f4ac7d17
@@ -19,6 +20,7 @@ require (
 	github.com/codesjoy/yggdrasil-ecosystem/modules/polaris/v3 v3.0.0-20260429033927-d1bc68f367b9
 	github.com/codesjoy/yggdrasil-ecosystem/modules/protovalidate/v3 v3.0.0-20260429033927-d1bc68f367b9
 	github.com/codesjoy/yggdrasil/v3 v3.0.0-rc.4
+	github.com/docker/docker v28.5.1+incompatible
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/google/wire v0.7.0
 	github.com/jackc/pgx/v5 v5.10.0
@@ -29,6 +31,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.40.0
 	github.com/testcontainers/testcontainers-go/modules/toxiproxy v0.40.0
 	go.opentelemetry.io/otel/metric v1.44.0
+	go.opentelemetry.io/otel/sdk/metric v1.44.0
 	go.opentelemetry.io/otel/trace v1.44.0
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260810153831-ec0a7760b754
 	google.golang.org/protobuf v1.36.12
@@ -66,7 +69,6 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/distribution/reference v0.6.0 // indirect
 	github.com/dlclark/regexp2 v1.7.0 // indirect
-	github.com/docker/docker v28.5.1+incompatible // indirect
 	github.com/docker/go-connections v0.7.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/ebitengine/purego v0.8.4 // indirect
@@ -109,6 +111,7 @@ require (
 	github.com/natefinch/lumberjack v2.0.0+incompatible // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
+	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
@@ -138,7 +141,6 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.40.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.34.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.44.0 // indirect
-	go.opentelemetry.io/otel/sdk/metric v1.44.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.9.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.1 // indirect

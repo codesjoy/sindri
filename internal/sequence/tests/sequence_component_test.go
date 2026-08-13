@@ -23,6 +23,10 @@ type inProcessClient struct {
 	service *service.SequenceService
 }
 
+type testMemorySampler struct{}
+
+func (testMemorySampler) MemoryUsage() (uint64, uint64) { return 1, 100 }
+
 func (c *inProcessClient) Invoke(
 	ctx context.Context,
 	method string,
@@ -71,7 +75,12 @@ func TestGeneratedClientDrivesServiceAllocatorAndSQLiteRepo(t *testing.T) {
 
 	key := "orders"
 	repo := gormdata.NewSequenceData(db)
-	allocator := biz.NewAllocator(&biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100}, repo, nil)
+	allocator := biz.NewAllocator(
+		&biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
+		repo,
+		testMemorySampler{},
+		nil,
+	)
 	allocator.Open(1, 0, []uint32{biz.SlotForKey(key)})
 	allocator.ApplyRoute(0)
 	route := biz.NewRouteCache()
@@ -89,6 +98,7 @@ func TestGeneratedClientDrivesServiceAllocatorAndSQLiteRepo(t *testing.T) {
 	restarted := biz.NewAllocator(
 		&biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
 		gormdata.NewSequenceData(db),
+		testMemorySampler{},
 		nil,
 	)
 	restarted.Open(1, 0, []uint32{biz.SlotForKey(key)})
@@ -129,6 +139,7 @@ func TestAllocatorPrefetchesDatabaseRangeBeforeExhaustion(t *testing.T) {
 			ReserveTimeout: time.Second,
 		},
 		gormdata.NewSequenceData(db),
+		testMemorySampler{},
 		nil,
 	)
 	allocator.Open(1, 0, []uint32{biz.SlotForKey(key)})

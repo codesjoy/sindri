@@ -1,7 +1,7 @@
 yggdrasil:
   mode: dev
   admin:
-    governor: {bind: "0.0.0.0", port: 8080}
+    governor: {bind: "127.0.0.1", port: 8080, expose_pprof: true}
   observability:
     telemetry:
       tracer: otlp-grpc
@@ -19,6 +19,9 @@ yggdrasil:
 
 app:
   sequence:
+    runtime:
+      memory_limit: auto
+      auto_memory_limit_ratio: 0.8
     database:
       driver: "${SKULD_SEQUENCE_DRIVER}"
       dsn: "${SKULD_SEQUENCE_DSN}"
@@ -35,7 +38,9 @@ app:
       step_decrease_threshold: 30m
       reserve_timeout: 1s
       idle_timeout: 24h
-      cleanup_interval: 10m
+      cleanup_interval: 1s
+      cleanup_slots_per_run: 64
+      memory_high_watermark_ratio: 0.9
     node:
       id: "${SKULD_SEQUENCE_NODE_ID}"
       heartbeat_timeout_ticks: 3

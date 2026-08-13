@@ -4,7 +4,6 @@ package sequencev1
 
 import (
 	context "context"
-
 	xerror "github.com/codesjoy/pkg/basic/xerror"
 	interceptor "github.com/codesjoy/yggdrasil/v3/rpc/interceptor"
 	metadata "github.com/codesjoy/yggdrasil/v3/rpc/metadata"

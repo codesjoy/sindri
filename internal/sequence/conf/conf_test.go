@@ -65,12 +65,58 @@ func TestLoadAppliesDefaultsForSupportedDrivers(t *testing.T) {
 			assert.Equal(t, biz.DefaultReserveTimeout, cfg.Allocator.ReserveTimeout)
 			assert.Equal(t, biz.DefaultIdleTimeout, cfg.Allocator.IdleTimeout)
 			assert.Equal(t, biz.DefaultCleanupInterval, cfg.Allocator.CleanupInterval)
+			assert.Equal(
+				t,
+				biz.DefaultCleanupSlotsPerRun,
+				cfg.Allocator.CleanupSlotsPerRun,
+			)
+			assert.Equal(
+				t,
+				biz.DefaultMemoryHighWatermarkRatio,
+				cfg.Allocator.MemoryHighWatermarkRatio,
+			)
 			assert.Equal(t, int64(3), cfg.Node.HeartbeatTimeoutTicks)
 			assert.Equal(t, time.Second, cfg.Node.RouteQueryTimeout)
 			assert.Equal(t, time.Second, cfg.Ticker.BaseTickInterval)
 			assert.Equal(t, int64(1), cfg.Ticker.HeartbeatTicks)
 			assert.Equal(t, 20, cfg.Database.MaxOpenConns)
+			assert.Equal(t, DefaultMemoryLimit, cfg.Runtime.MemoryLimit)
+			assert.Equal(t, DefaultAutoMemoryLimitRatio, cfg.Runtime.AutoMemoryLimitRatio)
+			assert.False(t, cfg.Runtime.MemoryLimitExplicit())
 		})
+	}
+}
+
+func TestLoadRuntimeMemoryConfiguration(t *testing.T) {
+	values := validValues(xgorm.DriverPostgres)
+	section := values["app"].(map[string]any)["sequence"].(map[string]any)
+	section["runtime"] = map[string]any{
+		"memory_limit":            "256MiB",
+		"auto_memory_limit_ratio": 0,
+	}
+	cfg, err := Load(testkit.NewRuntime(t, values))
+	require.NoError(t, err)
+	assert.Equal(t, "256MiB", cfg.Runtime.MemoryLimit)
+	assert.Zero(t, cfg.Runtime.AutoMemoryLimitRatio)
+	assert.True(t, cfg.Runtime.MemoryLimitExplicit())
+}
+
+func TestLoadRejectsInvalidRuntimeMemoryConfiguration(t *testing.T) {
+	tests := []map[string]any{
+		{"memory_limit": ""},
+		{"memory_limit": "63MiB"},
+		{"memory_limit": "9223372036854775807"},
+		{"memory_limit": "1GB"},
+		{"memory_limit": "auto", "auto_memory_limit_ratio": 0},
+		{"memory_limit": "auto", "auto_memory_limit_ratio": 1},
+		{"auto_memory_limit_ratio": 0},
+	}
+	for _, runtimeValues := range tests {
+		values := validValues(xgorm.DriverPostgres)
+		section := values["app"].(map[string]any)["sequence"].(map[string]any)
+		section["runtime"] = runtimeValues
+		_, err := Load(testkit.NewRuntime(t, values))
+		assert.Error(t, err, "runtime values: %#v", runtimeValues)
 	}
 }
 
@@ -78,6 +124,13 @@ func TestLoadDefaultsEmptyDriverToPostgres(t *testing.T) {
 	cfg, err := Load(testkit.NewRuntime(t, validValues("")))
 	require.NoError(t, err)
 	assert.Equal(t, xgorm.DriverPostgres, cfg.Database.Driver)
+}
+
+func TestConfigSetDefaultsAppliesRuntimeDefaults(t *testing.T) {
+	var cfg Config
+	cfg.SetDefaults()
+	assert.Equal(t, DefaultMemoryLimit, cfg.Runtime.MemoryLimit)
+	assert.Equal(t, DefaultAutoMemoryLimitRatio, cfg.Runtime.AutoMemoryLimitRatio)
 }
 
 func TestLoadRejectsInvalidContracts(t *testing.T) {
@@ -215,6 +268,30 @@ func TestLoadRejectsAllocatorAndSchedulingBoundaries(t *testing.T) {
 					"idle_timeout":     "1m",
 					"cleanup_interval": "2m",
 				},
+			},
+		},
+		{
+			name: "zero cleanup slots",
+			values: map[string]any{
+				"allocator": map[string]any{"cleanup_slots_per_run": 0},
+			},
+		},
+		{
+			name: "too many cleanup slots",
+			values: map[string]any{
+				"allocator": map[string]any{"cleanup_slots_per_run": biz.SlotCount + 1},
+			},
+		},
+		{
+			name: "zero memory watermark",
+			values: map[string]any{
+				"allocator": map[string]any{"memory_high_watermark_ratio": 0},
+			},
+		},
+		{
+			name: "full memory watermark",
+			values: map[string]any{
+				"allocator": map[string]any{"memory_high_watermark_ratio": 1},
 			},
 		},
 		{name: "empty node", values: map[string]any{"node": map[string]any{"id": " "}}},
