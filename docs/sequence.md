@@ -150,6 +150,7 @@ variables. The default Compose stack recognizes these primary settings:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `SKULD_SEQUENCE_APP_NAME` | `github.com.codesjoy.skuld.sequence` | Yggdrasil application identity used for service discovery and telemetry |
 | `SKULD_SEQUENCE_DRIVER` | `postgres` | Database dialect: `postgres` or `mysql` |
 | `SKULD_SEQUENCE_DSN` | Local PostgreSQL DSN | Complete service database connection string |
 | `SKULD_SEQUENCE_NODE_ID` | `sequence-1` | Node ID referenced by route snapshots |
@@ -158,6 +159,18 @@ variables. The default Compose stack recognizes these primary settings:
 | `SKULD_SEQUENCE_MEMORY_LIMIT` | `1g` | Container memory limit |
 | `SKULD_OTLP_ENDPOINT` | `otel-collector:4317` | OTLP gRPC endpoint visible to Sequence |
 | `GRAFANA_PORT` | `3000` | Host port for Grafana |
+
+Set a distinct application name for each independent deployment, for example
+`github.com.codesjoy.skuld.sequence.user` and
+`github.com.codesjoy.skuld.sequence.group`. The name is resolved once at process
+startup; it is not part of `app.sequence` and cannot be changed by a config
+reload. Consumers must use the same name in their Yggdrasil
+`clients.services` entry and when calling `NewClient`.
+
+Application names separate service registration, discovery, and application
+identity telemetry. They do not namespace database records. Each independent
+deployment must use its own DSN; deployments that share a database also share
+the `sequence_ranges` and `sequence_routes` tables.
 
 Do not commit real credentials or production DSNs. See the
 [Docker deployment guide](../deploy/docker/README.md) for MySQL DSNs, external

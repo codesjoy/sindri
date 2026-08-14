@@ -18,6 +18,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/codesjoy/sindri/internal/sequence/app"
 	"github.com/codesjoy/yggdrasil-ecosystem/modules/etcd/v3"
@@ -27,12 +28,24 @@ import (
 	"github.com/codesjoy/yggdrasil/v3"
 )
 
-const appName = "github.com.codesjoy.skuld.sequence"
+const (
+	appNameEnv     = "SKULD_SEQUENCE_APP_NAME"
+	defaultAppName = "github.com.codesjoy.skuld.sequence"
+)
+
+func resolveAppName(lookupEnv func(string) (string, bool)) string {
+	if value, ok := lookupEnv(appNameEnv); ok {
+		if name := strings.TrimSpace(value); name != "" {
+			return name
+		}
+	}
+	return defaultAppName
+}
 
 func main() {
 	if err := yggdrasil.Run(
 		context.Background(),
-		appName,
+		resolveAppName(os.LookupEnv),
 		app.Compose,
 		yggdrasil.WithConfigPath("configs/sequence.yaml"),
 		yggdrasil.WithModules(

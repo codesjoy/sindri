@@ -41,6 +41,7 @@ Stop the stack with `docker compose -f deploy/docker/compose.yaml down`. Add `-v
 export SKULD_SEQUENCE_DRIVER=postgres
 export SKULD_SEQUENCE_DSN='postgres://skuld_sequence:password@db.example.com:5432/skuld_sequence?sslmode=require'
 export SKULD_OTLP_ENDPOINT='otel-collector.example.com:4317'
+export SKULD_SEQUENCE_APP_NAME=github.com.codesjoy.skuld.sequence.user
 export SKULD_SEQUENCE_NODE_ID=sequence-prod-1
 export SKULD_SEQUENCE_MEMORY_LIMIT=2g
 docker compose -f deploy/docker/compose.external.yaml up --build -d
@@ -58,6 +59,16 @@ The external Collector must accept OTLP gRPC on the configured endpoint. Externa
 ## Configuration and secrets
 
 All `${...}` values in `configs/sequence.yaml` are expanded from the container environment. Replace the example passwords for any shared or production deployment. Prefer Docker secrets, a secret manager, or an orchestrator-provided environment over committing a `.env` file with credentials.
+
+`SKULD_SEQUENCE_APP_NAME` is read directly by the process before Yggdrasil
+loads `configs/sequence.yaml`. It defaults to
+`github.com.codesjoy.skuld.sequence`. Give independent deployments distinct
+names, such as `github.com.codesjoy.skuld.sequence.user` and
+`github.com.codesjoy.skuld.sequence.group`, and configure consumers to use the
+matching name in both their Yggdrasil `clients.services` entry and `NewClient`
+call. Each deployment must also use a separate DSN: changing the application
+name does not namespace `sequence_ranges` or `sequence_routes` in a shared
+database.
 
 ## Memory and CPU sizing
 

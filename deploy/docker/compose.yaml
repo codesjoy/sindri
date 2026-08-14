@@ -21,6 +21,7 @@ x-sequence-image: &sequence-image
     dockerfile: deploy/docker/Dockerfile.go-service
 
 x-sequence-environment: &sequence-environment
+  SKULD_SEQUENCE_APP_NAME: ${SKULD_SEQUENCE_APP_NAME:-github.com.codesjoy.skuld.sequence}
   SKULD_SEQUENCE_DRIVER: ${SKULD_SEQUENCE_DRIVER:-postgres}
   SKULD_SEQUENCE_DSN: ${SKULD_SEQUENCE_DSN:-postgres://skuld_sequence:${SKULD_SEQUENCE_DB_PASSWORD:-skuld-local}@postgres:5432/skuld_sequence?sslmode=disable}
   SKULD_OTLP_ENDPOINT: ${SKULD_OTLP_ENDPOINT:-otel-collector:4317}
