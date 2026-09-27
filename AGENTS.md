@@ -64,18 +64,29 @@ testcontainers. Put package tests beside code, component tests in
 
 ## Commit, Release, and Pull Request Guidelines
 
-Follow `.gitlint` Conventional Commit rules: `feat(sequence): add route refresh`,
-with a lowercase subject, no trailing period, and at most 72 characters. Nested
-module tags include the module directory, for example
+Run `make hooks.install` after checkout. Branch names must be `main`, `master`,
+`develop`, or use
+`(feature|fix|chore|docs|refactor|release|hotfix)/<description>`; detached HEAD
+is not allowed.
+
+Follow `.gitlint` and the Git and change review rules in
+`docs/engineering-standards.md`. Commit headers use
+`<type>(<scope>): <description>` or `<type>: <description>`, for example
+`feat(sequence): add route refresh`, with a lowercase description, no trailing
+period, and at most 72 characters. Use a scope when one service, module, or
+package owns the change. A body is required for large or mixed changes, and
+breaking changes require both `!` and a `BREAKING CHANGE:` body entry.
+
+Nested module tags include the module directory, for example
 `gen/go/sequence/v0.1.0` and `pkg/sequence/v0.1.0`. Deployable services use
 `service/<service>/vX.Y.Z` tags; these are Git release markers, not Go module
 versions. Record the exact contract and tested clients in
 `releases/services/<service>.yaml` and release in dependency order as documented
 in `docs/module-release.md`.
 
-Pull requests should explain behavior and architecture impact, identify
-config/schema/API changes, and list commands run. Include generated files and
-both dialect migrations when their sources change.
+Pull requests must explain behavior and architecture impact, identify
+config/schema/API changes, list commands run, and cover generated files,
+compatibility, rollback, and both dialect migrations when applicable.
 
 ## Security & Configuration
 

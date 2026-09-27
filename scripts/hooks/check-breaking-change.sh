@@ -13,15 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+set -o errexit
+set -o nounset
+set -o pipefail
 
-set -euo pipefail
+if [[ $# -ne 1 ]]; then
+	echo "Error: commit message file path is required" >&2
+	exit 1
+fi
 
-commit_message_file="${1:?commit message file is required}"
-commit_subject="$(sed -n '1p' "$commit_message_file")"
+commit_msg_file="$1"
+raw_commit_msg="$(cat "${commit_msg_file}")"
+title_line="$(printf '%s\n' "${raw_commit_msg}" | head -n 1 | sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 
-if [[ "$commit_subject" == *"!:"* ]]; then
-  if ! grep -q '^BREAKING CHANGE:' "$commit_message_file"; then
-    echo "commit message policy: bang commits require a BREAKING CHANGE: footer" >&2
-    exit 1
-  fi
+if [[ "${title_line}" =~ ^(Merge|Revert) ]] || [[ -z "${title_line}" ]]; then
+	exit 0
+fi
+
+if [[ "${title_line}" =~ !: ]]; then
+	body="$(printf '%s\n' "${raw_commit_msg}" | sed -e '1d' -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*#/d')"
+	if ! grep -qE '^BREAKING[[:space:]]+CHANGE[[:space:]]*:' <<<"${body}"; then
+		echo "Error: breaking commit '!' requires a 'BREAKING CHANGE: ...' line in body" >&2
+		exit 1
+	fi
 fi
