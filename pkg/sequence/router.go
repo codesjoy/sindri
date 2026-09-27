@@ -292,15 +292,20 @@ func compileRoute(snapshot *sequencev1.RouteSnapshot) (*compiledRoute, error) {
 }
 
 func (r *Router) ownerTable() [SlotCount]string {
+	owners, _ := r.ownerSnapshot()
+	return owners
+}
+
+func (r *Router) ownerSnapshot() ([SlotCount]string, int64) {
 	if r == nil {
-		return [SlotCount]string{}
+		return [SlotCount]string{}, 0
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if r.current == nil {
-		return [SlotCount]string{}
+		return [SlotCount]string{}, 0
 	}
-	return r.current.owners
+	return r.current.owners, r.current.snapshot.GetVersion()
 }
 
 func (r *Router) subscribe(listener func()) func() {

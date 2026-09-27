@@ -244,6 +244,10 @@ app:
       default_step: 100
       max_step: 10000
       prefetch_ratio: 0.5
+      prefetch_latency_multiplier: 4
+      prefetch_latency_window: 5m
+      prefetch_latency_min_samples: 100
+      prefetch_rate_reset_after: 1m
       step_increase_threshold: 15m
       step_decrease_threshold: 30m
       reserve_timeout: 1s
@@ -391,16 +395,22 @@ func splitSlots() map[string][]uint32 {
 }
 
 func keyForOwner(owner string, route map[string][]uint32) string {
+	return keysForOwner(owner, route, 1)[0]
+}
+
+func keysForOwner(owner string, route map[string][]uint32, count int) []string {
 	owned := make(map[uint32]struct{}, len(route[owner]))
 	for _, slot := range route[owner] {
 		owned[slot] = struct{}{}
 	}
-	for index := 0; ; index++ {
+	keys := make([]string, 0, count)
+	for index := 0; len(keys) < count; index++ {
 		key := fmt.Sprintf("system-%s-%d", owner, index)
 		if _, ok := owned[biz.SlotForKey(key)]; ok {
-			return key
+			keys = append(keys, key)
 		}
 	}
+	return keys
 }
 
 func (s *SequenceSystemSuite) waitForOwnership(nodeID, key string, version int64) int64 {

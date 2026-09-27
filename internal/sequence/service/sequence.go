@@ -48,41 +48,156 @@ func (s *SequenceService) FetchNext(
 	ctx context.Context,
 	req *sequencev1.FetchNextRequest,
 ) (*sequencev1.FetchNextResponse, error) {
-	val, err := s.allocator.FetchNext(ctx, req.Key)
+	request, err := validateFetchNextRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	allocation, err := s.allocator.FetchNextN(ctx, request.Key, request.Count)
 	if err == nil {
-		return &sequencev1.FetchNextResponse{Id: val}, nil
+		return &sequencev1.FetchNextResponse{
+			Id:    allocation.ID,
+			Count: allocation.Count,
+		}, nil
 	}
 
 	if !xerror.IsReason(err, reason.Reason_SEQUENCE_SLOT_NOT_OWNER) {
 		return nil, err
 	}
+	if err = s.waitForRouteVersion(ctx); err != nil {
+		return nil, err
+	}
 
+	allocation, err = s.allocator.FetchNextN(ctx, request.Key, request.Count)
+	if err != nil {
+		return nil, err
+	}
+	return &sequencev1.FetchNextResponse{
+		Id:    allocation.ID,
+		Count: allocation.Count,
+	}, nil
+}
+
+// FetchNextBatch allocates IDs for a route-homogeneous batch of keys.
+func (s *SequenceService) FetchNextBatch(
+	ctx context.Context,
+	req *sequencev1.FetchNextBatchRequest,
+) (*sequencev1.FetchNextBatchResponse, error) {
+	requests, err := validateFetchNextBatchRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	allocations, err := s.allocator.FetchNextBatch(ctx, requests)
+	if err == nil {
+		return fetchNextBatchResponse(requests, allocations), nil
+	}
+
+	if !xerror.IsReason(err, reason.Reason_SEQUENCE_SLOT_NOT_OWNER) {
+		return nil, err
+	}
+	if err = s.waitForRouteVersion(ctx); err != nil {
+		return nil, err
+	}
+
+	allocations, err = s.allocator.FetchNextBatch(ctx, requests)
+	if err != nil {
+		return nil, err
+	}
+	return fetchNextBatchResponse(requests, allocations), nil
+}
+
+func (s *SequenceService) waitForRouteVersion(ctx context.Context) error {
 	md, ok := metadata.FromInContext(ctx)
 	if !ok {
-		return nil, xerror.New(code.Code_INVALID_ARGUMENT, "not found metadata")
+		return xerror.New(code.Code_INVALID_ARGUMENT, "not found metadata")
 	}
 	v := md.Get(sequence.VersionMetaKey)
 	if len(v) == 0 {
-		return nil, xerror.New(code.Code_INVALID_ARGUMENT, "version not found")
+		return xerror.New(code.Code_INVALID_ARGUMENT, "version not found")
 	}
 	rv, err := strconv.ParseInt(v[0], 10, 64)
 	if err != nil {
-		return nil, xerror.New(code.Code_INVALID_ARGUMENT, "version not found")
+		return xerror.New(code.Code_INVALID_ARGUMENT, "version not found")
 	}
 
 	if rv <= s.route.Version() {
-		return nil, xerror.NewWithReason(reason.Reason_SEQUENCE_ROUTE_EXPIRED, "", nil)
+		return xerror.NewWithReason(reason.Reason_SEQUENCE_ROUTE_EXPIRED, "", nil)
 	}
 
 	if err = s.allocator.WaitForVersion(ctx, rv); err != nil {
-		return nil, err
+		return err
+	}
+	return nil
+}
+
+func validateFetchNextRequest(
+	req *sequencev1.FetchNextRequest,
+) (biz.SequenceRequest, error) {
+	if req == nil {
+		return biz.SequenceRequest{}, invalidRequest("request is required")
+	}
+	if req.GetKey() == "" || len(req.GetKey()) > 256 {
+		return biz.SequenceRequest{}, invalidRequest("key must contain 1..256 bytes")
+	}
+	count := req.GetCount()
+	if count == 0 {
+		count = 1
+	}
+	if count > biz.MaxIDsPerKey {
+		return biz.SequenceRequest{}, invalidRequest("count is out of range")
+	}
+	return biz.SequenceRequest{Key: req.GetKey(), Count: count}, nil
+}
+
+func validateFetchNextBatchRequest(
+	req *sequencev1.FetchNextBatchRequest,
+) ([]biz.SequenceRequest, error) {
+	if req == nil {
+		return nil, invalidRequest("request is required")
+	}
+	if len(req.GetRequests()) == 0 || len(req.GetRequests()) > biz.MaxBatchKeys {
+		return nil, invalidRequest("request key count is out of range")
 	}
 
-	val, err = s.allocator.FetchNext(ctx, req.Key)
-	if err != nil {
-		return nil, err
+	requests := make([]biz.SequenceRequest, len(req.GetRequests()))
+	seen := make(map[string]struct{}, len(requests))
+	var total int64
+	for index, item := range req.GetRequests() {
+		request, err := validateFetchNextRequest(item)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := seen[request.Key]; exists {
+			return nil, invalidRequest("duplicate key")
+		}
+		seen[request.Key] = struct{}{}
+		total += int64(request.Count)
+		if total > biz.MaxIDsPerRequest {
+			return nil, invalidRequest("request ID count is out of range")
+		}
+		requests[index] = request
 	}
-	return &sequencev1.FetchNextResponse{Id: val}, nil
+	return requests, nil
+}
+
+func invalidRequest(message string) error {
+	return xerror.New(code.Code_INVALID_ARGUMENT, message)
+}
+
+func fetchNextBatchResponse(
+	requests []biz.SequenceRequest,
+	allocations []biz.SequenceAllocation,
+) *sequencev1.FetchNextBatchResponse {
+	response := &sequencev1.FetchNextBatchResponse{
+		Results: make([]*sequencev1.FetchNextBatchResult, len(allocations)),
+	}
+	for index, allocation := range allocations {
+		response.Results[index] = &sequencev1.FetchNextBatchResult{
+			Key:   requests[index].Key,
+			Id:    allocation.ID,
+			Count: allocation.Count,
+		}
+	}
+	return response
 }
 
 // GetRoute returns the active route or a not-modified response.

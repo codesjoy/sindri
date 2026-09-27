@@ -47,6 +47,12 @@ func TestSequenceBalancerRoutesSlotsAndTracksRouteUpdates(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Same(t, client.clients["grpc/a:1"], result.RemoteClient())
+	result, err = picker.Next(balancer.RPCInfo{
+		Ctx:    WithSlot(context.Background(), 0),
+		Method: fetchNextBatchFullMethod,
+	})
+	require.NoError(t, err)
+	assert.Same(t, client.clients["grpc/a:1"], result.RemoteClient())
 
 	updates := client.updateCount()
 	require.NoError(t, router.Update(testRoute(2, "node-b", "node-a")))

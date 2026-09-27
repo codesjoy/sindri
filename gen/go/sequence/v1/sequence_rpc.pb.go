@@ -18,6 +18,7 @@ var _ = new(metadata.MD)
 
 type SequenceGeneratorClient interface {
 	FetchNext(context.Context, *FetchNextRequest) (*FetchNextResponse, error)
+	FetchNextBatch(context.Context, *FetchNextBatchRequest) (*FetchNextBatchResponse, error)
 	GetRoute(context.Context, *GetRouteRequest) (*GetRouteResponse, error)
 }
 
@@ -32,6 +33,15 @@ func NewSequenceGeneratorClient(cc client.Client) SequenceGeneratorClient {
 func (c *sequencegeneratorClient) FetchNext(ctx context.Context, in *FetchNextRequest) (*FetchNextResponse, error) {
 	out := new(FetchNextResponse)
 	err := c.cc.Invoke(ctx, "/codesjoy.sindri.sequence.v1.SequenceGenerator/FetchNext", in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sequencegeneratorClient) FetchNextBatch(ctx context.Context, in *FetchNextBatchRequest) (*FetchNextBatchResponse, error) {
+	out := new(FetchNextBatchResponse)
+	err := c.cc.Invoke(ctx, "/codesjoy.sindri.sequence.v1.SequenceGenerator/FetchNextBatch", in, out)
 	if err != nil {
 		return nil, err
 	}
@@ -65,6 +75,24 @@ func _SequenceGenerator_FetchNext_Handler(srv interface{}, ctx context.Context, 
 	return unaryInt(ctx, in, info, handler)
 }
 
+func _SequenceGenerator_FetchNextBatch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, unaryInt interceptor.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FetchNextBatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if unaryInt == nil {
+		return srv.(SequenceGeneratorServer).FetchNextBatch(ctx, in)
+	}
+	info := &interceptor.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/codesjoy.sindri.sequence.v1.SequenceGenerator/FetchNextBatch",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SequenceGeneratorServer).FetchNextBatch(ctx, req.(*FetchNextBatchRequest))
+	}
+	return unaryInt(ctx, in, info, handler)
+}
+
 func _SequenceGenerator_GetRoute_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, unaryInt interceptor.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetRouteRequest)
 	if err := dec(in); err != nil {
@@ -85,6 +113,7 @@ func _SequenceGenerator_GetRoute_Handler(srv interface{}, ctx context.Context, d
 
 type SequenceGeneratorServer interface {
 	FetchNext(context.Context, *FetchNextRequest) (*FetchNextResponse, error)
+	FetchNextBatch(context.Context, *FetchNextBatchRequest) (*FetchNextBatchResponse, error)
 	GetRoute(context.Context, *GetRouteRequest) (*GetRouteResponse, error)
 	UnsafeSequenceGeneratorServer
 }
@@ -101,6 +130,10 @@ func (UnimplementedSequenceGeneratorServer) FetchNext(context.Context, *FetchNex
 	return nil, xerror.New(code.Code_UNIMPLEMENTED, "method FetchNext not implemented")
 }
 
+func (UnimplementedSequenceGeneratorServer) FetchNextBatch(context.Context, *FetchNextBatchRequest) (*FetchNextBatchResponse, error) {
+	return nil, xerror.New(code.Code_UNIMPLEMENTED, "method FetchNextBatch not implemented")
+}
+
 func (UnimplementedSequenceGeneratorServer) GetRoute(context.Context, *GetRouteRequest) (*GetRouteResponse, error) {
 	return nil, xerror.New(code.Code_UNIMPLEMENTED, "method GetRoute not implemented")
 }
@@ -114,6 +147,10 @@ var SequenceGeneratorServiceDesc = server.ServiceDesc{
 		{
 			MethodName: "FetchNext",
 			Handler:    _SequenceGenerator_FetchNext_Handler,
+		},
+		{
+			MethodName: "FetchNextBatch",
+			Handler:    _SequenceGenerator_FetchNextBatch_Handler,
 		},
 		{
 			MethodName: "GetRoute",

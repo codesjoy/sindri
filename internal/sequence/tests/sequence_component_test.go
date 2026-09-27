@@ -17,6 +17,7 @@ package sequence_test
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -51,6 +52,12 @@ func (c *inProcessClient) Invoke(
 		response, err := c.service.FetchNext(ctx, args.(*sequencev1.FetchNextRequest))
 		if err == nil {
 			proto.Merge(reply.(*sequencev1.FetchNextResponse), response)
+		}
+		return err
+	case "/codesjoy.sindri.sequence.v1.SequenceGenerator/FetchNextBatch":
+		response, err := c.service.FetchNextBatch(ctx, args.(*sequencev1.FetchNextBatchRequest))
+		if err == nil {
+			proto.Merge(reply.(*sequencev1.FetchNextBatchResponse), response)
 		}
 		return err
 	case "/codesjoy.sindri.sequence.v1.SequenceGenerator/GetRoute":
@@ -178,3 +185,67 @@ func TestAllocatorPrefetchesDatabaseRangeBeforeExhaustion(t *testing.T) {
 		assert.Equal(t, want, got)
 	}
 }
+
+func TestGeneratedClientDrivesBatchAllocation(t *testing.T) {
+	db, err := gorm.Open(
+		sqlite.Open("file:sequence-batch-component?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&gormdata.SequenceModel{}, &gormdata.RouteModel{}))
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+
+	keys := sameSlotComponentKeys(t, "orders", 3)
+	slots := make([]uint32, len(keys))
+	for index, key := range keys {
+		slots[index] = biz.SlotForKey(key)
+	}
+	allocator := biz.NewAllocator(
+		&biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
+		gormdata.NewSequenceData(db),
+		testMemorySampler{},
+		nil,
+	)
+	allocator.Open(1, 0, slots)
+	allocator.ApplyRoute(0)
+	route := biz.NewRouteCache()
+	route.UpdateRoute(&biz.Route{Version: 1, Nodes: []biz.RouteNode{{
+		NodeID: "node-a",
+		Slots:  slots,
+	}}})
+	client := sequencev1.NewSequenceGeneratorClient(&inProcessClient{
+		service: service.NewSequenceService(allocator, route),
+	})
+
+	response, err := client.FetchNextBatch(
+		context.Background(),
+		&sequencev1.FetchNextBatchRequest{Requests: []*sequencev1.FetchNextRequest{
+			{Key: keys[0]},
+			{Key: keys[1], Count: uint32Pointer(2)},
+			{Key: keys[2], Count: uint32Pointer(3)},
+		}},
+	)
+	require.NoError(t, err)
+	require.Len(t, response.Results, 3)
+	assert.Equal(t, keys[0], response.Results[0].Key)
+	assert.Equal(t, uint32(1), response.Results[0].Count)
+	assert.Equal(t, uint32(2), response.Results[1].Count)
+	assert.Equal(t, uint32(3), response.Results[2].Count)
+}
+
+func sameSlotComponentKeys(t *testing.T, base string, count int) []string {
+	t.Helper()
+	slot := biz.SlotForKey(base)
+	keys := []string{base}
+	for candidate := 0; len(keys) < count; candidate++ {
+		key := base + "-" + strconv.Itoa(candidate)
+		if biz.SlotForKey(key) == slot {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func uint32Pointer(value uint32) *uint32 { return &value }

@@ -28,8 +28,9 @@ import (
 )
 
 const (
-	fetchNextFullMethod = "/codesjoy.sindri.sequence.v1.SequenceGenerator/FetchNext"
-	getRouteFullMethod  = "/codesjoy.sindri.sequence.v1.SequenceGenerator/GetRoute"
+	fetchNextFullMethod      = "/codesjoy.sindri.sequence.v1.SequenceGenerator/FetchNext"
+	fetchNextBatchFullMethod = "/codesjoy.sindri.sequence.v1.SequenceGenerator/FetchNextBatch"
+	getRouteFullMethod       = "/codesjoy.sindri.sequence.v1.SequenceGenerator/GetRoute"
 )
 
 var (
@@ -267,7 +268,7 @@ func (p *sequencePicker) Next(info balancer.RPCInfo) (balancer.PickResult, error
 		index := p.next.Add(1) - 1
 		return pickedRemote{client: p.control[index%uint64(len(p.control))]}, nil
 	}
-	if info.Method != fetchNextFullMethod {
+	if info.Method != fetchNextFullMethod && info.Method != fetchNextBatchFullMethod {
 		return nil, fmt.Errorf("%w: method %s", ErrMissingSlot, info.Method)
 	}
 	slot, ok := SlotFromContext(info.Ctx)

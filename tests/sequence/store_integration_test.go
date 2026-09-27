@@ -157,6 +157,7 @@ func TestSequenceStoreContractAcrossDialects(t *testing.T) {
 		t.Run(item.name, func(t *testing.T) {
 			db := openGORM(t, item)
 			runRangeContract(t, db, item.name)
+			runBatchRangeContract(t, db, item.name)
 			runRouteContract(t, db, item.name)
 		})
 	}
@@ -172,16 +173,20 @@ func TestDatabaseIdentityAndAppInitializationAcrossDialects(t *testing.T) {
 					ExpectedDatabase: databaseName, ExpectedAccount: databaseUser,
 				},
 				Allocator: biz.AllocatorConfig{
-					DefaultStep:              10,
-					MaxStep:                  100,
-					PrefetchRatio:            biz.DefaultPrefetchRatio,
-					StepIncreaseThreshold:    biz.DefaultStepIncreaseThreshold,
-					StepDecreaseThreshold:    biz.DefaultStepDecreaseThreshold,
-					ReserveTimeout:           biz.DefaultReserveTimeout,
-					IdleTimeout:              biz.DefaultIdleTimeout,
-					CleanupInterval:          biz.DefaultCleanupInterval,
-					CleanupSlotsPerRun:       biz.DefaultCleanupSlotsPerRun,
-					MemoryHighWatermarkRatio: biz.DefaultMemoryHighWatermarkRatio,
+					DefaultStep:               10,
+					MaxStep:                   100,
+					PrefetchRatio:             biz.DefaultPrefetchRatio,
+					PrefetchLatencyMultiplier: biz.DefaultPrefetchLatencyMultiplier,
+					PrefetchLatencyWindow:     biz.DefaultPrefetchLatencyWindow,
+					PrefetchLatencyMinSamples: biz.DefaultPrefetchLatencyMinSamples,
+					PrefetchRateResetAfter:    biz.DefaultPrefetchRateResetAfter,
+					StepIncreaseThreshold:     biz.DefaultStepIncreaseThreshold,
+					StepDecreaseThreshold:     biz.DefaultStepDecreaseThreshold,
+					ReserveTimeout:            biz.DefaultReserveTimeout,
+					IdleTimeout:               biz.DefaultIdleTimeout,
+					CleanupInterval:           biz.DefaultCleanupInterval,
+					CleanupSlotsPerRun:        biz.DefaultCleanupSlotsPerRun,
+					MemoryHighWatermarkRatio:  biz.DefaultMemoryHighWatermarkRatio,
 				},
 				Node: biz.NodeConfig{
 					ID: "node-a", HeartbeatTimeoutTicks: 3,
@@ -207,23 +212,23 @@ func runRangeContract(t *testing.T, db *gorm.DB, prefix string) {
 	t.Helper()
 	store := gormdata.NewSequenceData(db)
 	key := prefix + "-orders"
-	first, err := store.ReserveRange(context.Background(), key, 10)
+	first, err := reserveRange(context.Background(), store, key, 10)
 	require.NoError(t, err)
 	assert.Equal(t, biz.SequenceRange{Start: 1, End: 10}, first)
-	second, err := store.ReserveRange(context.Background(), key, 10)
+	second, err := reserveRange(context.Background(), store, key, 10)
 	require.NoError(t, err)
 	assert.Equal(t, biz.SequenceRange{Start: 11, End: 20}, second)
 
 	restarted := gormdata.NewSequenceData(db)
-	third, err := restarted.ReserveRange(context.Background(), key, 5)
+	third, err := reserveRange(context.Background(), restarted, key, 5)
 	require.NoError(t, err)
 	assert.Equal(t, biz.SequenceRange{Start: 21, End: 25}, third)
-	independent, err := store.ReserveRange(context.Background(), prefix+"-invoices", 3)
+	independent, err := reserveRange(context.Background(), store, prefix+"-invoices", 3)
 	require.NoError(t, err)
 	assert.Equal(t, biz.SequenceRange{Start: 1, End: 3}, independent)
-	_, err = store.ReserveRange(context.Background(), "", 1)
+	_, err = reserveRange(context.Background(), store, "", 1)
 	require.Error(t, err)
-	_, err = store.ReserveRange(context.Background(), key, 0)
+	_, err = reserveRange(context.Background(), store, key, 0)
 	require.Error(t, err)
 
 	const workers = 32
@@ -235,8 +240,11 @@ func runRangeContract(t *testing.T, db *gorm.DB, prefix string) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			reserved, reserveErr := store.ReserveRange(
-				context.Background(), prefix+"-concurrent", step,
+			reserved, reserveErr := reserveRange(
+				context.Background(),
+				store,
+				prefix+"-concurrent",
+				step,
 			)
 			if reserveErr != nil {
 				errs <- reserveErr
@@ -267,8 +275,160 @@ func runRangeContract(t *testing.T, db *gorm.DB, prefix string) {
 		MaxID:       math.MaxInt64 - 2,
 		UpdatedAt:   time.Now().UTC(),
 	}).Error)
-	_, err = store.ReserveRange(context.Background(), overflowKey, 3)
+	_, err = reserveRange(context.Background(), store, overflowKey, 3)
 	require.Error(t, err)
+}
+
+func reserveRange(
+	ctx context.Context,
+	store biz.SequenceRepo,
+	key string,
+	step int64,
+) (biz.SequenceRange, error) {
+	ranges, err := store.ReserveRanges(
+		ctx,
+		[]biz.ReservationRequest{{Key: key, Step: step}},
+	)
+	if err != nil {
+		return biz.SequenceRange{}, err
+	}
+	return ranges[0], nil
+}
+
+func runBatchRangeContract(t *testing.T, db *gorm.DB, prefix string) {
+	t.Helper()
+	ctx := context.Background()
+	store := gormdata.NewSequenceData(db)
+
+	firstKey := prefix + "-batch-first"
+	secondKey := prefix + "-batch-second"
+	reserved, err := store.ReserveRanges(ctx, []biz.ReservationRequest{
+		{Key: secondKey, Step: 4},
+		{Key: firstKey, Step: 3},
+	})
+	require.NoError(t, err)
+	require.Len(t, reserved, 2)
+	assert.Equal(t, biz.SequenceRange{Start: 1, End: 4}, reserved[0],
+		"batch results must follow request order")
+	assert.Equal(t, biz.SequenceRange{Start: 1, End: 3}, reserved[1])
+	assert.Equal(t, int64(3), maxIDFor(t, db, firstKey))
+	assert.Equal(t, int64(4), maxIDFor(t, db, secondKey))
+
+	mixed, err := store.ReserveRanges(ctx, []biz.ReservationRequest{
+		{Key: firstKey, Step: 2},
+		{Key: prefix + "-batch-third", Step: 5},
+	})
+	require.NoError(t, err)
+	require.Len(t, mixed, 2)
+	assert.Equal(t, biz.SequenceRange{Start: 4, End: 5}, mixed[0],
+		"existing keys continue from their watermark")
+	assert.Equal(t, biz.SequenceRange{Start: 1, End: 5}, mixed[1])
+
+	_, err = store.ReserveRanges(ctx, nil)
+	require.Error(t, err, "an empty batch must be rejected")
+	_, err = store.ReserveRanges(ctx, []biz.ReservationRequest{
+		{Key: firstKey, Step: 1},
+		{Key: firstKey, Step: 1},
+	})
+	require.Error(t, err, "duplicate keys must be rejected")
+
+	const (
+		workers   = 8
+		batchKeys = 3
+		step      = int64(5)
+	)
+	batchPrefix := prefix + "-batch-concurrent"
+	results := make(chan []biz.SequenceRange, workers)
+	errs := make(chan error, workers)
+	var wait sync.WaitGroup
+	for range workers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			requests := make([]biz.ReservationRequest, batchKeys)
+			for index := range requests {
+				requests[index] = biz.ReservationRequest{
+					Key:  fmt.Sprintf("%s-%d", batchPrefix, index),
+					Step: step,
+				}
+			}
+			ranges, reserveErr := store.ReserveRanges(context.Background(), requests)
+			if reserveErr != nil {
+				errs <- reserveErr
+				return
+			}
+			results <- ranges
+		}()
+	}
+	wait.Wait()
+	close(results)
+	close(errs)
+	for reserveErr := range errs {
+		require.NoError(t, reserveErr, "sorted key batches must not deadlock")
+	}
+	covered := make(map[string][]biz.SequenceRange, batchKeys)
+	for ranges := range results {
+		require.Len(t, ranges, batchKeys)
+		for index, item := range ranges {
+			key := fmt.Sprintf("%s-%d", batchPrefix, index)
+			covered[key] = append(covered[key], item)
+		}
+	}
+	for key, ranges := range covered {
+		require.Len(t, ranges, workers)
+		sort.Slice(ranges, func(i, j int) bool { return ranges[i].Start < ranges[j].Start })
+		for index, item := range ranges {
+			start := int64(index)*step + 1
+			assert.Equal(t, biz.SequenceRange{Start: start, End: start + step - 1}, item, key)
+		}
+	}
+
+	overflowKey := prefix + "-batch-overflow"
+	normalKey := prefix + "-batch-normal"
+	overflowMax := int64(math.MaxInt64 - 2)
+	require.NoError(t, db.Create(&gormdata.SequenceModel{
+		SequenceKey: overflowKey,
+		MaxID:       overflowMax,
+		UpdatedAt:   time.Now().UTC(),
+	}).Error)
+	_, err = store.ReserveRanges(ctx, []biz.ReservationRequest{
+		{Key: normalKey, Step: 6},
+		{Key: overflowKey, Step: 3},
+	})
+	require.Error(t, err, "overflow must fail the whole reservation")
+	assert.Zero(t, maxIDFor(t, db, normalKey),
+		"a failing batch must not advance the other keys")
+	assert.Equal(t, overflowMax, maxIDFor(t, db, overflowKey))
+
+	require.NoError(t, db.Where("sequence_key = ?", overflowKey).
+		Delete(&gormdata.SequenceModel{}).Error)
+	reserved, err = store.ReserveRanges(ctx, []biz.ReservationRequest{
+		{Key: normalKey, Step: 6},
+		{Key: overflowKey, Step: 3},
+	})
+	require.NoError(t, err)
+	require.Len(t, reserved, 2)
+	assert.Equal(t, biz.SequenceRange{Start: 1, End: 6}, reserved[0])
+	assert.Equal(t, biz.SequenceRange{Start: 1, End: 3}, reserved[1])
+
+	cancelledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err = store.ReserveRanges(cancelledCtx, []biz.ReservationRequest{{
+		Key:  prefix + "-batch-cancelled",
+		Step: 1,
+	}})
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func maxIDFor(t *testing.T, db *gorm.DB, key string) int64 {
+	t.Helper()
+	var model gormdata.SequenceModel
+	err := db.Where("sequence_key = ?", key).Take(&model).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0
+	}
+	require.NoError(t, err)
+	return model.MaxID
 }
 
 func runRouteContract(t *testing.T, db *gorm.DB, prefix string) {

@@ -37,8 +37,18 @@ const (
 	// DefaultMaxStep is the default upper bound for dynamically sized ranges.
 	DefaultMaxStep int64 = 10000
 
-	// DefaultPrefetchRatio starts reserving the next range halfway through the active range.
+	// DefaultPrefetchRatio reserves the next range at the fallback consumed
+	// watermark while the adaptive rate estimate is unavailable.
 	DefaultPrefetchRatio = 0.5
+	// DefaultPrefetchLatencyMultiplier reserves enough time for several reserve attempts.
+	DefaultPrefetchLatencyMultiplier = 4.0
+	// DefaultPrefetchLatencyWindow bounds the age of reserve latency samples.
+	DefaultPrefetchLatencyWindow = 5 * time.Minute
+	// DefaultPrefetchLatencyMinSamples is the number of successful samples required
+	// before the observed p99 replaces the configured reserve timeout.
+	DefaultPrefetchLatencyMinSamples = 100
+	// DefaultPrefetchRateResetAfter resets a key's rate estimate after an idle gap.
+	DefaultPrefetchRateResetAfter = time.Minute
 	// DefaultStepIncreaseThreshold grows ranges expected to be exhausted quickly.
 	DefaultStepIncreaseThreshold = 15 * time.Minute
 	// DefaultStepDecreaseThreshold shrinks ranges expected to last a long time.
@@ -55,22 +65,35 @@ const (
 	DefaultMemoryHighWatermarkRatio = 0.9
 
 	maxCleanupCandidates = 1024
+	// MaxReserveLatencySamples bounds the process-local latency sample ring.
+	MaxReserveLatencySamples = 1024
+	rateSampleInterval       = 10 * time.Millisecond
+	rateMinObservation       = 100 * time.Millisecond
+	latencyRecomputeInterval = time.Second
+	latencyRecomputeSamples  = 32
+	minPrefetchLead          = time.Millisecond
+	minRetryBackoff          = 5 * time.Millisecond
+	maxRetryBackoff          = 250 * time.Millisecond
 )
 
 // AllocatorConfig contains immutable range allocation settings.
 type AllocatorConfig struct {
 	// LegacyStep only detects the removed allocator.step configuration.
-	LegacyStep               *int64        `mapstructure:"step"`
-	DefaultStep              int64         `mapstructure:"default_step"`
-	MaxStep                  int64         `mapstructure:"max_step"`
-	PrefetchRatio            float64       `mapstructure:"prefetch_ratio"`
-	StepIncreaseThreshold    time.Duration `mapstructure:"step_increase_threshold"`
-	StepDecreaseThreshold    time.Duration `mapstructure:"step_decrease_threshold"`
-	ReserveTimeout           time.Duration `mapstructure:"reserve_timeout"`
-	IdleTimeout              time.Duration `mapstructure:"idle_timeout"`
-	CleanupInterval          time.Duration `mapstructure:"cleanup_interval"`
-	CleanupSlotsPerRun       int           `mapstructure:"cleanup_slots_per_run"`
-	MemoryHighWatermarkRatio float64       `mapstructure:"memory_high_watermark_ratio"`
+	LegacyStep                *int64        `mapstructure:"step"`
+	DefaultStep               int64         `mapstructure:"default_step"`
+	MaxStep                   int64         `mapstructure:"max_step"`
+	PrefetchRatio             float64       `mapstructure:"prefetch_ratio"`
+	PrefetchLatencyMultiplier float64       `mapstructure:"prefetch_latency_multiplier"`
+	PrefetchLatencyWindow     time.Duration `mapstructure:"prefetch_latency_window"`
+	PrefetchLatencyMinSamples int           `mapstructure:"prefetch_latency_min_samples"`
+	PrefetchRateResetAfter    time.Duration `mapstructure:"prefetch_rate_reset_after"`
+	StepIncreaseThreshold     time.Duration `mapstructure:"step_increase_threshold"`
+	StepDecreaseThreshold     time.Duration `mapstructure:"step_decrease_threshold"`
+	ReserveTimeout            time.Duration `mapstructure:"reserve_timeout"`
+	IdleTimeout               time.Duration `mapstructure:"idle_timeout"`
+	CleanupInterval           time.Duration `mapstructure:"cleanup_interval"`
+	CleanupSlotsPerRun        int           `mapstructure:"cleanup_slots_per_run"`
+	MemoryHighWatermarkRatio  float64       `mapstructure:"memory_high_watermark_ratio"`
 }
 
 func (c *AllocatorConfig) setDefaults() {
@@ -82,6 +105,18 @@ func (c *AllocatorConfig) setDefaults() {
 	}
 	if c.PrefetchRatio == 0 {
 		c.PrefetchRatio = DefaultPrefetchRatio
+	}
+	if c.PrefetchLatencyMultiplier == 0 {
+		c.PrefetchLatencyMultiplier = DefaultPrefetchLatencyMultiplier
+	}
+	if c.PrefetchLatencyWindow == 0 {
+		c.PrefetchLatencyWindow = DefaultPrefetchLatencyWindow
+	}
+	if c.PrefetchLatencyMinSamples == 0 {
+		c.PrefetchLatencyMinSamples = DefaultPrefetchLatencyMinSamples
+	}
+	if c.PrefetchRateResetAfter == 0 {
+		c.PrefetchRateResetAfter = DefaultPrefetchRateResetAfter
 	}
 	if c.StepIncreaseThreshold == 0 {
 		c.StepIncreaseThreshold = DefaultStepIncreaseThreshold
@@ -115,7 +150,13 @@ const (
 
 // SequenceRepo persists ranges reserved for sequence keys.
 type SequenceRepo interface {
-	ReserveRange(ctx context.Context, key string, step int64) (SequenceRange, error)
+	ReserveRanges(ctx context.Context, requests []ReservationRequest) ([]SequenceRange, error)
+}
+
+// ReservationRequest asks the repository to reserve a range for one key.
+type ReservationRequest struct {
+	Key  string
+	Step int64
 }
 
 // MemorySampler reports Go-managed memory and the configured Go memory limit.
@@ -137,6 +178,7 @@ type rangeFetch struct {
 }
 
 type keyState struct {
+	allocator   *Allocator
 	next        atomic.Int64
 	start       atomic.Int64
 	end         atomic.Int64
@@ -144,13 +186,21 @@ type keyState struct {
 	initialized atomic.Bool
 	lastUsed    atomic.Int64
 	returned    atomic.Int64
+	prefetchAt  atomic.Int64
+	recentBlock atomic.Int64
+	rateGate    atomic.Int64
+	retired     atomic.Bool
 
-	mu          sync.Mutex
-	activeStep  int64
-	activatedAt time.Time
-	standby     *SequenceRange
-	fetch       *rangeFetch
-	retryAfter  time.Time
+	mu           sync.Mutex
+	activeStep   int64
+	standby      *SequenceRange
+	fetch        *rangeFetch
+	retryAfter   time.Time
+	retryAttempt int
+	retryTimer   retryTimer
+
+	rateMu sync.Mutex
+	rate   keyRateEstimator
 }
 
 func (k *keyState) allocate(
@@ -171,7 +221,7 @@ func (k *keyState) allocate(
 		candidate = k.next.Add(1)
 		if generation%2 == 0 && k.inActiveRange(candidate) &&
 			generation == k.generation.Load() {
-			k.afterAllocate(store, key, cfg, now, candidate, generation)
+			k.afterAllocate(store, key, cfg, now, candidate, 1, generation)
 			return candidate, nil
 		}
 	}
@@ -189,7 +239,7 @@ func (k *keyState) allocate(
 	if err != nil {
 		return 0, err
 	}
-	k.afterAllocate(store, key, cfg, now, id, idGeneration)
+	k.afterAllocate(store, key, cfg, now, id, 1, idGeneration)
 	return id, nil
 }
 
@@ -222,7 +272,7 @@ func (k *keyState) allocateSlow(
 		}
 
 		if k.standby != nil {
-			id, nextGeneration := k.activateStandbyLocked(now())
+			id, nextGeneration := k.activateStandbyLocked(now(), 1, cfg)
 			k.mu.Unlock()
 			return id, nextGeneration, nil
 		}
@@ -244,14 +294,17 @@ func (k *keyState) allocateSlow(
 		step := cfg.DefaultStep
 		if k.initialized.Load() {
 			activeSize := k.end.Load() - k.start.Load() + 1
-			step = k.nextStepLocked(now(), activeSize, activeSize, cfg)
+			step = k.nextStepLocked(activeSize, cfg)
 		}
 		fetch := &rangeFetch{done: make(chan struct{})}
 		k.fetch = fetch
+		k.clearRetryLocked()
 		k.mu.Unlock()
 
+		started := time.Now()
 		reserved, err := reserveRange(ctx, store, key, step)
-		k.completeFetch(fetch, reserved, err, cfg, now())
+		k.observeAllocationReserve(started, err)
+		k.completeFetch(fetch, reserved, err, cfg, now(), key)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -264,18 +317,23 @@ func (k *keyState) afterAllocate(
 	cfg AllocatorConfig,
 	now func() time.Time,
 	id int64,
+	blockSize int64,
 	generation uint64,
 ) {
 	k.recordReturned(id)
-	k.touch(now())
+	currentTime := now()
+	k.touch(currentTime)
 	start := k.start.Load()
 	end := k.end.Load()
 	if start <= 0 || end < start {
 		return
 	}
 	consumed := id - start + 1
-	size := end - start + 1
-	if consumed <= 0 || float64(consumed)/float64(size) < cfg.PrefetchRatio {
+	if consumed <= 0 {
+		return
+	}
+	k.observeAllocation(currentTime, consumed, blockSize, generation, cfg)
+	if id < k.prefetchAt.Load() {
 		return
 	}
 
@@ -284,7 +342,6 @@ func (k *keyState) afterAllocate(
 		k.mu.Unlock()
 		return
 	}
-	currentTime := now()
 	if currentTime.Before(k.retryAfter) {
 		k.mu.Unlock()
 		return
@@ -293,39 +350,50 @@ func (k *keyState) afterAllocate(
 	currentEnd := k.end.Load()
 	currentConsumed := id - currentStart + 1
 	currentSize := currentEnd - currentStart + 1
-	if currentConsumed <= 0 || currentSize <= 0 ||
-		float64(currentConsumed)/float64(currentSize) < cfg.PrefetchRatio {
+	shouldPrefetch, fallback := k.prefetchDecisionLocked(id, cfg)
+	if currentConsumed <= 0 || currentSize <= 0 || !shouldPrefetch {
 		k.mu.Unlock()
 		return
 	}
-	step := k.nextStepLocked(currentTime, currentConsumed, currentSize, cfg)
+	step := k.nextStepLocked(currentSize, cfg)
 	fetch := &rangeFetch{
 		done:       make(chan struct{}),
 		background: true,
 	}
 	k.fetch = fetch
+	if k.retryTimer != nil {
+		k.retryTimer.Stop()
+		k.retryTimer = nil
+	}
+	k.retryAfter = time.Time{}
+	if k.allocator != nil {
+		k.allocator.prefetchStarted.Add(1)
+		if fallback {
+			k.allocator.prefetchFallback.Add(1)
+		}
+	}
 	k.mu.Unlock()
 
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), cfg.ReserveTimeout)
-		defer cancel()
-		reserved, err := reserveRange(ctx, store, key, step)
-		k.completeFetch(fetch, reserved, err, cfg, now())
-	}()
+	k.launchBackgroundPrefetch(store, key, fetch, step, cfg)
 }
 
-func (k *keyState) nextStepLocked(
-	now time.Time,
-	consumed int64,
-	size int64,
-	cfg AllocatorConfig,
-) int64 {
+func (k *keyState) nextStepLocked(size int64, cfg AllocatorConfig) int64 {
 	step := k.activeStep
 	if step < cfg.DefaultStep {
 		step = cfg.DefaultStep
 	}
-	consumedRatio := float64(consumed) / float64(size)
-	estimatedDuration := time.Duration(float64(now.Sub(k.activatedAt)) / consumedRatio)
+	rate, ready := k.rateSnapshot()
+	if !ready || size <= 0 {
+		return step
+	}
+	seconds := float64(size) / rate
+	if seconds <= 0 {
+		return step
+	}
+	estimatedDuration := time.Duration(math.MaxInt64)
+	if seconds < float64(math.MaxInt64)/float64(time.Second) {
+		estimatedDuration = time.Duration(seconds * float64(time.Second))
+	}
 	switch {
 	case estimatedDuration <= cfg.StepIncreaseThreshold:
 		if step >= cfg.MaxStep/2 {
@@ -349,6 +417,7 @@ func (k *keyState) completeFetch(
 	err error,
 	cfg AllocatorConfig,
 	now time.Time,
+	key string,
 ) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -359,27 +428,38 @@ func (k *keyState) completeFetch(
 	fetch.err = err
 	if err == nil {
 		k.standby = &fetch.reserved
-		k.retryAfter = time.Time{}
+		k.clearRetryLocked()
+		if k.allocator != nil && fetch.background {
+			k.allocator.prefetchSucceeded.Add(1)
+		}
 	} else if fetch.background {
-		k.retryAfter = now.Add(cfg.ReserveTimeout)
+		if k.allocator != nil {
+			k.allocator.prefetchFailed.Add(1)
+		}
+		k.scheduleRetryLocked(key, cfg, now)
 	}
 	k.fetch = nil
 	close(fetch.done)
 }
 
-func (k *keyState) activateStandbyLocked(now time.Time) (int64, uint64) {
+func (k *keyState) activateStandbyLocked(
+	now time.Time,
+	advance int64,
+	cfg AllocatorConfig,
+) (int64, uint64) {
 	reserved := *k.standby
 	k.standby = nil
 	// Odd generations prevent optimistic readers from consuming partially
 	// published bounds while the active range is changing.
 	k.generation.Add(1)
-	k.next.Store(reserved.Start)
+	k.next.Store(reserved.Start + advance - 1)
 	k.activeStep = reserved.End - reserved.Start + 1
-	k.activatedAt = now
 	k.start.Store(reserved.Start)
 	k.end.Store(reserved.End)
 	generation := k.generation.Add(1)
 	k.initialized.Store(true)
+	k.clearRetryLocked()
+	k.resetPrefetchState(generation, now, 0, cfg)
 	k.touch(now)
 	return reserved.Start, generation
 }
@@ -390,20 +470,52 @@ func reserveRange(
 	key string,
 	step int64,
 ) (SequenceRange, error) {
-	reserved, err := store.ReserveRange(ctx, key, step)
+	ranges, err := reserveRanges(ctx, store, []ReservationRequest{{Key: key, Step: step}})
 	if err != nil {
 		return SequenceRange{}, err
 	}
+	return ranges[0], nil
+}
+
+func reserveRanges(
+	ctx context.Context,
+	store SequenceRepo,
+	requests []ReservationRequest,
+) ([]SequenceRange, error) {
+	if len(requests) == 0 {
+		return nil, nil
+	}
+	reserved, err := store.ReserveRanges(ctx, requests)
+	if err != nil {
+		return nil, err
+	}
+	if len(reserved) != len(requests) {
+		return nil, fmt.Errorf(
+			"reserve sequence ranges: got %d ranges for %d requests",
+			len(reserved),
+			len(requests),
+		)
+	}
+	for index, request := range requests {
+		item := reserved[index]
+		if err := validateReservedRange(request.Key, request.Step, item); err != nil {
+			return nil, err
+		}
+	}
+	return reserved, nil
+}
+
+func validateReservedRange(key string, step int64, reserved SequenceRange) error {
 	if reserved.Start <= 0 || reserved.End < reserved.Start ||
 		reserved.End-reserved.Start+1 != step {
-		return SequenceRange{}, fmt.Errorf(
+		return fmt.Errorf(
 			"reserve sequence range for %q: invalid range [%d,%d]",
 			key,
 			reserved.Start,
 			reserved.End,
 		)
 	}
-	return reserved, nil
+	return nil
 }
 
 func (k *keyState) inActiveRange(id int64) bool {
@@ -459,6 +571,12 @@ type AllocatorStats struct {
 	AdmissionRejected int64
 	CleanupScanned    int64
 	CleanupEvicted    int64
+	PrefetchStarted   int64
+	PrefetchSucceeded int64
+	PrefetchFailed    int64
+	PrefetchRetries   int64
+	PrefetchFallback  int64
+	ReserveLatencyP99 time.Duration
 }
 
 type cleanupStats struct {
@@ -487,10 +605,13 @@ type Allocator struct {
 	cleanupSlots  []uint32
 	cleanupCursor int
 
-	store         SequenceRepo
-	cfg           AllocatorConfig
-	now           func() time.Time
-	memorySampler MemorySampler
+	store          SequenceRepo
+	cfg            AllocatorConfig
+	now            func() time.Time
+	memorySampler  MemorySampler
+	reserveLatency *reserveLatencyTracker
+	afterFunc      func(time.Duration, func()) retryTimer
+	randomFloat64  func() float64
 
 	prepareApply      *PrepareApply
 	lastCleanup       atomic.Int64
@@ -498,6 +619,11 @@ type Allocator struct {
 	admissionRejected atomic.Int64
 	cleanupScanned    atomic.Int64
 	cleanupEvicted    atomic.Int64
+	prefetchStarted   atomic.Int64
+	prefetchSucceeded atomic.Int64
+	prefetchFailed    atomic.Int64
+	prefetchRetries   atomic.Int64
+	prefetchFallback  atomic.Int64
 
 	logger *slog.Logger
 }
@@ -524,6 +650,13 @@ func NewAllocator(
 		cfg:           allocatorConfig,
 		now:           time.Now,
 		memorySampler: memorySampler,
+		reserveLatency: newReserveLatencyTracker(
+			allocatorConfig.PrefetchLatencyWindow,
+			allocatorConfig.PrefetchLatencyMinSamples,
+			time.Now,
+		),
+		afterFunc:     defaultRetryAfter,
+		randomFloat64: defaultRandomFloat64,
 		logger:        logger,
 	}
 	obj.state.Store(StatePaused)
@@ -575,7 +708,7 @@ func (obj *Allocator) loadOrCreateState(key string, slot *allocationSlot) (*keyS
 			nil,
 		)
 	}
-	state := &keyState{}
+	state := &keyState{allocator: obj}
 	slot.Store(key, state)
 	slot.count.Add(1)
 	obj.cachedKeys.Add(1)
@@ -696,6 +829,7 @@ func (obj *Allocator) evictIdleCandidates(
 			obj.slotsMu.Unlock()
 			continue
 		}
+		candidate.state.clearRetryLocked()
 
 		if candidate.state.initialized.Load() {
 			returned := candidate.state.returned.Load()
@@ -754,6 +888,12 @@ func (obj *Allocator) Stats() AllocatorStats {
 		AdmissionRejected: obj.admissionRejected.Load(),
 		CleanupScanned:    obj.cleanupScanned.Load(),
 		CleanupEvicted:    obj.cleanupEvicted.Load(),
+		PrefetchStarted:   obj.prefetchStarted.Load(),
+		PrefetchSucceeded: obj.prefetchSucceeded.Load(),
+		PrefetchFailed:    obj.prefetchFailed.Load(),
+		PrefetchRetries:   obj.prefetchRetries.Load(),
+		PrefetchFallback:  obj.prefetchFallback.Load(),
+		ReserveLatencyP99: obj.observedReserveP99(),
 	}
 }
 
@@ -772,6 +912,7 @@ func (obj *Allocator) Open(version int64, applyTick int64, slots []uint32) {
 	if version > obj.version {
 		for slot := range obj.slots {
 			obj.cachedKeys.Add(-obj.slots[slot].count.Load())
+			obj.cancelSlotRetries(obj.slots[slot])
 			delete(obj.slots, slot)
 		}
 		obj.rebuildCleanupSlotsLocked()
@@ -796,6 +937,7 @@ func (obj *Allocator) commitRoute(version int64, applyTick int64, slots []uint32
 	}
 	for _, slot := range needDel {
 		obj.cachedKeys.Add(-obj.slots[slot].count.Load())
+		obj.cancelSlotRetries(obj.slots[slot])
 		delete(obj.slots, slot)
 	}
 	obj.rebuildCleanupSlotsLocked()
@@ -847,6 +989,18 @@ func (obj *Allocator) ApplyRoute(tick int64) {
 	obj.versionCh = make(chan struct{})
 	obj.logger.Info("apply route change", slog.Int64("version", obj.prepareApply.Version))
 	obj.prepareApply = nil
+}
+
+func (obj *Allocator) cancelSlotRetries(slot *allocationSlot) {
+	if slot == nil {
+		return
+	}
+	slot.Range(func(_, value any) bool {
+		if state, ok := value.(*keyState); ok {
+			state.cancelRetry()
+		}
+		return true
+	})
 }
 
 func (obj *Allocator) rebuildCleanupSlotsLocked() {

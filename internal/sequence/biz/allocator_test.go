@@ -34,12 +34,16 @@ import (
 
 func testAllocatorConfig() AllocatorConfig {
 	return AllocatorConfig{
-		DefaultStep:           10,
-		MaxStep:               100,
-		PrefetchRatio:         0.5,
-		StepIncreaseThreshold: 15 * time.Minute,
-		StepDecreaseThreshold: 30 * time.Minute,
-		ReserveTimeout:        100 * time.Millisecond,
+		DefaultStep:               10,
+		MaxStep:                   100,
+		PrefetchRatio:             0.5,
+		PrefetchLatencyMultiplier: DefaultPrefetchLatencyMultiplier,
+		PrefetchLatencyWindow:     DefaultPrefetchLatencyWindow,
+		PrefetchLatencyMinSamples: DefaultPrefetchLatencyMinSamples,
+		PrefetchRateResetAfter:    DefaultPrefetchRateResetAfter,
+		StepIncreaseThreshold:     15 * time.Minute,
+		StepDecreaseThreshold:     30 * time.Minute,
+		ReserveTimeout:            100 * time.Millisecond,
 	}
 }
 
@@ -56,16 +60,19 @@ var unlimitedMemorySampler = memorySamplerFunc(func() (uint64, uint64) {
 	return 1, math.MaxInt64
 })
 
-func (s *rangeStore) ReserveRange(
+func (s *rangeStore) ReserveRanges(
 	_ context.Context,
-	key string,
-	step int64,
-) (SequenceRange, error) {
+	requests []ReservationRequest,
+) ([]SequenceRange, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	start := s.max[key] + 1
-	s.max[key] += step
-	return SequenceRange{Start: start, End: s.max[key]}, nil
+	reserved := make([]SequenceRange, len(requests))
+	for index, request := range requests {
+		start := s.max[request.Key] + 1
+		s.max[request.Key] += request.Step
+		reserved[index] = SequenceRange{Start: start, End: s.max[request.Key]}
+	}
+	return reserved, nil
 }
 
 func TestKeyStateContinuesFromPersistedWatermark(t *testing.T) {
@@ -160,8 +167,11 @@ func TestKeyStateConcurrentInitializationIsUnique(t *testing.T) {
 
 type invalidRangeStore struct{}
 
-func (invalidRangeStore) ReserveRange(context.Context, string, int64) (SequenceRange, error) {
-	return SequenceRange{Start: 10, End: 10}, nil
+func (invalidRangeStore) ReserveRanges(
+	context.Context,
+	[]ReservationRequest,
+) ([]SequenceRange, error) {
+	return []SequenceRange{{Start: 10, End: 10}}, nil
 }
 
 func TestKeyStateRejectsInvalidReservedRange(t *testing.T) {
@@ -191,11 +201,10 @@ type blockingRangeStore struct {
 	release chan struct{}
 }
 
-func (s *blockingRangeStore) ReserveRange(
+func (s *blockingRangeStore) ReserveRanges(
 	ctx context.Context,
-	_ string,
-	step int64,
-) (SequenceRange, error) {
+	requests []ReservationRequest,
+) ([]SequenceRange, error) {
 	select {
 	case <-s.started:
 	default:
@@ -203,49 +212,66 @@ func (s *blockingRangeStore) ReserveRange(
 	}
 	select {
 	case <-ctx.Done():
-		return SequenceRange{}, ctx.Err()
+		return nil, ctx.Err()
 	case <-s.release:
-		return SequenceRange{Start: 1, End: step}, nil
+		reserved := make([]SequenceRange, len(requests))
+		var start int64 = 1
+		for index, request := range requests {
+			reserved[index] = SequenceRange{Start: start, End: start + request.Step - 1}
+			start += request.Step
+		}
+		return reserved, nil
 	}
 }
 
-func (s *recordingRangeStore) ReserveRange(
+func (s *recordingRangeStore) ReserveRanges(
 	ctx context.Context,
-	_ string,
-	step int64,
-) (SequenceRange, error) {
+	requests []ReservationRequest,
+) ([]SequenceRange, error) {
 	s.mu.Lock()
-	s.steps = append(s.steps, step)
-	call := len(s.steps)
+	call := len(s.steps) + 1
+	for _, request := range requests {
+		s.steps = append(s.steps, request.Step)
+	}
 	if call == 1 {
-		start := s.max + 1
-		s.max += step
-		reserved := SequenceRange{Start: start, End: s.max}
+		reserved := s.reserveLocked(requests)
 		s.mu.Unlock()
 		return reserved, nil
 	}
 	s.mu.Unlock()
 	if s.started != nil {
-		select {
-		case s.started <- step:
-		default:
+		for _, request := range requests {
+			select {
+			case s.started <- request.Step:
+			default:
+			}
 		}
 	}
 	if s.release != nil {
 		select {
 		case <-ctx.Done():
-			return SequenceRange{}, ctx.Err()
+			return nil, ctx.Err()
 		case <-s.release:
 		}
 	}
 	if s.err != nil {
-		return SequenceRange{}, s.err
+		return nil, s.err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	start := s.max + 1
-	s.max += step
-	return SequenceRange{Start: start, End: s.max}, nil
+	return s.reserveLocked(requests), nil
+}
+
+func (s *recordingRangeStore) reserveLocked(
+	requests []ReservationRequest,
+) []SequenceRange {
+	reserved := make([]SequenceRange, len(requests))
+	for index, request := range requests {
+		start := s.max + 1
+		s.max += request.Step
+		reserved[index] = SequenceRange{Start: start, End: s.max}
+	}
+	return reserved
 }
 
 func (s *recordingRangeStore) recordedSteps() []int64 {
@@ -297,7 +323,7 @@ func TestKeyStatePrefetchesOnceAtConfiguredRatio(t *testing.T) {
 	assert.Equal(t, int64(6), got)
 	select {
 	case step := <-store.started:
-		assert.Equal(t, int64(20), step)
+		assert.Equal(t, int64(10), step)
 	case <-time.After(time.Second):
 		t.Fatal("prefetch did not start at configured ratio")
 	}
@@ -306,7 +332,7 @@ func TestKeyStatePrefetchesOnceAtConfiguredRatio(t *testing.T) {
 		_, err = state.allocate(context.Background(), store, "orders", cfg, clock.Now)
 		require.NoError(t, err)
 	}
-	assert.Equal(t, []int64{10, 20}, store.recordedSteps())
+	assert.Equal(t, []int64{10, 10}, store.recordedSteps())
 	close(store.release)
 }
 
@@ -343,14 +369,10 @@ func TestKeyStateAdjustsStepFromEstimatedExhaustion(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := testAllocatorConfig()
 			cfg.MaxStep = test.maxStep
-			activatedAt := time.Unix(100, 0)
-			state := &keyState{activeStep: test.activeStep, activatedAt: activatedAt}
-			got := state.nextStepLocked(
-				activatedAt.Add(test.elapsed),
-				5,
-				10,
-				cfg,
-			)
+			state := &keyState{activeStep: test.activeStep}
+			state.rate.ready = true
+			state.rate.rate = 5 / test.elapsed.Seconds()
+			got := state.nextStepLocked(10, cfg)
 			assert.Equal(t, test.wantNextStep, got)
 		})
 	}
@@ -377,7 +399,7 @@ func TestKeyStateWaitsForInflightPrefetchAtExhaustion(t *testing.T) {
 	cancel()
 	_, err := state.allocate(ctx, store, "orders", cfg, time.Now)
 	assert.ErrorIs(t, err, context.Canceled)
-	assert.Equal(t, []int64{10, 20}, store.recordedSteps())
+	assert.Equal(t, []int64{10, 10}, store.recordedSteps())
 	close(store.release)
 
 	got, err := state.allocate(context.Background(), store, "orders", cfg, time.Now)
@@ -622,7 +644,7 @@ func distinctSlotKeys(count int) []string {
 func BenchmarkAllocatorExistingKey(b *testing.B) {
 	allocator := readyAllocatorForKeys(b, "orders")
 	slot := allocator.slots[SlotForKey("orders")]
-	state := &keyState{activeStep: math.MaxInt64, activatedAt: time.Now()}
+	state := &keyState{activeStep: math.MaxInt64}
 	state.initialized.Store(true)
 	state.start.Store(1)
 	state.end.Store(math.MaxInt64)
@@ -641,7 +663,7 @@ func BenchmarkAllocatorExistingKey(b *testing.B) {
 func BenchmarkAllocatorExistingKeyParallel(b *testing.B) {
 	allocator := readyAllocatorForKeys(b, "orders")
 	slot := allocator.slots[SlotForKey("orders")]
-	state := &keyState{activeStep: math.MaxInt64, activatedAt: time.Now()}
+	state := &keyState{activeStep: math.MaxInt64}
 	state.initialized.Store(true)
 	state.start.Store(1)
 	state.end.Store(math.MaxInt64)

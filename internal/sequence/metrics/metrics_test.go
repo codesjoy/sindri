@@ -29,12 +29,11 @@ import (
 
 type testSequenceRepo struct{}
 
-func (testSequenceRepo) ReserveRange(
+func (testSequenceRepo) ReserveRanges(
 	context.Context,
-	string,
-	int64,
-) (biz.SequenceRange, error) {
-	return biz.SequenceRange{Start: 1, End: 10}, nil
+	[]biz.ReservationRequest,
+) ([]biz.SequenceRange, error) {
+	return []biz.SequenceRange{{Start: 1, End: 10}}, nil
 }
 
 type testMemorySampler struct {
@@ -88,6 +87,12 @@ func TestAllocatorMetricsCollectsRuntimeAndAllocatorValues(t *testing.T) {
 	assert.Equal(t, float64(0), values["sequence.allocator.admission_rejected"])
 	assert.Equal(t, float64(0), values["sequence.allocator.cleanup_scanned"])
 	assert.Equal(t, float64(0), values["sequence.allocator.cleanup_evicted"])
+	assert.Equal(t, float64(0), values["sequence.allocator.prefetch_started"])
+	assert.Equal(t, float64(0), values["sequence.allocator.prefetch_succeeded"])
+	assert.Equal(t, float64(0), values["sequence.allocator.prefetch_failed"])
+	assert.Equal(t, float64(0), values["sequence.allocator.prefetch_retries"])
+	assert.Equal(t, float64(0), values["sequence.allocator.prefetch_fallback"])
+	assert.Equal(t, float64(0), values["sequence.allocator.reserve_latency_p99"])
 }
 
 func TestAllocatorMetricsLifecycle(t *testing.T) {

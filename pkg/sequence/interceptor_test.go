@@ -234,6 +234,145 @@ func TestSequenceInterceptorRejectsReservedMetadata(t *testing.T) {
 	require.ErrorIs(t, err, ErrReservedRouteMetadata)
 }
 
+func TestSequenceInterceptorValidatesRequestedCount(t *testing.T) {
+	router, err := NewRouter(func(context.Context, int64) (*sequencev1.GetRouteResponse, error) {
+		return nil, errors.New("unexpected refresh")
+	})
+	require.NoError(t, err)
+	require.NoError(t, router.Update(testRoute(1, "node-a")))
+	middleware := newUnaryClientInterceptor(router)
+	count := uint32(3)
+
+	err = middleware(
+		context.Background(),
+		fetchNextFullMethod,
+		&sequencev1.FetchNextRequest{Key: "orders", Count: &count},
+		&sequencev1.FetchNextResponse{},
+		func(context.Context, string, any, any) error {
+			// Simulate an old service that ignored count and returned one ID.
+			return nil
+		},
+	)
+	require.ErrorIs(t, err, ErrCountUnsupported)
+
+	err = middleware(
+		context.Background(),
+		fetchNextFullMethod,
+		&sequencev1.FetchNextRequest{Key: "orders"},
+		&sequencev1.FetchNextResponse{},
+		func(context.Context, string, any, any) error {
+			return nil
+		},
+	)
+	require.NoError(t, err, "legacy count=0 response is accepted for a single ID")
+}
+
+func TestSequenceInterceptorRoutesHomogeneousBatch(t *testing.T) {
+	router, err := NewRouter(func(context.Context, int64) (*sequencev1.GetRouteResponse, error) {
+		return nil, errors.New("unexpected refresh")
+	})
+	require.NoError(t, err)
+	require.NoError(t, router.Update(testRoute(1, "node-a")))
+	middleware := newUnaryClientInterceptor(router)
+	requests := []*sequencev1.FetchNextRequest{{Key: "orders"}, {Key: "invoices"}}
+	reply := &sequencev1.FetchNextBatchResponse{}
+
+	err = middleware(
+		context.Background(),
+		fetchNextBatchFullMethod,
+		&sequencev1.FetchNextBatchRequest{Requests: requests},
+		reply,
+		func(ctx context.Context, _ string, _, response any) error {
+			slot, ok := SlotFromContext(ctx)
+			require.True(t, ok)
+			assert.Equal(t, SlotForKey("orders"), slot)
+			outgoing, ok := metadata.FromOutContext(ctx)
+			require.True(t, ok)
+			assert.Equal(t, []string{"1"}, outgoing.Get(VersionMetaKey))
+			response.(*sequencev1.FetchNextBatchResponse).Results = []*sequencev1.FetchNextBatchResult{
+				{Key: "orders", Id: 1, Count: 1},
+				{Key: "invoices", Id: 1, Count: 1},
+			}
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, reply.GetResults(), 2)
+}
+
+func TestSequenceInterceptorRejectsMixedOwnerBatch(t *testing.T) {
+	router, err := NewRouter(func(context.Context, int64) (*sequencev1.GetRouteResponse, error) {
+		return nil, errors.New("unexpected refresh")
+	})
+	require.NoError(t, err)
+	require.NoError(t, router.Update(testRoute(1, "node-a", "node-b")))
+	middleware := newUnaryClientInterceptor(router)
+
+	nodeA := sameOwnerRequests(t, "node-a", 1)
+	nodeB := sameOwnerRequests(t, "node-b", 1)
+	requests := []*sequencev1.FetchNextRequest{
+		{Key: nodeA[0].Key},
+		{Key: nodeB[0].Key},
+	}
+	calls := 0
+	err = middleware(
+		context.Background(),
+		fetchNextBatchFullMethod,
+		&sequencev1.FetchNextBatchRequest{Requests: requests},
+		&sequencev1.FetchNextBatchResponse{},
+		func(context.Context, string, any, any) error {
+			calls++
+			return nil
+		},
+	)
+	require.ErrorIs(t, err, ErrBatchRouteChanged)
+	assert.Zero(t, calls)
+}
+
+func TestSequenceInterceptorRefreshesAndRetriesBatchOnce(t *testing.T) {
+	loads := 0
+	router, err := NewRouter(func(
+		context.Context,
+		int64,
+	) (*sequencev1.GetRouteResponse, error) {
+		loads++
+		return &sequencev1.GetRouteResponse{Route: testRoute(int64(loads), "node-a")}, nil
+	})
+	require.NoError(t, err)
+	middleware := newUnaryClientInterceptor(router)
+	request := &sequencev1.FetchNextBatchRequest{
+		Requests: []*sequencev1.FetchNextRequest{{Key: "orders"}},
+	}
+	calls := 0
+	err = middleware(
+		context.Background(),
+		fetchNextBatchFullMethod,
+		request,
+		&sequencev1.FetchNextBatchResponse{},
+		func(_ context.Context, _ string, _, response any) error {
+			calls++
+			out := response.(*sequencev1.FetchNextBatchResponse)
+			if calls == 1 {
+				out.Results = []*sequencev1.FetchNextBatchResult{
+					{Key: "orders", Id: 999, Count: 1},
+				}
+				return status.FromError(xerror.NewWithReason(
+					reason.Reason_SEQUENCE_ROUTE_EXPIRED,
+					"stale",
+					nil,
+				))
+			}
+			require.Empty(t, out.GetResults())
+			out.Results = []*sequencev1.FetchNextBatchResult{
+				{Key: "orders", Id: 42, Count: 1},
+			}
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 2, calls)
+}
+
 func TestInterceptorProviderContract(t *testing.T) {
 	router, err := NewRouter(func(context.Context, int64) (*sequencev1.GetRouteResponse, error) {
 		return nil, errors.New("unused")

@@ -16,6 +16,7 @@ package service
 
 import (
 	"context"
+	"strconv"
 	"testing"
 
 	"github.com/codesjoy/pkg/basic/xerror"
@@ -35,14 +36,17 @@ type testMemorySampler struct{}
 
 func (testMemorySampler) MemoryUsage() (uint64, uint64) { return 1, 100 }
 
-func (s *sequenceStore) ReserveRange(
+func (s *sequenceStore) ReserveRanges(
 	_ context.Context,
-	_ string,
-	step int64,
-) (biz.SequenceRange, error) {
-	start := s.max + 1
-	s.max += step
-	return biz.SequenceRange{Start: start, End: s.max}, nil
+	requests []biz.ReservationRequest,
+) ([]biz.SequenceRange, error) {
+	reserved := make([]biz.SequenceRange, len(requests))
+	for index, request := range requests {
+		start := s.max + 1
+		s.max += request.Step
+		reserved[index] = biz.SequenceRange{Start: start, End: s.max}
+	}
+	return reserved, nil
 }
 
 func readyService(t *testing.T, key string) (*SequenceService, *biz.Allocator, *biz.RouteCache) {
@@ -70,6 +74,93 @@ func TestFetchNextSuccess(t *testing.T) {
 	)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), response.Id)
+	assert.Equal(t, uint32(1), response.Count)
+}
+
+func TestFetchNextReturnsContiguousBlock(t *testing.T) {
+	svc, _, _ := readyService(t, "orders")
+	count := uint32(3)
+	response, err := svc.FetchNext(
+		context.Background(),
+		&sequencev1.FetchNextRequest{Key: "orders", Count: &count},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), response.Id)
+	assert.Equal(t, uint32(3), response.Count)
+
+	next, err := svc.FetchNext(
+		context.Background(),
+		&sequencev1.FetchNextRequest{Key: "orders"},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), next.Id)
+	assert.Equal(t, uint32(1), next.Count)
+}
+
+func TestFetchNextBatchSuccess(t *testing.T) {
+	keys := sameSlotKeys(t, "orders", 3)
+	svc, _, _ := readyService(t, keys[0])
+	response, err := svc.FetchNextBatch(
+		context.Background(),
+		&sequencev1.FetchNextBatchRequest{Requests: []*sequencev1.FetchNextRequest{
+			{Key: keys[0]},
+			{Key: keys[1], Count: uint32Pointer(2)},
+			{Key: keys[2], Count: uint32Pointer(3)},
+		}},
+	)
+	require.NoError(t, err)
+	require.Len(t, response.Results, 3)
+	assert.Equal(t, keys[0], response.Results[0].Key)
+	assert.Equal(t, int64(1), response.Results[0].Id)
+	assert.Equal(t, uint32(1), response.Results[0].Count)
+	assert.Equal(t, keys[1], response.Results[1].Key)
+	assert.Equal(t, int64(11), response.Results[1].Id)
+	assert.Equal(t, uint32(2), response.Results[1].Count)
+	assert.Equal(t, keys[2], response.Results[2].Key)
+	assert.Equal(t, int64(21), response.Results[2].Id)
+	assert.Equal(t, uint32(3), response.Results[2].Count)
+}
+
+func TestFetchNextBatchRejectsInvalidRequests(t *testing.T) {
+	svc, _, _ := readyService(t, "orders")
+	keys := sameSlotKeys(t, "orders", 2)
+
+	tests := []struct {
+		name    string
+		request *sequencev1.FetchNextBatchRequest
+	}{
+		{name: "nil", request: nil},
+		{name: "empty", request: &sequencev1.FetchNextBatchRequest{}},
+		{name: "duplicate", request: &sequencev1.FetchNextBatchRequest{
+			Requests: []*sequencev1.FetchNextRequest{
+				{Key: keys[0]},
+				{Key: keys[0]},
+			},
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := svc.FetchNextBatch(context.Background(), test.request)
+			assert.True(t, xerror.IsCode(err, code.Code_INVALID_ARGUMENT))
+		})
+	}
+}
+
+func TestFetchNextBatchRejectsExcessiveTotalCount(t *testing.T) {
+	keys := sameSlotKeys(t, "orders", 11)
+	svc, _, _ := readyService(t, keys[0])
+	requests := make([]*sequencev1.FetchNextRequest, len(keys))
+	for index, key := range keys {
+		requests[index] = &sequencev1.FetchNextRequest{
+			Key:   key,
+			Count: uint32Pointer(biz.MaxIDsPerKey),
+		}
+	}
+	_, err := svc.FetchNextBatch(
+		context.Background(),
+		&sequencev1.FetchNextBatchRequest{Requests: requests},
+	)
+	assert.True(t, xerror.IsCode(err, code.Code_INVALID_ARGUMENT))
 }
 
 func TestFetchNextReturnsPaused(t *testing.T) {
@@ -168,3 +259,18 @@ func TestGetRouteResponses(t *testing.T) {
 	assert.Equal(t, int64(2), current.Route.Version)
 	assert.Equal(t, "node-a", current.Route.Nodes[0].NodeId)
 }
+
+func sameSlotKeys(t *testing.T, base string, count int) []string {
+	t.Helper()
+	slot := biz.SlotForKey(base)
+	keys := []string{base}
+	for candidate := 0; len(keys) < count; candidate++ {
+		key := base + "-" + strconv.Itoa(candidate)
+		if biz.SlotForKey(key) == slot {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func uint32Pointer(value uint32) *uint32 { return &value }

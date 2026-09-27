@@ -105,6 +105,18 @@ func setAllocatorDefaults(cfg *biz.AllocatorConfig, values map[string]any) {
 	if _, ok := values["prefetch_ratio"]; !ok {
 		cfg.PrefetchRatio = biz.DefaultPrefetchRatio
 	}
+	if _, ok := values["prefetch_latency_multiplier"]; !ok {
+		cfg.PrefetchLatencyMultiplier = biz.DefaultPrefetchLatencyMultiplier
+	}
+	if _, ok := values["prefetch_latency_window"]; !ok {
+		cfg.PrefetchLatencyWindow = biz.DefaultPrefetchLatencyWindow
+	}
+	if _, ok := values["prefetch_latency_min_samples"]; !ok {
+		cfg.PrefetchLatencyMinSamples = biz.DefaultPrefetchLatencyMinSamples
+	}
+	if _, ok := values["prefetch_rate_reset_after"]; !ok {
+		cfg.PrefetchRateResetAfter = biz.DefaultPrefetchRateResetAfter
+	}
 	if _, ok := values["step_increase_threshold"]; !ok {
 		cfg.StepIncreaseThreshold = biz.DefaultStepIncreaseThreshold
 	}
@@ -183,6 +195,29 @@ func (c Config) Validate() error {
 	}
 	if c.Allocator.PrefetchRatio <= 0 || c.Allocator.PrefetchRatio >= 1 {
 		return errors.New("sequence config: allocator.prefetch_ratio must be within (0,1)")
+	}
+	if c.Allocator.PrefetchLatencyMultiplier <= 1 ||
+		c.Allocator.PrefetchLatencyMultiplier > 10 {
+		return errors.New(
+			"sequence config: allocator.prefetch_latency_multiplier must be within (1,10]",
+		)
+	}
+	if c.Allocator.PrefetchLatencyWindow <= 0 {
+		return errors.New(
+			"sequence config: allocator.prefetch_latency_window must be positive",
+		)
+	}
+	if c.Allocator.PrefetchLatencyMinSamples <= 0 ||
+		c.Allocator.PrefetchLatencyMinSamples > biz.MaxReserveLatencySamples {
+		return fmt.Errorf(
+			"sequence config: allocator.prefetch_latency_min_samples must be within 1..%d",
+			biz.MaxReserveLatencySamples,
+		)
+	}
+	if c.Allocator.PrefetchRateResetAfter <= 0 {
+		return errors.New(
+			"sequence config: allocator.prefetch_rate_reset_after must be positive",
+		)
 	}
 	if c.Allocator.StepIncreaseThreshold <= 0 {
 		return errors.New(

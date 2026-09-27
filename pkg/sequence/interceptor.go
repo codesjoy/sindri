@@ -17,6 +17,7 @@ package sequence
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 
 	"github.com/codesjoy/pkg/basic/xerror"
@@ -40,52 +41,214 @@ func newUnaryClientInterceptor(router *Router) interceptor.UnaryClientIntercepto
 		req, reply any,
 		invoker interceptor.UnaryInvoker,
 	) error {
-		request, ok := req.(*sequencev1.FetchNextRequest)
-		if method != fetchNextFullMethod || !ok {
-			return invoker(ctx, method, req, reply)
-		}
-		if router == nil {
-			return errors.New("sequence interceptor: router is required")
-		}
-		if outgoing, exists := metadata.FromOutContext(ctx); exists &&
-			len(outgoing.Get(VersionMetaKey)) != 0 {
-			return ErrReservedRouteMetadata
-		}
-		if router.Version() == 0 {
-			if err := router.Refresh(ctx); err != nil {
-				return err
+		switch request := req.(type) {
+		case *sequencev1.FetchNextRequest:
+			if method == fetchNextFullMethod {
+				return interceptFetchNext(ctx, router, method, request, reply, invoker)
+			}
+		case *sequencev1.FetchNextBatchRequest:
+			if method == fetchNextBatchFullMethod {
+				return interceptFetchNextBatch(ctx, router, method, request, reply, invoker)
 			}
 		}
-
-		version := router.Version()
-		err := invokeFetchNext(ctx, method, request, reply, invoker, version)
-		if err == nil || !isRefreshableRouteError(err) {
-			return err
-		}
-		if err := router.refreshAfter(ctx, version); err != nil {
-			return err
-		}
-		if message, ok := reply.(proto.Message); ok {
-			proto.Reset(message)
-		}
-		return invokeFetchNext(ctx, method, request, reply, invoker, router.Version())
+		return invoker(ctx, method, req, reply)
 	}
 }
 
-func invokeFetchNext(
+func interceptFetchNext(
 	ctx context.Context,
+	router *Router,
 	method string,
 	request *sequencev1.FetchNextRequest,
 	reply any,
 	invoker interceptor.UnaryInvoker,
+) error {
+	if err := validateInterceptorRouter(ctx, router); err != nil {
+		return err
+	}
+	slot := SlotForKey(request.GetKey())
+	version := router.Version()
+	err := invokeRouted(ctx, method, request, reply, invoker, slot, version)
+	if err == nil {
+		return validateFetchNextCount(request, reply)
+	}
+	if !isRefreshableRouteError(err) {
+		return err
+	}
+	if err := router.refreshAfter(ctx, version); err != nil {
+		return err
+	}
+	resetReply(reply)
+	err = invokeRouted(
+		ctx,
+		method,
+		request,
+		reply,
+		invoker,
+		SlotForKey(request.GetKey()),
+		router.Version(),
+	)
+	if err != nil {
+		return err
+	}
+	return validateFetchNextCount(request, reply)
+}
+
+func interceptFetchNextBatch(
+	ctx context.Context,
+	router *Router,
+	method string,
+	request *sequencev1.FetchNextBatchRequest,
+	reply any,
+	invoker interceptor.UnaryInvoker,
+) error {
+	if err := validateInterceptorRouter(ctx, router); err != nil {
+		return err
+	}
+	slot, err := batchAnchorSlot(request, router)
+	if err != nil {
+		return err
+	}
+	version := router.Version()
+	err = invokeRouted(ctx, method, request, reply, invoker, slot, version)
+	if err == nil {
+		return validateFetchNextBatchCounts(request, reply)
+	}
+	if !isRefreshableRouteError(err) {
+		return err
+	}
+	if err := router.refreshAfter(ctx, version); err != nil {
+		return err
+	}
+	slot, err = batchAnchorSlot(request, router)
+	if err != nil {
+		return err
+	}
+	resetReply(reply)
+	err = invokeRouted(ctx, method, request, reply, invoker, slot, router.Version())
+	if err != nil {
+		return err
+	}
+	return validateFetchNextBatchCounts(request, reply)
+}
+
+func validateInterceptorRouter(ctx context.Context, router *Router) error {
+	if router == nil {
+		return errors.New("sequence interceptor: router is required")
+	}
+	if outgoing, exists := metadata.FromOutContext(ctx); exists &&
+		len(outgoing.Get(VersionMetaKey)) != 0 {
+		return ErrReservedRouteMetadata
+	}
+	if router.Version() == 0 {
+		if err := router.Refresh(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func batchAnchorSlot(
+	request *sequencev1.FetchNextBatchRequest,
+	router *Router,
+) (uint32, error) {
+	if request == nil || len(request.GetRequests()) == 0 {
+		return 0, errors.New("sequence interceptor: batch must not be empty")
+	}
+	owners := router.ownerTable()
+	first := request.GetRequests()[0]
+	if first == nil {
+		return 0, errors.New("sequence interceptor: batch request is nil")
+	}
+	anchor := SlotForKey(first.GetKey())
+	owner := owners[anchor]
+	if owner == "" {
+		return 0, fmt.Errorf("%w: slot %d has no owner", ErrBatchRouteChanged, anchor)
+	}
+	for _, item := range request.GetRequests()[1:] {
+		if item == nil {
+			return 0, errors.New("sequence interceptor: batch request is nil")
+		}
+		slot := SlotForKey(item.GetKey())
+		if owners[slot] != owner {
+			return 0, fmt.Errorf(
+				"%w: keys span owners %q and %q",
+				ErrBatchRouteChanged,
+				owner,
+				owners[slot],
+			)
+		}
+	}
+	return anchor, nil
+}
+
+func resetReply(reply any) {
+	if message, ok := reply.(proto.Message); ok {
+		proto.Reset(message)
+	}
+}
+
+func invokeRouted(
+	ctx context.Context,
+	method string,
+	request any,
+	reply any,
+	invoker interceptor.UnaryInvoker,
+	slot uint32,
 	version int64,
 ) error {
-	ctx = WithKey(ctx, request.GetKey())
+	ctx = WithSlot(ctx, slot)
 	ctx = metadata.WithOutContext(
 		ctx,
 		metadata.Pairs(VersionMetaKey, strconv.FormatInt(version, 10)),
 	)
 	return invoker(ctx, method, request, reply)
+}
+
+func validateFetchNextCount(
+	request *sequencev1.FetchNextRequest,
+	reply any,
+) error {
+	response, ok := reply.(*sequencev1.FetchNextResponse)
+	if !ok || response == nil {
+		return errors.New("sequence interceptor: invalid FetchNext response")
+	}
+	want := request.GetCount()
+	if want == 0 {
+		want = 1
+	}
+	if response.GetCount() != want &&
+		(want != 1 || response.GetCount() != 0) {
+		return ErrCountUnsupported
+	}
+	return nil
+}
+
+func validateFetchNextBatchCounts(
+	request *sequencev1.FetchNextBatchRequest,
+	reply any,
+) error {
+	response, ok := reply.(*sequencev1.FetchNextBatchResponse)
+	if !ok || response == nil {
+		return errors.New("sequence interceptor: invalid FetchNextBatch response")
+	}
+	if len(response.GetResults()) != len(request.GetRequests()) {
+		return errors.New("sequence interceptor: batch response count does not match request")
+	}
+	for index, item := range request.GetRequests() {
+		result := response.GetResults()[index]
+		if item == nil || result == nil || result.GetKey() != item.GetKey() {
+			return errors.New("sequence interceptor: batch response key does not match request")
+		}
+		want := item.GetCount()
+		if want == 0 {
+			want = 1
+		}
+		if result.GetCount() != want {
+			return ErrCountUnsupported
+		}
+	}
+	return nil
 }
 
 func isRefreshableRouteError(err error) bool {

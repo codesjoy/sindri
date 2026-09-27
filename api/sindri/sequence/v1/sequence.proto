@@ -1,4 +1,4 @@
-// Copyright 2026 Codesjoy
+  // Copyright 2026 Codesjoy
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,9 +24,12 @@ import "buf/validate/validate.proto";
 option go_package = "github.com/codesjoy/sindri/gen/go/sequence/v1;sequencev1";
 
 service SequenceGenerator {
-  // Allocates the next id for key. route_version is the snapshot used by the
-  // caller; an owner rejects stale or misrouted requests.
+  // Allocates a contiguous block of ids for key. route_version is the snapshot
+  // used by the caller; an owner rejects stale or misrouted requests.
   rpc FetchNext(FetchNextRequest) returns (FetchNextResponse);
+
+  // Allocates ids for a group of keys owned by the same sequence node.
+  rpc FetchNextBatch(FetchNextBatchRequest) returns (FetchNextBatchResponse);
 
   // Returns the active route snapshot. known_version allows a cheap
   // not-modified response for SDK refresh loops.
@@ -38,13 +41,36 @@ message FetchNextRequest {
     min_len: 1
     max_len: 256
   }];
+  // Omitted count defaults to one. Values are limited to keep range
+  // reservations and retry gaps bounded.
+  optional uint32 count = 2 [(buf.validate.field).uint32 = {
+    gte: 1
+    lte: 10000
+  }];
 }
 
 message FetchNextResponse {
-  // The allocated id. It is strictly increasing per key, but not necessarily
-  // contiguous across process or route ownership changes or idle state
-  // eviction.
+  // The first allocated id. The response covers [id, id + count - 1].
   int64 id = 1;
+  uint32 count = 2;
+}
+
+message FetchNextBatchRequest {
+  repeated FetchNextRequest requests = 1 [(buf.validate.field).repeated = {
+    min_items: 1
+    max_items: 1000
+  }];
+}
+
+message FetchNextBatchResponse {
+  // Results preserve the request order.
+  repeated FetchNextBatchResult results = 1;
+}
+
+message FetchNextBatchResult {
+  string key = 1;
+  int64 id = 2;
+  uint32 count = 3;
 }
 
 message GetRouteRequest {

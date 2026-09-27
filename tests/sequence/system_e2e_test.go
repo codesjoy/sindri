@@ -25,6 +25,7 @@ import (
 	"github.com/codesjoy/pkg/basic/xerror"
 	"github.com/codesjoy/sindri/gen/go/sequence/reason"
 	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
+	sequencepkg "github.com/codesjoy/sindri/pkg/sequence"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/genproto/googleapis/rpc/code"
@@ -143,6 +144,80 @@ func (s *SequenceSystemSuite) TestLiveRouteHandoff() {
 	after := s.waitForOwnership("node-b", key, versionB)
 	s.Greater(after, before)
 	s.GreaterOrEqual(s.watermark(key), after)
+}
+
+func (s *SequenceSystemSuite) TestBatchAllocationAcrossOwnersAndRouteHandoff() {
+	route := splitSlots()
+	version := s.publishRoute(route)
+	nodeAKeys := keysForOwner("node-a", route, 3)
+	nodeBKeys := keysForOwner("node-b", route, 3)
+	s.waitForOwnership("node-a", nodeAKeys[0], version)
+	s.waitForOwnership("node-b", nodeBKeys[0], version)
+
+	routed := s.routedClient()
+	batch, err := sequencepkg.NewBatchClient(s.router, routed)
+	s.Require().NoError(err)
+
+	requests := []sequencepkg.KeyRequest{
+		{Key: nodeAKeys[0]},
+		{Key: nodeBKeys[0], Count: 2},
+		{Key: nodeAKeys[1], Count: 3},
+		{Key: nodeBKeys[1]},
+		{Key: nodeAKeys[2], Count: 2},
+		{Key: nodeBKeys[2], Count: 4},
+	}
+	results, err := batch.FetchNext(context.Background(), requests)
+	s.Require().NoError(err)
+	s.Require().Len(results, len(requests))
+	last := make(map[string]int64, len(requests))
+	for index, result := range results {
+		s.Equal(requests[index].Key, result.Key, "results must preserve request order")
+		wantCount := requests[index].Count
+		if wantCount == 0 {
+			wantCount = 1
+		}
+		s.Equal(wantCount, result.Count, "omitted count must allocate a single ID")
+		s.Greater(result.FirstID, int64(0))
+		lastID := result.FirstID + int64(result.Count) - 1
+		s.GreaterOrEqual(s.watermark(result.Key), lastID)
+		last[result.Key] = lastID
+	}
+
+	_, err = batch.FetchNext(context.Background(), []sequencepkg.KeyRequest{
+		{Key: nodeAKeys[0]},
+		{Key: nodeAKeys[0]},
+	})
+	s.Require().Error(err, "duplicate keys must be rejected")
+
+	s.Require().NoError(s.proxies["grpc-b"].Disable())
+	partial, batchErr := batch.FetchNext(context.Background(), requests)
+	s.Require().NoError(s.proxies["grpc-b"].Enable())
+	s.Require().Error(batchErr, "an unreachable owner must fail the whole batch")
+	s.Nil(partial, "a failed batch must not return partial results")
+
+	versionB := s.publishRoute(allSlots("node-b"))
+	s.waitForOwnership("node-b", nodeBKeys[0], versionB)
+	var handoff []sequencepkg.KeyAllocation
+	s.Require().Eventually(func() bool {
+		callCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		allocations, fetchErr := batch.FetchNext(callCtx, requests)
+		if fetchErr != nil {
+			if !allowedTransient(fetchErr) {
+				s.T().Logf("unexpected batch handoff error: %v", fetchErr)
+			}
+			return false
+		}
+		handoff = allocations
+		return true
+	}, recoveryDeadline, 50*time.Millisecond)
+	s.Require().Len(handoff, len(requests))
+	for index, result := range handoff {
+		s.Equal(requests[index].Key, result.Key)
+		s.Greater(result.FirstID, last[result.Key],
+			"handoff must continue after the previous allocation")
+		s.GreaterOrEqual(s.watermark(result.Key), result.FirstID+int64(result.Count)-1)
+	}
 }
 
 func (s *SequenceSystemSuite) TestNodeCrashFailoverAndRecovery() {

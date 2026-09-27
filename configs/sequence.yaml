@@ -48,6 +48,10 @@ app:
       default_step: 100
       max_step: 10000
       prefetch_ratio: 0.5
+      prefetch_latency_multiplier: 4
+      prefetch_latency_window: 5m
+      prefetch_latency_min_samples: 100
+      prefetch_rate_reset_after: 1m
       step_increase_threshold: 15m
       step_decrease_threshold: 30m
       reserve_timeout: 1s

@@ -68,6 +68,26 @@ func TestLoadAppliesDefaultsForSupportedDrivers(t *testing.T) {
 			assert.Equal(t, biz.DefaultPrefetchRatio, cfg.Allocator.PrefetchRatio)
 			assert.Equal(
 				t,
+				biz.DefaultPrefetchLatencyMultiplier,
+				cfg.Allocator.PrefetchLatencyMultiplier,
+			)
+			assert.Equal(
+				t,
+				biz.DefaultPrefetchLatencyWindow,
+				cfg.Allocator.PrefetchLatencyWindow,
+			)
+			assert.Equal(
+				t,
+				biz.DefaultPrefetchLatencyMinSamples,
+				cfg.Allocator.PrefetchLatencyMinSamples,
+			)
+			assert.Equal(
+				t,
+				biz.DefaultPrefetchRateResetAfter,
+				cfg.Allocator.PrefetchRateResetAfter,
+			)
+			assert.Equal(
+				t,
 				biz.DefaultStepIncreaseThreshold,
 				cfg.Allocator.StepIncreaseThreshold,
 			)
@@ -216,6 +236,44 @@ func TestLoadRejectsAllocatorAndSchedulingBoundaries(t *testing.T) {
 			name: "full prefetch ratio",
 			values: map[string]any{
 				"allocator": map[string]any{"prefetch_ratio": 1.0},
+			},
+		},
+		{
+			name: "low latency multiplier",
+			values: map[string]any{
+				"allocator": map[string]any{"prefetch_latency_multiplier": 1},
+			},
+		},
+		{
+			name: "high latency multiplier",
+			values: map[string]any{
+				"allocator": map[string]any{"prefetch_latency_multiplier": 10.1},
+			},
+		},
+		{
+			name: "zero latency window",
+			values: map[string]any{
+				"allocator": map[string]any{"prefetch_latency_window": "0s"},
+			},
+		},
+		{
+			name: "zero latency samples",
+			values: map[string]any{
+				"allocator": map[string]any{"prefetch_latency_min_samples": 0},
+			},
+		},
+		{
+			name: "too many latency samples",
+			values: map[string]any{
+				"allocator": map[string]any{
+					"prefetch_latency_min_samples": biz.MaxReserveLatencySamples + 1,
+				},
+			},
+		},
+		{
+			name: "zero rate reset",
+			values: map[string]any{
+				"allocator": map[string]any{"prefetch_rate_reset_after": "0s"},
 			},
 		},
 		{
