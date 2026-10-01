@@ -484,31 +484,21 @@ func (k *keyState) recordReturned(id int64) {
 // FetchNext returns the next ID for a locally owned key.
 func (obj *Allocator) FetchNext(ctx context.Context, key string) (int64, error) {
 	started := obj.now()
+	slotID := SlotForKey(key)
 
-	obj.slotsMu.RLock()
-	defer obj.slotsMu.RUnlock()
-	if obj.Paused() {
-		return 0, xerror.NewWithReason(
-			reason.Reason_SEQUENCE_ALLOCATOR_PAUSED,
-			"allocator is already paused",
-			nil,
-		)
-	}
-
-	slot, ok := obj.slots[SlotForKey(key)]
-	if !ok {
-		return 0, xerror.NewWithReason(reason.Reason_SEQUENCE_SLOT_NOT_OWNER, "slot not found", nil)
-	}
-	if !slot.enter() {
-		return 0, xerror.NewWithReason(
-			reason.Reason_SEQUENCE_SLOT_NOT_OWNER,
-			"slot is draining",
-			nil,
-		)
+	// The read lock covers only the pause check, the slot lookup and entering the
+	// gate; the rest of the request -- authorisation, range reservation and the
+	// storage round trips it may need -- runs after it is released. The held
+	// slot pointer is safe to use because enter() has registered this allocation
+	// as in flight, so a drain that drops the slot from the map still has to wait
+	// for this request to leave before it may release the authority.
+	slot, err := obj.enterSlot(slotID)
+	if err != nil {
+		return 0, err
 	}
 	defer slot.leave()
-	if err := obj.authorizeLocked(
-		[]uint32{SlotForKey(key)},
+	if err := obj.authorize(
+		[]uint32{slotID},
 		[]*allocationSlot{slot},
 	); err != nil {
 		return 0, err
@@ -605,39 +595,42 @@ func (obj *Allocator) FetchNextBatch(
 	}
 	started := obj.now()
 
+	states := make([]*keyState, len(normalized))
+	slotOf := make([]*allocationSlot, len(normalized))
+	entered := make([]*allocationSlot, 0, len(normalized))
+	slots := make([]uint32, 0, len(normalized))
+
+	// The read lock covers the pause check, the slot lookups and opening every
+	// involved gate. It is released before any allocation runs, so the storage
+	// I/O a batch may need cannot block a reconciliation that needs the write
+	// lock. Keeping each slot pointer is safe: its gate is open, so a drain that
+	// drops the slot from the map must wait for this batch to leave before it
+	// releases the authority.
 	obj.slotsMu.RLock()
-	defer obj.slotsMu.RUnlock()
 	if obj.Paused() {
+		obj.slotsMu.RUnlock()
 		return nil, xerror.NewWithReason(
 			reason.Reason_SEQUENCE_ALLOCATOR_PAUSED,
 			"allocator is already paused",
 			nil,
 		)
 	}
-
-	states := make([]*keyState, len(normalized))
-	missing := 0
-	entered := make([]*allocationSlot, 0, len(normalized))
-	slots := make([]uint32, 0, len(normalized))
 	for index, request := range normalized {
 		slotID := SlotForKey(request.Key)
 		slot, ok := obj.slots[slotID]
 		if !ok {
+			obj.slotsMu.RUnlock()
 			return nil, xerror.NewWithReason(
 				reason.Reason_SEQUENCE_SLOT_NOT_OWNER,
 				"slot not found",
 				nil,
 			)
 		}
+		slotOf[index] = slot
 		if !slices.Contains(entered, slot) {
 			entered = append(entered, slot)
 			slots = append(slots, slotID)
 		}
-		state, ok := slot.Load(request.Key)
-		if !ok {
-			missing++
-		}
-		states[index] = state
 	}
 	// Every involved slot is opened before any allocation runs and closed on
 	// return, so a concurrent drain either sees this batch or rejects it.
@@ -646,6 +639,7 @@ func (obj *Allocator) FetchNextBatch(
 			for _, opened := range entered[:index] {
 				opened.leave()
 			}
+			obj.slotsMu.RUnlock()
 			return nil, xerror.NewWithReason(
 				reason.Reason_SEQUENCE_SLOT_NOT_OWNER,
 				"slot is draining",
@@ -653,13 +647,23 @@ func (obj *Allocator) FetchNextBatch(
 			)
 		}
 	}
+	obj.slotsMu.RUnlock()
 	defer func() {
 		for _, slot := range entered {
 			slot.leave()
 		}
 	}()
-	if err := obj.authorizeLocked(slots, entered); err != nil {
+	if err := obj.authorize(slots, entered); err != nil {
 		return nil, err
+	}
+	missing := 0
+	for index, request := range normalized {
+		state, ok := slotOf[index].Load(request.Key)
+		if !ok {
+			missing++
+			continue
+		}
+		states[index] = state
 	}
 	if missing > 0 && obj.memoryHighWatermarkReached() {
 		obj.admissionRejected.Add(1)
@@ -674,8 +678,7 @@ func (obj *Allocator) FetchNextBatch(
 		if states[index] != nil {
 			continue
 		}
-		slot := obj.slots[SlotForKey(request.Key)]
-		state, err := obj.loadOrCreateState(request.Key, slot)
+		state, err := obj.loadOrCreateState(request.Key, slotOf[index])
 		if err != nil {
 			return nil, err
 		}
@@ -702,7 +705,7 @@ func (obj *Allocator) FetchNextBatch(
 		// The epoch is read inside the gate, which a drain cannot close until
 		// this batch leaves, so it is the generation this block was fenced by
 		// rather than whatever the slot has moved on to.
-		allocation.SlotEpoch = obj.slots[SlotForKey(request.Key)].epoch.Load()
+		allocation.SlotEpoch = slotOf[index].epoch.Load()
 		results[index] = allocation
 	}
 	for index, request := range normalized {

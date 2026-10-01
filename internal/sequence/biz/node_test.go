@@ -73,12 +73,15 @@ type placementFake struct {
 	reads    int
 }
 
-func (f *placementFake) OwnershipView(context.Context) ([]Ownership, error) {
+func (f *placementFake) OwnershipSegments(
+	_ context.Context,
+	quietWindow time.Duration,
+) ([]OwnershipSegment, error) {
 	f.reads++
 	if f.viewErr != nil {
 		return nil, f.viewErr
 	}
-	return f.view, nil
+	return OwnershipSegmentsFromView(f.view, quietWindow)
 }
 
 func (f *placementFake) LiveNodes(
@@ -209,8 +212,8 @@ func ownershipViewWithNodeA(slot uint32) []Ownership {
 
 func testFleet() []NodeInfo {
 	return []NodeInfo{
-		{ID: "node-a", InstanceID: "instance-new", State: NodeActive},
-		{ID: "node-b", InstanceID: "instance-b", State: NodeActive},
+		{ID: "node-a", InstanceID: "instance-new"},
+		{ID: "node-b", InstanceID: "instance-b"},
 	}
 }
 

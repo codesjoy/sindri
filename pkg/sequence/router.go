@@ -294,6 +294,13 @@ func compileRoute(snapshot *sequencev1.RouteSnapshot) (*compiledRoute, error) {
 	compiled := &compiledRoute{
 		snapshot: proto.Clone(snapshot).(*sequencev1.RouteSnapshot),
 	}
+	hasSegments := len(compiled.snapshot.GetSegments()) > 0
+	if hasSegments {
+		if err := compileSegments(compiled, compiled.snapshot.GetSegments()); err != nil {
+			return nil, err
+		}
+	}
+
 	nodeIDs := make(map[string]struct{}, len(compiled.snapshot.GetNodes()))
 	assigned := make([]bool, SlotCount)
 	assignedCount := 0
@@ -322,11 +329,27 @@ func compileRoute(snapshot *sequencev1.RouteSnapshot) (*compiledRoute, error) {
 				)
 			}
 			assigned[slotIndex] = true
-			compiled.owners[slotIndex] = node.GetNodeId()
+			if hasSegments {
+				// Segments are the authoritative owner view. The node lists
+				// remain a projection, so they may be partial, but they may
+				// never claim a slot for a different node or claim an unowned
+				// slot for themselves.
+				if compiled.owners[slotIndex] != node.GetNodeId() {
+					return nil, fmt.Errorf(
+						"%w: slot %d is owned by %q but node %q lists it",
+						ErrInvalidRoute,
+						slot,
+						compiled.owners[slotIndex],
+						node.GetNodeId(),
+					)
+				}
+			} else {
+				compiled.owners[slotIndex] = node.GetNodeId()
+			}
 			assignedCount++
 		}
 	}
-	if assignedCount != SlotCount {
+	if !hasSegments && assignedCount != SlotCount {
 		return nil, fmt.Errorf(
 			"%w: assigned %d of %d slots",
 			ErrInvalidRoute,
@@ -335,9 +358,6 @@ func compileRoute(snapshot *sequencev1.RouteSnapshot) (*compiledRoute, error) {
 		)
 	}
 	compiled.layoutVersion = snapshot.GetLayoutVersion()
-	if err := compileSegments(compiled, snapshot.GetSegments()); err != nil {
-		return nil, err
-	}
 	return compiled, nil
 }
 
@@ -374,8 +394,26 @@ func compileSegments(compiled *compiledRoute, segments []*sequencev1.RouteSegmen
 				next,
 			)
 		}
+		if segment.GetOwnerNodeId() == "" && segment.GetOwnerInstanceId() != "" {
+			return fmt.Errorf(
+				"%w: route segment [%d,%d] names an instance but no owner",
+				ErrInvalidRoute,
+				start,
+				end,
+			)
+		}
+		if segment.GetOwnerNodeId() != "" && segment.GetOwnerInstanceId() == "" {
+			return fmt.Errorf(
+				"%w: route segment [%d,%d] names owner %q without an instance",
+				ErrInvalidRoute,
+				start,
+				end,
+				segment.GetOwnerNodeId(),
+			)
+		}
 		epoch := segment.GetSlotEpoch()
 		for slot := start; slot <= end; slot++ {
+			compiled.owners[slot] = segment.GetOwnerNodeId()
 			compiled.epochs[slot] = epoch
 		}
 		next = end + 1

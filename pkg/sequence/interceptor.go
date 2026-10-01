@@ -166,11 +166,9 @@ func batchAnchorSlot(
 	if owner == "" {
 		return 0, fmt.Errorf("%w: slot %d has no owner", ErrBatchRouteChanged, anchor)
 	}
-	// A batch is sent to one owner under one anchor, so every key must share the
-	// anchor's owner *and* its epoch: a run of slots can change epoch without
-	// changing owner, and the server would otherwise validate the whole batch
-	// against the epoch of the first key (section A.6).
-	anchorEpoch, hasEpoch := router.EpochOf(anchor)
+	// A batch is sent to one owner under one anchor. The caller's anchor epoch is
+	// only a hint: ownership can change per slot without changing the node owner,
+	// and the server fences every key against its own slot gate.
 	for _, item := range request.GetRequests()[1:] {
 		if item == nil {
 			return 0, errors.New("sequence interceptor: batch request is nil")
@@ -182,14 +180,6 @@ func batchAnchorSlot(
 				ErrBatchRouteChanged,
 				owner,
 				owners[slot],
-			)
-		}
-		if epoch, ok := router.EpochOf(slot); hasEpoch && (!ok || epoch != anchorEpoch) {
-			return 0, fmt.Errorf(
-				"%w: keys span epochs %d and %d",
-				ErrBatchRouteChanged,
-				anchorEpoch,
-				epoch,
 			)
 		}
 	}

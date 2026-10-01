@@ -119,10 +119,12 @@ func publishSeededRoute(t *testing.T, db *gorm.DB) int64 {
 	publisher := biz.NewPublisher(
 		biz.ControlPlaneConfig{
 			LayoutVersion:     testLayoutVersion,
+			RouteRetention:    64,
 			CoordinatorLease:  time.Minute,
 			ReconcileInterval: time.Second,
 			PassTimeout:       30 * time.Second,
 		},
+		processQuietWindow,
 		testPublisherInstanceID,
 		placement,
 		placement,

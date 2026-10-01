@@ -16,6 +16,7 @@ package data
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -32,7 +33,7 @@ import (
 // coordinator predicates -- are spelled per dialect in the code under test and
 // are covered by the PostgreSQL and MySQL contract tests.
 
-func openPlacementTestDB(t *testing.T) *gormio.DB {
+func openPlacementTestDB(t testing.TB) *gormio.DB {
 	t.Helper()
 	db, err := gormio.Open(
 		sqlite.Open("file:sequence-placement-"+t.Name()+"?mode=memory&cache=shared"),
@@ -70,21 +71,19 @@ func expireCoordinator(t *testing.T, db *gormio.DB) {
 	).Error)
 }
 
-// fullPlacementView builds the complete ownership view a materialised route has
-// to cover: the encoder refuses a snapshot that does not describe the whole
-// space.
-func fullPlacementView(nodeID, instanceID string, epoch uint64) []biz.Ownership {
-	view := make([]biz.Ownership, int(biz.SlotCount))
-	for slot := range view {
-		view[slot] = biz.Ownership{
-			SlotID:          uint32(slot),
-			State:           biz.SlotOwned,
-			OwnerNodeID:     nodeID,
-			OwnerInstanceID: instanceID,
-			Epoch:           epoch,
-		}
-	}
-	return view
+// fullPlacementSegments builds the complete compact ownership view a
+// materialised route has to cover: the encoder refuses a snapshot that does not
+// describe the whole space.
+func fullPlacementSegments(nodeID, instanceID string, epoch uint64) []biz.OwnershipSegment {
+	return []biz.OwnershipSegment{{
+		StartSlot:       0,
+		EndSlot:         biz.SlotCount - 1,
+		OwnerNodeID:     nodeID,
+		OwnerInstanceID: instanceID,
+		Epoch:           epoch,
+		State:           biz.SlotOwned,
+		GrantAgeKnown:   true,
+	}}
 }
 
 // TestAcquireCoordinatorReportsTheTenureItHolds pins the credential every
@@ -140,11 +139,12 @@ func TestMaterialiseRouteIsRefusedUnderALostTenure(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, held.Held)
 
-	revision, err := data.MaterialiseRoute(
-		ctx, fullPlacementView("node-a", "instance-a", held.Epoch), 1, held,
+	published, err := data.MaterialiseRoute(
+		ctx, fullPlacementSegments("node-a", "instance-a", held.Epoch), 1, 64, held,
 	)
 	require.NoError(t, err)
-	assert.EqualValues(t, 1, revision)
+	assert.EqualValues(t, 1, published.Revision)
+	assert.Positive(t, published.PayloadBytes)
 
 	expireCoordinator(t, data.db)
 	takeover, err := data.AcquireCoordinator(ctx, "instance-b", time.Minute)
@@ -152,7 +152,7 @@ func TestMaterialiseRouteIsRefusedUnderALostTenure(t *testing.T) {
 	require.True(t, takeover.Held)
 
 	_, err = data.MaterialiseRoute(
-		ctx, fullPlacementView("node-b", "instance-b", takeover.Epoch), 1, held,
+		ctx, fullPlacementSegments("node-b", "instance-b", takeover.Epoch), 1, 64, held,
 	)
 	assert.ErrorIs(t, err, biz.ErrCoordinatorLost)
 
@@ -185,15 +185,200 @@ func TestMaterialiseRouteIsRefusedForAStaleEpoch(t *testing.T) {
 	require.Equal(t, stale.Epoch+2, current.Epoch)
 
 	_, err = data.MaterialiseRoute(
-		ctx, fullPlacementView("node-a", "instance-a", stale.Epoch), 1, stale,
+		ctx, fullPlacementSegments("node-a", "instance-a", stale.Epoch), 1, 64, stale,
 	)
 	assert.ErrorIs(t, err, biz.ErrCoordinatorLost)
 
-	revision, err := data.MaterialiseRoute(
-		ctx, fullPlacementView("node-a", "instance-a", current.Epoch), 1, current,
+	published, err := data.MaterialiseRoute(
+		ctx, fullPlacementSegments("node-a", "instance-a", current.Epoch), 1, 64, current,
 	)
 	require.NoError(t, err)
-	assert.EqualValues(t, 1, revision, "the tenure in force still publishes")
+	assert.EqualValues(t, 1, published.Revision, "the tenure in force still publishes")
+}
+
+// openOwnershipSegmentTestDB builds the authority table the compact reader
+// aggregates over. The rows are seeded by each test.
+func openOwnershipSegmentTestDB(t testing.TB) *gormio.DB {
+	t.Helper()
+	db := openPlacementTestDB(t)
+	require.NoError(t, db.Exec(
+		"CREATE TABLE slot_ownership ("+
+			"slot_id integer PRIMARY KEY, owner_node_id text, owner_instance_id text, "+
+			"epoch integer NOT NULL DEFAULT 0, granted_at datetime, state text NOT NULL, "+
+			"updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+	).Error)
+	return db
+}
+
+// TestOwnershipSegmentsAggregatesRunsAndClassifiesTheQuietWindow pins the
+// compact read: consecutive slots sharing an owner story collapse into one run,
+// and a run whose grant has aged past the reader's window is split off and
+// marked, because the planner decides the two halves differently.
+func TestOwnershipSegmentsAggregatesRunsAndClassifiesTheQuietWindow(t *testing.T) {
+	data := NewPlacementData(openOwnershipSegmentTestDB(t))
+	now := time.Now().UTC()
+	seed := func(
+		slot uint32,
+		node, instance any,
+		epoch int64,
+		granted any,
+		state string,
+	) {
+		t.Helper()
+		require.NoError(t, data.db.Exec(
+			"INSERT INTO slot_ownership "+
+				"(slot_id, owner_node_id, owner_instance_id, epoch, granted_at, state) "+
+				"VALUES (?, ?, ?, ?, ?, ?)",
+			slot, node, instance, epoch, granted, state,
+		).Error)
+	}
+	// Slots 0..3 are one fresh run; slot 4 shares the owner story but its grant
+	// is old enough to be its own overdue run; slots 5..9 are unowned.
+	for slot := uint32(0); slot < 4; slot++ {
+		seed(slot, "node-a", "instance-a", 7, now, "OWNED")
+	}
+	seed(4, "node-a", "instance-a", 7, now.Add(-time.Minute), "OWNED")
+	for slot := uint32(5); slot < 10; slot++ {
+		seed(slot, nil, nil, 0, nil, "UNOWNED")
+	}
+	// The rest of the space is unowned; the view has to cover every slot for the
+	// reader to accept it.
+	require.NoError(t, data.db.Exec(
+		"WITH RECURSIVE cnt(x) AS ("+
+			"SELECT 10 UNION ALL SELECT x + 1 FROM cnt WHERE x < ?"+
+			") INSERT INTO slot_ownership (slot_id, epoch, state) "+
+			"SELECT x, 0, 'UNOWNED' FROM cnt",
+		biz.SlotCount-1,
+	).Error)
+
+	segments, err := data.OwnershipSegments(context.Background(), 30*time.Second)
+	require.NoError(t, err)
+	require.Len(t, segments, 3)
+	assert.Equal(t, uint32(0), segments[0].StartSlot)
+	assert.Equal(t, uint32(3), segments[0].EndSlot)
+	assert.False(t, segments[0].QuietWindowOverdue)
+	assert.Equal(t, uint32(4), segments[1].StartSlot)
+	assert.True(t, segments[1].QuietWindowOverdue)
+	assert.Equal(t, "node-a", segments[1].OwnerNodeID)
+	assert.Equal(t, biz.SlotUnowned, segments[2].State)
+	assert.Equal(t, uint32(biz.SlotCount-1), segments[2].EndSlot)
+
+	// The same rows read with a longer window collapse into two runs: the split
+	// is a property of the window the reader is planning under, not of storage.
+	segments, err = data.OwnershipSegments(context.Background(), 5*time.Minute)
+	require.NoError(t, err)
+	require.Len(t, segments, 2)
+	assert.Equal(t, uint32(4), segments[0].EndSlot)
+}
+
+// TestOwnershipSegmentsRefusesAHoleInTheSpace pins the completeness rule on the
+// compact read: a short answer is refused rather than planned against, because
+// a hole is indistinguishable from a fleet that owns nothing.
+func TestOwnershipSegmentsRefusesAHoleInTheSpace(t *testing.T) {
+	data := NewPlacementData(openOwnershipSegmentTestDB(t))
+	require.NoError(t, data.db.Exec(
+		"INSERT INTO slot_ownership (slot_id, epoch, state) VALUES (0, 0, 'UNOWNED')",
+	).Error)
+	_, err := data.OwnershipSegments(context.Background(), time.Second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "covers")
+}
+
+// BenchmarkOwnershipSegmentsAtHundredNodeSteadyState pins the capacity shape the
+// compact read exists for: a 100-node fleet holding the space in even shares is
+// read back as one run per node (plus the remainder) rather than SlotCount rows.
+// The returned segment count is reported as a metric so a regression that
+// re-reads the table per slot shows up as rows/op, not just as latency.
+func BenchmarkOwnershipSegmentsAtHundredNodeSteadyState(b *testing.B) {
+	data := NewPlacementData(openOwnershipSegmentTestDB(b))
+	require.NoError(b, data.db.Exec(
+		"WITH RECURSIVE cnt(x) AS ("+
+			"SELECT 0 UNION ALL SELECT x + 1 FROM cnt WHERE x < ?"+
+			") INSERT INTO slot_ownership (slot_id, epoch, state) "+
+			"SELECT x, 0, 'UNOWNED' FROM cnt",
+		biz.SlotCount-1,
+	).Error)
+
+	const nodes = 100
+	perNode := uint32(biz.SlotCount / nodes)
+	now := time.Now().UTC()
+	for node := 0; node < nodes; node++ {
+		from := uint32(node) * perNode
+		to := from + perNode - 1
+		require.NoError(b, data.db.Exec(
+			"UPDATE slot_ownership SET owner_node_id = ?, owner_instance_id = ?, "+
+				"epoch = 1, granted_at = ?, state = 'OWNED' "+
+				"WHERE slot_id BETWEEN ? AND ?",
+			fmt.Sprintf("node-%03d", node),
+			fmt.Sprintf("instance-%03d", node),
+			now,
+			from,
+			to,
+		).Error)
+	}
+
+	segments := 0
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		view, err := data.OwnershipSegments(context.Background(), time.Minute)
+		if err != nil {
+			b.Fatal(err)
+		}
+		segments = len(view)
+		// One run per node, plus the unowned remainder of the even split.
+		if segments > nodes+1 {
+			b.Fatalf("compact read returned %d runs for %d nodes", segments, nodes)
+		}
+	}
+	b.ReportMetric(float64(segments), "segments/op")
+}
+
+// TestMaterialiseRouteKeepsTheRouteTableBounded pins the retention bound: every
+// publish -- including the ones that mint a revision -- prunes the rows older
+// than the newest retention revisions.
+func TestMaterialiseRouteKeepsTheRouteTableBounded(t *testing.T) {
+	data := NewPlacementData(openPlacementTestDB(t))
+	ctx := context.Background()
+	held, err := data.AcquireCoordinator(ctx, "instance-a", time.Minute)
+	require.NoError(t, err)
+	require.True(t, held.Held)
+
+	const retention = 3
+	for epoch := uint64(1); epoch <= 5; epoch++ {
+		published, publishErr := data.MaterialiseRoute(
+			ctx,
+			fullPlacementSegments("node-a", "instance-a", epoch),
+			1,
+			retention,
+			held,
+		)
+		require.NoError(t, publishErr)
+		assert.EqualValues(t, epoch, published.Revision)
+	}
+
+	var routes int64
+	require.NoError(t, data.db.Table("sequence_routes").Count(&routes).Error)
+	assert.EqualValues(t, retention, routes)
+
+	var oldest int64
+	require.NoError(t, data.db.Table("sequence_routes").
+		Select("MIN(version)").Scan(&oldest).Error)
+	assert.EqualValues(t, 5-retention+1, oldest, "the newest revisions are kept")
+
+	// A payload identical to the newest one returns that revision and still
+	// enforces the bound, so a fleet that never changes again cannot grow the
+	// table.
+	repeated, err := data.MaterialiseRoute(
+		ctx,
+		fullPlacementSegments("node-a", "instance-a", 5),
+		1,
+		retention,
+		held,
+	)
+	require.NoError(t, err)
+	assert.EqualValues(t, 5, repeated.Revision)
+	require.NoError(t, data.db.Table("sequence_routes").Count(&routes).Error)
+	assert.EqualValues(t, retention, routes)
 }
 
 // seedLivenessRow writes a liveness row with an explicit timestamp, which is how
@@ -227,7 +412,6 @@ func TestLiveNodesIsTheReadersWindowOverTheRenewalTimestamps(t *testing.T) {
 	assert.Equal(t, []string{"node-a", "node-b"},
 		[]string{live[0].ID, live[1].ID}, "the live set is ordered by node id")
 	assert.Equal(t, "instance-a", live[0].InstanceID)
-	assert.Equal(t, biz.NodeActive, live[0].State)
 
 	// A fleet nobody is renewing reports empty rather than falling back to the set
 	// it last saw: the reader holds no state of its own to fall back to.

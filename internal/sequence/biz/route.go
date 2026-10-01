@@ -209,59 +209,88 @@ type storedRouteSegment struct {
 	Epoch           uint64 `json:"epoch"`
 }
 
-// EncodeOwnershipView builds the stored snapshot payload from the authority view.
+// EncodeOwnershipView builds the stored snapshot payload from the per-slot
+// authority view.
+//
+// It is the bridge for callers that hold the diagnostic slot view; the
+// publisher encodes the compact segment view directly. The view is refused
+// unless it covers every slot exactly once, so a reader cannot publish a
+// directory with a hole in it.
+func EncodeOwnershipView(view []Ownership, layoutVersion int64) ([]byte, error) {
+	segments, err := ownershipSegmentsFromView(view, func(Ownership) bool { return false })
+	if err != nil {
+		return nil, err
+	}
+	return EncodeOwnershipSegments(segments, layoutVersion)
+}
+
+// EncodeOwnershipSegments builds the stored snapshot payload from the compact
+// authority view.
 //
 // Segments carry every slot exactly once, including the unowned ones, because a
 // caller needs a complete ownership picture to check a per-slot epoch. Node
 // lists contain only slots that are owned: an unowned slot is paused rather than
 // routed, and listing it under a node would claim an owner it does not have.
-func EncodeOwnershipView(view []Ownership, layoutVersion int64) ([]byte, error) {
-	if len(view) == 0 {
-		return nil, errors.New("sequence placement: ownership view is empty")
-	}
-	ordered := append([]Ownership(nil), view...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].SlotID < ordered[j].SlotID })
-	// A route that does not cover the space exactly once is refused here rather
-	// than published: every reader rejects it, so writing it would only replace a
-	// clear failure in the writer with an unreadable snapshot in the fleet.
-	if len(ordered) != SlotCount ||
-		ordered[0].SlotID != 0 ||
-		ordered[len(ordered)-1].SlotID != SlotCount-1 {
-		return nil, fmt.Errorf(
-			"sequence placement: ownership view covers %d of %d slots",
-			len(ordered),
-			SlotCount,
+//
+// The encoder re-canonicalises the runs before writing them: only a change of
+// owner story (node, instance, epoch) starts a new stored segment, while the
+// quiet-window classification that split the read into finer runs is dropped.
+// Without that, the payload would change every time a grant aged across the
+// window even though nothing a client observes had changed, and the publisher
+// would mint a revision for a directory identical to the one already stored.
+func EncodeOwnershipSegments(
+	segments []OwnershipSegment,
+	layoutVersion int64,
+) ([]byte, error) {
+	if layoutVersion <= 0 {
+		return nil, errors.New(
+			"sequence placement: layout_version must be positive",
 		)
 	}
-
+	if err := ValidateOwnershipSegments(segments); err != nil {
+		return nil, err
+	}
 	payload := routePayload{LayoutVersion: layoutVersion}
 	slotsByNode := make(map[string][]uint32)
 	order := make([]string, 0, 4)
-	for _, slot := range ordered {
-		last := len(payload.Segments) - 1
-		sameOwner := last >= 0 &&
-			payload.Segments[last].OwnerNodeID == slot.OwnerNodeID &&
-			payload.Segments[last].OwnerInstanceID == slot.OwnerInstanceID &&
-			payload.Segments[last].Epoch == slot.Epoch &&
-			payload.Segments[last].EndSlot+1 == slot.SlotID
-		if sameOwner {
-			payload.Segments[last].EndSlot = slot.SlotID
-		} else {
-			payload.Segments = append(payload.Segments, storedRouteSegment{
-				StartSlot:       slot.SlotID,
-				EndSlot:         slot.SlotID,
-				OwnerNodeID:     slot.OwnerNodeID,
-				OwnerInstanceID: slot.OwnerInstanceID,
-				Epoch:           slot.Epoch,
-			})
+	for _, segment := range segments {
+		stored := storedRouteSegment{
+			StartSlot:       segment.StartSlot,
+			EndSlot:         segment.EndSlot,
+			OwnerNodeID:     segment.OwnerNodeID,
+			OwnerInstanceID: segment.OwnerInstanceID,
+			Epoch:           segment.Epoch,
 		}
-		if slot.State != SlotOwned || slot.OwnerNodeID == "" {
+		if !segment.Owned() {
+			// An unowned run carries no authority: it is written without an
+			// owner or epoch so a reader pauses those slots rather than routing
+			// them to the empty node.
+			stored.OwnerNodeID = ""
+			stored.OwnerInstanceID = ""
+			stored.Epoch = 0
+		}
+		last := len(payload.Segments) - 1
+		if last >= 0 &&
+			payload.Segments[last].OwnerNodeID == stored.OwnerNodeID &&
+			payload.Segments[last].OwnerInstanceID == stored.OwnerInstanceID &&
+			payload.Segments[last].Epoch == stored.Epoch &&
+			payload.Segments[last].EndSlot+1 == stored.StartSlot {
+			payload.Segments[last].EndSlot = stored.EndSlot
+		} else {
+			payload.Segments = append(payload.Segments, stored)
+		}
+		if !segment.Owned() {
 			continue
 		}
-		if _, seen := slotsByNode[slot.OwnerNodeID]; !seen {
-			order = append(order, slot.OwnerNodeID)
+		if _, seen := slotsByNode[segment.OwnerNodeID]; !seen {
+			order = append(order, segment.OwnerNodeID)
 		}
-		slotsByNode[slot.OwnerNodeID] = append(slotsByNode[slot.OwnerNodeID], slot.SlotID)
+		for slot := segment.StartSlot; slot <= segment.EndSlot; slot++ {
+			slotsByNode[segment.OwnerNodeID] = append(
+				slotsByNode[segment.OwnerNodeID],
+				slot,
+			)
+		}
 	}
 	sort.Strings(order)
 	for _, nodeID := range order {
@@ -309,11 +338,13 @@ func SameRoutePayload(left, right []byte) bool {
 // DecodeRoute turns a stored payload into a route.
 //
 // One shape is accepted: a snapshot written from storage ownership. It carries a
-// positive layout_version and segments that cover every slot exactly once, and
-// the nodes must agree with the segments slot for slot. The ownership view is
-// what a caller needs to check a per-slot epoch, so it is validated rather than
-// trusted; nodes stay in the payload because that is the projection a router
-// uses.
+// positive layout_version and segments that cover every slot exactly once. The
+// node lists are a projection of the segments, not a second authority: they may
+// list only some of the owned slots, and they may omit an unowned slot entirely,
+// but a slot they do list must agree with the segment that owns it. The
+// ownership view is what a caller needs to check a per-slot epoch, so it is
+// validated rather than trusted; nodes stay in the payload because that is the
+// projection a router uses.
 //
 // A payload without segments is refused. Routes used to be published by hand
 // with only a node list, and such a snapshot says nothing about which epoch a
@@ -356,13 +387,27 @@ func DecodeRoute(version int64, payload []byte) (*Route, error) {
 	}
 	for _, segment := range segments {
 		for slot := segment.StartSlot; slot <= segment.EndSlot; slot++ {
-			if slotNode[slot] != segment.OwnerNodeID {
+			listed := slotNode[slot]
+			if listed == "" {
+				// The node projection is allowed to be partial; the segment is
+				// the authority, so an omitted slot says nothing.
+				continue
+			}
+			if segment.OwnerNodeID == "" {
+				return nil, fmt.Errorf(
+					"decode route version %d: node %q lists unowned slot %d",
+					version,
+					listed,
+					slot,
+				)
+			}
+			if listed != segment.OwnerNodeID {
 				return nil, fmt.Errorf(
 					"decode route version %d: slot %d is owned by %q but node %q lists it",
 					version,
 					slot,
 					segment.OwnerNodeID,
-					slotNode[slot],
+					listed,
 				)
 			}
 		}

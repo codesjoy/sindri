@@ -91,6 +91,7 @@ var dataPlaneSet = wire.NewSet(
 // held the role.
 var controlPlaneSet = wire.NewSet(
 	newInstanceID,
+	provideQuietWindow,
 	biz.NewPublisher,
 	task.NewPublisherTask,
 	wire.Bind(new(task.PublisherReconciler), new(*biz.Publisher)),
@@ -102,6 +103,15 @@ var bundleSet = wire.NewSet(newBusinessBundle)
 
 func provideLogger(rt yggdrasil.Runtime) *slog.Logger {
 	return rt.Logger()
+}
+
+// provideQuietWindow exposes W to the publisher's compact ownership read.
+//
+// The window belongs to the HA section, and the publisher classifies the runs
+// it reads with the same value the nodes claim under, so the two halves cannot
+// disagree about which grants are overdue.
+func provideQuietWindow(dataPlane biz.DataPlaneConfig) time.Duration {
+	return dataPlane.HA.QuietWindow
 }
 
 func provideAllocatorMeter(rt yggdrasil.Runtime) metric.Meter {

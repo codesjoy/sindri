@@ -269,10 +269,14 @@ func (s *SequenceService) waitForRouteVersion(ctx context.Context) error {
 		return xerror.New(code.Code_INVALID_ARGUMENT, "version not found")
 	}
 
-	if rv <= s.route.Version() {
+	if rv < s.route.Version() {
 		return xerror.NewWithReason(reason.Reason_SEQUENCE_ROUTE_EXPIRED, "", nil)
 	}
 
+	// A caller at the current published version may still arrive before this
+	// node's allocator has applied it. Treat that as a handoff barrier to wait
+	// for, not as an expired route: only a version older than the route cache is
+	// genuinely stale.
 	if err = s.allocator.WaitForVersion(ctx, rv); err != nil {
 		return err
 	}

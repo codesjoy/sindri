@@ -71,6 +71,78 @@ func TestDecodeRouteValidatesAndSortsSnapshot(t *testing.T) {
 	}
 }
 
+// TestDecodeRouteAcceptsAPartialNodeProjection pins the compatibility rule the
+// client compiler and the decoder share: the segments are the authority, so a
+// node list that omits owned slots -- or omits unowned slots entirely -- is
+// accepted as long as every slot it does list agrees with its segment.
+func TestDecodeRouteAcceptsAPartialNodeProjection(t *testing.T) {
+	payload := halvesPayload(t)
+	payload.Nodes = []storedRouteNode{{NodeID: "node-a", Slots: []uint32{0}}}
+
+	route, err := DecodeRoute(9, marshalPayload(t, payload))
+	require.NoError(t, err)
+	require.Len(t, route.Segments, 2)
+	assert.Equal(t, uint64(3), route.Segments[0].Epoch)
+	assert.Equal(t, "node-b", route.Segments[1].OwnerNodeID)
+}
+
+// TestDecodeRouteAcceptsAnUnownedSegment pins the pause path: a run nobody owns
+// is a legitimate directory entry, and it carries no authority for any node.
+func TestDecodeRouteAcceptsAnUnownedSegment(t *testing.T) {
+	payload := routePayload{
+		LayoutVersion: 1,
+		Segments: []storedRouteSegment{
+			{StartSlot: 0, EndSlot: SlotCount - 1},
+		},
+	}
+	route, err := DecodeRoute(4, marshalPayload(t, payload))
+	require.NoError(t, err)
+	require.Len(t, route.Segments, 1)
+	assert.Empty(t, route.Segments[0].OwnerNodeID)
+	assert.Empty(t, route.Segments[0].OwnerInstanceID)
+	assert.Empty(t, route.Nodes, "an unowned run is not a node's slot")
+}
+
+// TestEncodeOwnershipSegmentsDropsTheQuietWindowSplit covers the canonical form:
+// the read splits a run where its grant ages across the quiet window, but the
+// stored directory must not, or every pass over an unchanged fleet would mint a
+// revision.
+func TestEncodeOwnershipSegmentsDropsTheQuietWindowSplit(t *testing.T) {
+	segments := []OwnershipSegment{
+		{
+			StartSlot: 0, EndSlot: SlotCount/2 - 1,
+			OwnerNodeID: "node-a", OwnerInstanceID: "instance-a", Epoch: 1,
+			State: SlotOwned, GrantAgeKnown: true, QuietWindowOverdue: true,
+		},
+		{
+			StartSlot: SlotCount / 2, EndSlot: SlotCount - 1,
+			OwnerNodeID: "node-a", OwnerInstanceID: "instance-a", Epoch: 1,
+			State: SlotOwned, GrantAgeKnown: true,
+		},
+	}
+	payload, err := EncodeOwnershipSegments(segments, 1)
+	require.NoError(t, err)
+	route, err := DecodeRoute(2, payload)
+	require.NoError(t, err)
+	require.Len(t, route.Segments, 1, "the same owner story is one stored run")
+	assert.Equal(t, uint32(SlotCount-1), route.Segments[0].EndSlot)
+}
+
+// TestEncodeOwnershipViewRefusesAnIncompleteView is the writer's half of the
+// completeness rule: a view with a repeated slot never reaches storage.
+func TestEncodeOwnershipViewRefusesAnIncompleteView(t *testing.T) {
+	view := make([]Ownership, 0, SlotCount)
+	for slot := uint32(0); slot < SlotCount; slot++ {
+		view = append(view, Ownership{
+			SlotID: slot, State: SlotOwned,
+			OwnerNodeID: "node-a", OwnerInstanceID: "instance-a", Epoch: 1,
+		})
+	}
+	view[SlotCount-1].SlotID = 0
+	_, err := EncodeOwnershipView(view, 1)
+	require.Error(t, err)
+}
+
 func TestDecodeRouteRejectsInvalidSnapshots(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -91,14 +163,30 @@ func TestDecodeRouteRejectsInvalidSnapshots(t *testing.T) {
 			}),
 		},
 		{
-			name:    "missing slots",
+			// The node lists are a projection of the segments, not a second
+			// authority, so a listed slot that disagrees with its segment is the
+			// one thing that has to be refused.
+			name:    "node conflicts with segment",
+			version: 1,
+			payload: marshalPayload(t, routePayload{
+				LayoutVersion: 1,
+				Nodes:         []storedRouteNode{{NodeID: "node-b", Slots: []uint32{0}}},
+				Segments: []storedRouteSegment{{
+					StartSlot: 0, EndSlot: SlotCount - 1,
+					OwnerNodeID: "node-a", OwnerInstanceID: "instance-a", Epoch: 1,
+				}},
+			}),
+		},
+		{
+			// An unowned run is paused, not routed. A node list that claims it
+			// would hand the slot to a process that does not hold it.
+			name:    "node claims an unowned slot",
 			version: 1,
 			payload: marshalPayload(t, routePayload{
 				LayoutVersion: 1,
 				Nodes:         []storedRouteNode{{NodeID: "node-a", Slots: []uint32{0}}},
 				Segments: []storedRouteSegment{{
 					StartSlot: 0, EndSlot: SlotCount - 1,
-					OwnerNodeID: "node-a", OwnerInstanceID: "instance-a", Epoch: 1,
 				}},
 			}),
 		},

@@ -154,6 +154,10 @@ app:
     controlplane:
       # Identifies the slot layout a published snapshot was minted under.
       layout_version: 1
+      # How many of the newest directory revisions stay in sequence_routes.
+      # Each publish deletes the older ones in the same transaction, so the
+      # table is bounded no matter how long the fleet runs.
+      route_retention: 64
       # How long one replica keeps the publisher role. Only the holder writes
       # revisions, so two replicas cannot publish the same view twice.
       coordinator_lease: 10s

@@ -55,11 +55,12 @@ func initializeSequence(rt app.Runtime, cfg *conf.Config) (*app.BusinessBundle, 
 	nodeManager := biz.NewNodeManager(dataPlaneConfig, allocator, routeRepo, livenessRepo, placementData, routeCache, storageClockMonitor, logger)
 	ticker := task.NewTicker(taskConfig, nodeManager)
 	sequenceService := service.NewSequenceService(allocator, routeCache)
+	duration := provideQuietWindow(dataPlaneConfig)
 	string2, err := newInstanceID()
 	if err != nil {
 		return nil, err
 	}
-	publisher := biz.NewPublisher(controlPlaneConfig, string2, placementData, placementData, logger)
+	publisher := biz.NewPublisher(controlPlaneConfig, duration, string2, placementData, placementData, logger)
 	publisherTask := task.NewPublisherTask(publisher)
 	meter := provideAllocatorMeter(rt)
 	metricsMetrics, err := provideDataMetrics(mode, meter, allocator, runtimeMemorySampler, dataPlaneConfig, storageClockMonitor)
@@ -107,7 +108,8 @@ var dataPlaneSet = wire.NewSet(
 // fences the coordinator lease: two replicas sharing one would both believe they
 // held the role.
 var controlPlaneSet = wire.NewSet(
-	newInstanceID, biz.NewPublisher, task.NewPublisherTask, wire.Bind(new(task.PublisherReconciler), new(*biz.Publisher)), providePublisherMetrics,
+	newInstanceID,
+	provideQuietWindow, biz.NewPublisher, task.NewPublisherTask, wire.Bind(new(task.PublisherReconciler), new(*biz.Publisher)), providePublisherMetrics,
 )
 
 // bundleSet assembles what the startup mode selects.
@@ -115,6 +117,15 @@ var bundleSet = wire.NewSet(newBusinessBundle)
 
 func provideLogger(rt yggdrasil.Runtime) *slog.Logger {
 	return rt.Logger()
+}
+
+// provideQuietWindow exposes W to the publisher's compact ownership read.
+//
+// The window belongs to the HA section, and the publisher classifies the runs
+// it reads with the same value the nodes claim under, so the two halves cannot
+// disagree about which grants are overdue.
+func provideQuietWindow(dataPlane biz.DataPlaneConfig) time.Duration {
+	return dataPlane.HA.QuietWindow
 }
 
 func provideAllocatorMeter(rt yggdrasil.Runtime) metric.Meter {

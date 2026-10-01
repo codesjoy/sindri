@@ -264,39 +264,67 @@ func probeSequenceReadiness(url string) (int, readinessReport, error) {
 	return response.StatusCode, report, nil
 }
 
-// ownershipEventWatermark returns the newest outbox event the database has
-// already recorded, so an assertion about the release can be about the events
-// written after it rather than about rows an earlier test left in the table.
-func ownershipEventWatermark(t *testing.T, db *gorm.DB) int64 {
-	t.Helper()
-	var watermark int64
-	require.NoError(t, db.Raw(
-		"SELECT COALESCE(MAX(event_id), 0) FROM ownership_outbox",
-	).Scan(&watermark).Error)
-	return watermark
+// authorityGeneration is one instance/epoch pair and how many slots it held.
+// The pair is the fence: a release leaves it in place at the same epoch with the
+// state changed, and a re-claim by the same instance moves the epoch, so
+// watching the pair is what tells a released grant apart from a renewed one.
+type authorityGeneration struct {
+	InstanceID string
+	Epoch      uint64
+	Slots      int64
 }
 
-// requireReleaseEventsRecorded asserts that a stopping process revoked the
-// authority it held.
-//
-// The release hook drives the epoch-CAS release, and the outbox records one
-// RELEASE event per revoked grant. The event is the audit trail of the hook
-// rather than a promise about who owns the slot afterwards -- the last heartbeat
-// of a stopping process can claim slots again before the framework stops the
-// ticker -- so what a shutdown test can pin is that the hook ran and wrote,
-// which is what this checks above the watermark taken before the stop.
-func requireReleaseEventsRecorded(t *testing.T, db *gorm.DB, watermark int64) {
+// loadAuthorityGenerations records the authority an instance holds now, so a
+// shutdown assertion can be about the generation that was in force at the stop
+// rather than about rows an earlier test left in the table.
+func loadAuthorityGenerations(
+	t *testing.T,
+	db *gorm.DB,
+	instanceID string,
+) []authorityGeneration {
 	t.Helper()
+	var generations []authorityGeneration
+	require.NoError(t, db.Raw(
+		"SELECT owner_instance_id AS instance_id, epoch, COUNT(*) AS slots "+
+			"FROM slot_ownership WHERE owner_instance_id = ? AND state = 'OWNED' "+
+			"GROUP BY owner_instance_id, epoch ORDER BY epoch",
+		instanceID,
+	).Scan(&generations).Error)
+	return generations
+}
+
+// requireAuthorityVacated asserts that a stopping process no longer holds the
+// authority generations it held at the moment of the stop.
+//
+// The direct state is the assertion: the shutdown hook drives the epoch-CAS
+// release, and a released slot leaves that generation as UNOWNED. The last
+// heartbeat of a stopping process can claim the slots again before the
+// framework stops the ticker, which is why the check is that the observed
+// generation is gone -- a re-claim moves the epoch -- rather than that every
+// slot reads UNOWNED.
+func requireAuthorityVacated(
+	t *testing.T,
+	db *gorm.DB,
+	held []authorityGeneration,
+) {
+	t.Helper()
+	require.NotEmpty(t, held, "the process held no authority to release")
 	require.Eventually(t, func() bool {
-		count, err := queryCount(
-			db,
-			"SELECT COUNT(*) FROM ownership_outbox "+
-				"WHERE event_id > ? AND event_type = 'RELEASE'",
-			watermark,
-		)
-		return err == nil && count > 0
-	}, discoveryTestTimeout, 50*time.Millisecond,
-		"the departing process recorded no release of its authority")
+		for _, generation := range held {
+			count, err := queryCount(
+				db,
+				"SELECT COUNT(*) FROM slot_ownership "+
+					"WHERE owner_instance_id = ? AND epoch = ? AND state = 'OWNED'",
+				generation.InstanceID,
+				generation.Epoch,
+			)
+			if err != nil || count != 0 {
+				return false
+			}
+		}
+		return true
+	}, processQuietWindow+discoveryTestTimeout, 50*time.Millisecond,
+		"the departing process still holds the authority generation it had at shutdown")
 }
 
 // waitForNodeToLeaveLiveSet waits until the fleet stops counting nodeID as live.

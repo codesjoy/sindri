@@ -33,6 +33,12 @@ import (
 	"gorm.io/gorm"
 )
 
+// routeRetentionForTest is the directory bound these tests publish under. The
+// value only has to be positive here: retention is exercised where it is
+// decided, and the contract tests pin the publish protocol rather than the
+// deployment's configured horizon.
+const routeRetentionForTest = 64
+
 // TestCoordinatorElectionAdmitsOneWinnerAcrossDialects is the election's
 // single-publisher rule under real contention.
 //
@@ -123,11 +129,12 @@ func TestCoordinatorTenureIsAFencingTokenAcrossDialects(t *testing.T) {
 			assert.Equal(t, first.Epoch, renewed.Epoch, "a renewal is not a handover")
 
 			// Nothing published yet, and the tenure in force may publish.
-			revision, err := data.MaterialiseRoute(
-				ctx, fullView("node-a", "instance-a", first.Epoch), 1, renewed,
+			published, err := data.MaterialiseRoute(
+				ctx, fullSegments("node-a", "instance-a", first.Epoch), 1,
+				routeRetentionForTest, renewed,
 			)
 			require.NoError(t, err)
-			require.NotZero(t, revision)
+			require.NotZero(t, published.Revision)
 
 			// A live lease is not takeable, so the epoch does not move.
 			other, err := data.AcquireCoordinator(ctx, "instance-b", time.Minute)
@@ -145,12 +152,14 @@ func TestCoordinatorTenureIsAFencingTokenAcrossDialects(t *testing.T) {
 			// The old tenure is refused against the new one even though its writer
 			// never saw the takeover: the epoch is what fences it.
 			_, err = data.MaterialiseRoute(
-				ctx, fullView("node-b", "instance-b", taken.Epoch), 1, first,
+				ctx, fullSegments("node-b", "instance-b", taken.Epoch), 1,
+				routeRetentionForTest, first,
 			)
 			require.ErrorIs(t, err, biz.ErrCoordinatorLost)
 
 			_, err = data.MaterialiseRoute(
-				ctx, fullView("node-b", "instance-b", taken.Epoch), 1, taken,
+				ctx, fullSegments("node-b", "instance-b", taken.Epoch), 1,
+				routeRetentionForTest, taken,
 			)
 			require.NoError(t, err)
 		})
@@ -235,10 +244,12 @@ func TestPublisherPassPublishesTheDirectoryAcrossDialects(t *testing.T) {
 			publisher := biz.NewPublisher(
 				biz.ControlPlaneConfig{
 					LayoutVersion:     1,
+					RouteRetention:    routeRetentionForTest,
 					CoordinatorLease:  time.Minute,
 					ReconcileInterval: time.Minute,
 					PassTimeout:       30 * time.Second,
 				},
+				time.Minute,
 				"instance-a",
 				data,
 				data,
@@ -299,7 +310,7 @@ func TestLivenessLeasesExpireAcrossDialects(t *testing.T) {
 			require.Len(t, live, 1, "a renewal an hour old is outside a one-minute window")
 			assert.Equal(t, "node-a", live[0].ID)
 			assert.Equal(t, "instance-a", live[0].InstanceID)
-			assert.Equal(t, biz.NodeActive, live[0].State)
+			assert.WithinDuration(t, time.Now().UTC(), live[0].LastSeenAt, time.Minute)
 
 			// The same rows under a window that covers both. Nothing about the rows
 			// changed -- only the comparison -- which is what makes the expiry the
@@ -330,19 +341,19 @@ func winnerIndex(results []biz.CoordinatorLease) int {
 	return 0
 }
 
-// fullView is the complete ownership view a materialised route has to cover.
-func fullView(nodeID, instanceID string, epoch uint64) []biz.Ownership {
-	view := make([]biz.Ownership, int(biz.SlotCount))
-	for slot := range view {
-		view[slot] = biz.Ownership{
-			SlotID:          uint32(slot),
-			State:           biz.SlotOwned,
-			OwnerNodeID:     nodeID,
-			OwnerInstanceID: instanceID,
-			Epoch:           epoch,
-		}
-	}
-	return view
+// fullSegments is the complete ownership view a materialised route has to cover,
+// expressed the way the planner and publisher read it: one run covering every
+// slot.
+func fullSegments(nodeID, instanceID string, epoch uint64) []biz.OwnershipSegment {
+	return []biz.OwnershipSegment{{
+		StartSlot:       0,
+		EndSlot:         biz.SlotCount - 1,
+		OwnerNodeID:     nodeID,
+		OwnerInstanceID: instanceID,
+		Epoch:           epoch,
+		State:           biz.SlotOwned,
+		GrantAgeKnown:   true,
+	}}
 }
 
 // seedFleetOwnership stages the authority the pass is run against: node-a

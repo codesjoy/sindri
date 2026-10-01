@@ -70,6 +70,123 @@ func TestRouterCompilesTheOwnershipEpochView(t *testing.T) {
 	assert.Equal(t, "node-b", router.ownerTable()[100])
 }
 
+// TestRouterUsesSegmentsAsTheOwnerAuthority covers the compatibility case where
+// the node projection omits slots. Segments still cover the whole space, so the
+// router can route every slot and a partial nodes list must not be treated as a
+// corrupt snapshot.
+func TestRouterUsesSegmentsAsTheOwnerAuthority(t *testing.T) {
+	snapshot := &sequencev1.RouteSnapshot{
+		Version:       1,
+		LayoutVersion: 1,
+		Nodes: []*sequencev1.RouteNode{
+			{NodeId: "node-b", Slots: []uint32{100, SlotCount - 1}},
+		},
+		Segments: []*sequencev1.RouteSegment{
+			{
+				StartSlot:       0,
+				EndSlot:         99,
+				OwnerNodeId:     "node-a",
+				OwnerInstanceId: "instance-a",
+				SlotEpoch:       5,
+			},
+			{
+				StartSlot:       100,
+				EndSlot:         SlotCount - 1,
+				OwnerNodeId:     "node-b",
+				OwnerInstanceId: "instance-b",
+				SlotEpoch:       6,
+			},
+		},
+	}
+	router := newSegmentedTestRouter(t, snapshot)
+
+	assert.Equal(t, "node-a", router.ownerTable()[0])
+	epoch, ok := router.EpochOf(0)
+	require.True(t, ok)
+	assert.Equal(t, uint64(5), epoch)
+}
+
+// TestRouterAllowsUnownedSegmentsInTheNodeProjection pins the bootstrap case:
+// segments carry the complete ownership view, while nodes list only slots with a
+// live owner. An unowned segment is therefore not a hole in the routing table.
+func TestRouterAllowsUnownedSegmentsInTheNodeProjection(t *testing.T) {
+	snapshot := &sequencev1.RouteSnapshot{
+		Version:       1,
+		LayoutVersion: 1,
+		Segments: []*sequencev1.RouteSegment{
+			{StartSlot: 0, EndSlot: 99, SlotEpoch: 1},
+			{
+				StartSlot:       100,
+				EndSlot:         SlotCount - 1,
+				OwnerNodeId:     "node-b",
+				OwnerInstanceId: "instance-b",
+				SlotEpoch:       2,
+			},
+		},
+		Nodes: []*sequencev1.RouteNode{
+			{NodeId: "node-b", Slots: []uint32{100}},
+		},
+	}
+	router := newSegmentedTestRouter(t, snapshot)
+
+	assert.Empty(t, router.ownerTable()[0])
+	assert.Equal(t, "node-b", router.ownerTable()[100])
+	epoch, ok := router.EpochOf(0)
+	require.True(t, ok)
+	assert.Equal(t, uint64(1), epoch)
+}
+
+// TestRouterRejectsNodeProjectionConflicts keeps the projection useful without
+// letting it override the authoritative segments.
+func TestRouterRejectsNodeProjectionConflicts(t *testing.T) {
+	for name, node := range map[string]*sequencev1.RouteNode{
+		"different owner": {
+			NodeId: "node-b",
+			Slots:  []uint32{0},
+		},
+		"unowned slot": {
+			NodeId: "node-b",
+			Slots:  []uint32{0},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			snapshot := &sequencev1.RouteSnapshot{
+				Version:       1,
+				LayoutVersion: 1,
+				Segments: []*sequencev1.RouteSegment{
+					{
+						StartSlot:       0,
+						EndSlot:         99,
+						OwnerNodeId:     "node-a",
+						OwnerInstanceId: "instance-a",
+						SlotEpoch:       1,
+					},
+					{
+						StartSlot:       100,
+						EndSlot:         SlotCount - 1,
+						OwnerNodeId:     "node-b",
+						OwnerInstanceId: "instance-b",
+						SlotEpoch:       2,
+					},
+				},
+				Nodes: []*sequencev1.RouteNode{node},
+			}
+			if name == "unowned slot" {
+				snapshot.Segments[0].OwnerNodeId = ""
+				snapshot.Segments[0].OwnerInstanceId = ""
+			}
+			router, err := NewRouter(func(
+				context.Context,
+				int64,
+			) (*sequencev1.GetRouteResponse, error) {
+				return nil, errors.New("unused")
+			})
+			require.NoError(t, err)
+			require.ErrorIs(t, router.Update(snapshot), ErrInvalidRoute)
+		})
+	}
+}
+
 // TestRouterWithoutSegmentsHasNoEpochView pins the compatibility case: a snapshot
 // from before ownership was authoritative carries no epochs, so a caller sends
 // none and an owner compares none.

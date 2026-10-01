@@ -88,6 +88,14 @@ func NewMetrics(
 	reserveLatency := registrar.float64Histogram(
 		"sequence.allocator.reserve_latency", "s", "",
 	)
+	renewalBatchDuration := registrar.float64Histogram(
+		"sequence.dataplane.renewal_batch_duration_seconds", "s",
+		"duration of one grouped slot-lease renewal round trip",
+	)
+	renewalBatchSize := registrar.int64Histogram(
+		"sequence.dataplane.renewal_batch_size", "{slot}",
+		"slots covered by one grouped slot-lease renewal round trip",
+	)
 	if registrar.err != nil {
 		return nil, registrar.err
 	}
@@ -146,6 +154,12 @@ func NewMetrics(
 			reserveLatency.Record(context.Background(), duration.Seconds())
 		},
 	)
+	allocator.SetRenewalBatchObserver(
+		func(duration time.Duration, slots int) {
+			renewalBatchDuration.Record(context.Background(), duration.Seconds())
+			renewalBatchSize.Record(context.Background(), int64(slots))
+		},
+	)
 	return &Metrics{
 		registration:   registration,
 		haRegistration: haRegistration,
@@ -175,6 +189,7 @@ func (m *Metrics) Close() error {
 	}
 	if m.allocator != nil {
 		m.allocator.SetReserveLatencyObserver(nil)
+		m.allocator.SetRenewalBatchObserver(nil)
 	}
 	var closeErr error
 	for _, registration := range []metric.Registration{
@@ -232,6 +247,7 @@ func managedMemory(total, released uint64) uint64 {
 // directory revision it has published.
 type PublisherMetrics struct {
 	registration metric.Registration
+	publisher    *biz.Publisher
 }
 
 // NewPublisherMetrics registers the directory publisher's observable counters.
@@ -268,6 +284,23 @@ func NewPublisherMetrics(
 			"published, so the fleet's current revision is the maximum across "+
 			"replicas",
 	)
+	viewSegments := registrar.int64Gauge(
+		"sequence.control.ownership_view_segments", "{segment}",
+		"runs of slots in the most recent compact ownership read; at steady "+
+			"state this is O(live nodes), not O(slot count)",
+	)
+	payloadBytes := registrar.int64Gauge(
+		"sequence.control.route_payload_bytes", "By",
+		"encoded size of the most recent materialised route snapshot",
+	)
+	retentionDeleted := registrar.int64Counter(
+		"sequence.control.route_retention_deleted", "{revision}",
+		"route revisions pruned by the retention bound",
+	)
+	viewDuration := registrar.float64Histogram(
+		"sequence.control.ownership_view_duration_seconds", "s",
+		"duration of one compact ownership read",
+	)
 	if registrar.err != nil {
 		return nil, registrar.err
 	}
@@ -279,22 +312,39 @@ func NewPublisherMetrics(
 			observer.ObserveInt64(unownedSlots, stats.UnownedSlots)
 			observer.ObserveInt64(coordinatorLost, stats.CoordinatorLost)
 			observer.ObserveInt64(revision, stats.Revision)
+			observer.ObserveInt64(viewSegments, stats.OwnershipViewSegments)
+			observer.ObserveInt64(payloadBytes, stats.RoutePayloadBytes)
+			observer.ObserveInt64(retentionDeleted, stats.RetentionDeleted)
 			return nil
 		},
 		passes,
 		unownedSlots,
 		coordinatorLost,
 		revision,
+		viewSegments,
+		payloadBytes,
+		retentionDeleted,
 	)
 	if err != nil {
 		return nil, err
 	}
-	return &PublisherMetrics{registration: registration}, nil
+	publisher.SetObserver(biz.PublisherObserver{
+		OwnershipView: func(_ int, duration time.Duration) {
+			viewDuration.Record(context.Background(), duration.Seconds())
+		},
+	})
+	return &PublisherMetrics{registration: registration, publisher: publisher}, nil
 }
 
 // Close unregisters the publisher's callbacks.
 func (m *PublisherMetrics) Close() error {
-	if m == nil || m.registration == nil {
+	if m == nil {
+		return nil
+	}
+	if m.publisher != nil {
+		m.publisher.SetObserver(biz.PublisherObserver{})
+	}
+	if m.registration == nil {
 		return nil
 	}
 	return m.registration.Unregister()
@@ -382,6 +432,25 @@ func (r *instrumentRegistrar) float64Histogram(
 		options = append(options, metric.WithDescription(description))
 	}
 	instrument, err := r.meter.Float64Histogram(name, options...)
+	if err != nil {
+		r.err = err
+	}
+	return instrument
+}
+
+func (r *instrumentRegistrar) int64Histogram(
+	name string,
+	unit string,
+	description string,
+) metric.Int64Histogram {
+	if r.err != nil {
+		return nil
+	}
+	options := []metric.Int64HistogramOption{metric.WithUnit(unit)}
+	if description != "" {
+		options = append(options, metric.WithDescription(description))
+	}
+	instrument, err := r.meter.Int64Histogram(name, options...)
 	if err != nil {
 		r.err = err
 	}

@@ -30,9 +30,9 @@ docker compose -f deploy/docker/compose.yaml ps
 ```
 
 The migration container creates `sequence_ranges`, `sequence_routes`,
-`slot_ownership`, `ownership_outbox`, `sequence_route_state`,
-`sequence_node_liveness` and `sequence_coordinator` before Sequence starts, and
-pre-creates one `slot_ownership` row per routing slot. The local stack runs
+`slot_ownership`, `sequence_route_state`, `sequence_node_liveness` and
+`sequence_coordinator` before Sequence starts, and pre-creates one
+`slot_ownership` row per routing slot. The local stack runs
 Sequence as `mode: both`: the data plane claims and serves slots, and the
 publisher half materialises the first directory as soon as there is ownership to
 snapshot. Until a directory exists `GetRoute` returns
@@ -149,9 +149,13 @@ should look like this:
 }
 ```
 
-A snapshot that carries no segments is refused rather than followed: without an
-epoch per slot a node cannot check a stale owner, so the only safe answer is to
-keep the last valid directory and report it as unavailable.
+A snapshot that carries segments is the current shape: the segments are the
+authoritative owner view, the node lists are only a projection, and the router
+refuses a snapshot whose projection conflicts with them. A snapshot that
+carries no segments is a pre-authority directory from an older deployment: it
+is still followed when its node lists cover all 16,384 slots, but it carries no
+epochs, so a caller sends none and the owner answers without an epoch
+comparison.
 
 ## 5. Read the high-availability report
 
@@ -253,9 +257,11 @@ grpcurl -plaintext \
 
 A batch accepts at most 1000 keys, each key may request at most 10000 IDs, and
 one request may cover at most 100000 IDs. Duplicate keys, keys routed to
-different owners, and keys this node does not own are rejected. A failed batch
-returns no partial results, but IDs already consumed by that attempt can become
-gaps.
+different owners, and keys this node does not own are rejected. Keys on the same
+owner may be at different epochs: the batch is grouped by owner, the first key's
+epoch is only a routing hint, and the server fences every key against the gate
+of its own slot. A failed batch returns no partial results, but IDs already
+consumed by that attempt can become gaps.
 
 Applications that use multiple Sequence nodes should use the route-aware Go
 integration in `github.com/codesjoy/sindri/pkg/sequence`. It refreshes route
@@ -300,9 +306,11 @@ Placement bounds live under `app.sequence.dataplane.ha`: `node_ttl` (default
 `15s`) is how long a node's liveness row counts as current, and it must exceed
 `ticker.heartbeat_ticks * ticker.base_tick_interval` by a wide margin.
 `app.sequence.controlplane` configures the publisher: `layout_version` identifies
-the slot layout a snapshot is minted under, `coordinator_lease` is how long one
-replica keeps the publisher role, and `reconcile_interval` and `pass_timeout`
-bound the cadence and length of one publish pass.
+the slot layout a snapshot is minted under, `route_retention` (default `64`) is
+how many of the newest directory revisions stay in `sequence_routes`, and each
+publish prunes the older ones in the same transaction, `coordinator_lease` is
+how long one replica keeps the publisher role, and `reconcile_interval` and
+`pass_timeout` bound the cadence and length of one publish pass.
 
 `reserve_timeout` (default `1s`) bounds **one** storage statement — a range
 reservation, one lease renewal, or one claim or release batch — not a whole

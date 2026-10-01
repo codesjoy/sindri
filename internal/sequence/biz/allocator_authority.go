@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/codesjoy/pkg/basic/xerror"
@@ -277,17 +278,53 @@ func (obj *Allocator) hasAuthority() bool {
 	return obj.ownership != nil
 }
 
-// authorizeLocked fences the slots behind a request before any allocation
-// linearises. The caller must hold slotsMu for reading and pass the slots it
-// resolved under that lock; the lock is not taken again here, because a
-// recursive RLock deadlocks as soon as a writer queues between the two.
+// enterSlot resolves one slot under the read lock and opens its gate.
+//
+// It is the only part of the allocation path that has to run under slotsMu: the
+// pause check and the lookup need the map, and enter() must register the
+// allocation before the lock is released so a drain that removes the slot
+// cannot miss it. Everything after this returns runs outside the lock, which is
+// what keeps a slow storage call from blocking a reconciliation that needs the
+// write lock.
+func (obj *Allocator) enterSlot(slotID uint32) (*allocationSlot, error) {
+	obj.slotsMu.RLock()
+	defer obj.slotsMu.RUnlock()
+	if obj.Paused() {
+		return nil, xerror.NewWithReason(
+			reason.Reason_SEQUENCE_ALLOCATOR_PAUSED,
+			"allocator is already paused",
+			nil,
+		)
+	}
+	slot, ok := obj.slots[slotID]
+	if !ok {
+		return nil, xerror.NewWithReason(
+			reason.Reason_SEQUENCE_SLOT_NOT_OWNER,
+			"slot not found",
+			nil,
+		)
+	}
+	if !slot.enter() {
+		return nil, xerror.NewWithReason(
+			reason.Reason_SEQUENCE_SLOT_NOT_OWNER,
+			"slot is draining",
+			nil,
+		)
+	}
+	return slot, nil
+}
+
+// authorize fences the slots behind a request before any allocation linearises.
+// The caller passes the slots it resolved and entered; it does not hold slotsMu
+// while calling this, because the authority checks below include a clock read
+// and a re-read of the slot's deadline, neither of which needs the map.
 //
 // The fence is local, and nothing here touches storage: that is what keeps
 // steady-state allocation off the database. It is sound only because the
 // reservation itself carries the lease and the storage re-checks it against the
 // same clock that granted it, and because checkFastPathBound measures the one
 // interval this gate cannot see.
-func (obj *Allocator) authorizeLocked(slots []uint32, held []*allocationSlot) error {
+func (obj *Allocator) authorize(slots []uint32, held []*allocationSlot) error {
 	if !obj.hasAuthority() {
 		return nil
 	}
@@ -392,6 +429,23 @@ func (obj *Allocator) installEpoch(slot *allocationSlot, epoch uint64) {
 	slot.localDeadline.Store(now + int64(obj.ha.LeaseDeadline()))
 }
 
+// RenewalBatchObserver receives the duration and the number of slots of one
+// grouped renewal round trip.
+type RenewalBatchObserver func(duration time.Duration, slots int)
+
+// SetRenewalBatchObserver registers a low-cardinality observer for renewal
+// batches, replacing any previous one. A nil observer clears it.
+func (obj *Allocator) SetRenewalBatchObserver(observer RenewalBatchObserver) {
+	if obj == nil {
+		return
+	}
+	if observer == nil {
+		obj.renewalObserver.Store(nil)
+		return
+	}
+	obj.renewalObserver.Store(&observer)
+}
+
 // RenewLeases refreshes the storage grant of every slot this instance holds.
 //
 // It is driven by the node heartbeat rather than the logical tick, because the
@@ -455,11 +509,32 @@ func (obj *Allocator) RenewLeases() {
 	}()
 
 	authorities := make([]SlotAuthority, 0, len(pending))
+	// The renewal is grouped by the fence the authority CASes on. Everything
+	// this instance holds at the same epoch shares one predicate, so it can be
+	// renewed by one statement rather than one statement per slot; only a slot
+	// whose epoch moved needs a group of its own.
+	byEpoch := make(map[uint64][]uint32)
 	for _, item := range pending {
 		authorities = append(authorities, SlotAuthority{
 			SlotID:     item.slotID,
 			InstanceID: obj.instanceID,
 			Epoch:      item.epoch,
+		})
+		byEpoch[item.epoch] = append(byEpoch[item.epoch], item.slotID)
+	}
+	epochs := make([]uint64, 0, len(byEpoch))
+	for epoch := range byEpoch {
+		epochs = append(epochs, epoch)
+	}
+	sort.Slice(epochs, func(i, j int) bool { return epochs[i] < epochs[j] })
+	groups := make([]RenewGroup, 0, len(epochs))
+	for _, epoch := range epochs {
+		slots := byEpoch[epoch]
+		sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })
+		groups = append(groups, RenewGroup{
+			InstanceID: obj.instanceID,
+			Epoch:      epoch,
+			Slots:      slots,
 		})
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), obj.storeTimeout())
@@ -468,9 +543,14 @@ func (obj *Allocator) RenewLeases() {
 	// lease: only a row this instance still owns at this epoch is refreshed, so a
 	// renewal can never resurrect authority a takeover already replaced, and a
 	// grant that lapsed without a takeover stays recoverable.
+	renewStarted := time.Now()
 	renewed, err := obj.ownership.RenewSlots(ctx, RenewRequest{
-		Authorities: authorities,
+		Groups: groups,
 	})
+	renewDuration := time.Since(renewStarted)
+	if observer := obj.renewalObserver.Load(); observer != nil {
+		(*observer)(renewDuration, len(authorities))
+	}
 	if err != nil {
 		obj.renewalFailed.Add(int64(len(authorities)))
 		obj.logger.Warn(

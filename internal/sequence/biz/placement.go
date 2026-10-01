@@ -31,6 +31,7 @@ package biz
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sort"
 	"sync/atomic"
@@ -84,30 +85,201 @@ func (o Ownership) Holds(instanceID string, epoch uint64) bool {
 	return o.State == SlotOwned && o.OwnerInstanceID == instanceID && o.Epoch == epoch
 }
 
-// NodeState is whether a node should be holding slots.
-type NodeState string
+// OwnershipSegment is one contiguous run of slots that shares one authority.
+//
+// The authority table holds one row per slot, but every decision the planner
+// and the publisher make is about a run: slots are claimed and released in
+// whole assigned ranges, and consecutive slots with the same owner, instance,
+// epoch and grant age are decided identically. Reading the compact form keeps
+// the control-plane read proportional to the number of runs -- O(live nodes)
+// in a healthy fleet -- rather than to SlotCount.
+//
+// The quiet-window classification is part of the grouping key on purpose: a
+// run whose earlier slots have aged past W while its later ones have not is two
+// segments, because the planner decides them differently.
+type OwnershipSegment struct {
+	StartSlot uint32
+	EndSlot   uint32
+	// OwnerNodeID and OwnerInstanceID are empty exactly when the slots are
+	// unowned. An unowned run is paused rather than routed.
+	OwnerNodeID     string
+	OwnerInstanceID string
+	Epoch           uint64
+	State           SlotState
+	// GrantAgeKnown reports whether the reader saw a grant time for the run. A
+	// run that claims OWNED without one is refused by the planner rather than
+	// served on an age of zero.
+	GrantAgeKnown bool
+	// QuietWindowOverdue reports whether the run's grant had already aged past
+	// the reader's quiet window when the storage answered. It is only ever true
+	// for a run whose grant age is known.
+	QuietWindowOverdue bool
+}
 
-const (
-	// NodeActive means the node should hold and serve the slots it is assigned.
-	NodeActive NodeState = "ACTIVE"
-	// NodeLeaving means the node has been asked to give its slots up. It drains
-	// and releases them itself, so a mark in this table is an instruction to one
-	// node about its own authority, never a licence for another node to take it
-	// (decision D18).
-	NodeLeaving NodeState = "LEAVING"
-)
+// Slots returns how many slots the segment covers.
+func (s OwnershipSegment) Slots() uint32 {
+	if s.EndSlot < s.StartSlot {
+		return 0
+	}
+	return s.EndSlot - s.StartSlot + 1
+}
 
-// NodeInfo identifies a sequence service node and its placement state.
+// Owned reports whether the segment names a complete authority.
+func (s OwnershipSegment) Owned() bool {
+	return s.State == SlotOwned && s.OwnerNodeID != "" && s.OwnerInstanceID != ""
+}
+
+// ValidateOwnershipSegments checks that a compact ownership read is an ordered,
+// gap-free, non-overlapping cover of the whole slot space, and that every
+// segment names a consistent authority.
+//
+// It is the check both readers run before they act on a view. A partial view is
+// indistinguishable from a fleet that owns nothing, so a reader that skipped
+// this check could release every slot it serves on the strength of a short
+// read, or publish a directory with missing coverage.
+func ValidateOwnershipSegments(segments []OwnershipSegment) error {
+	if len(segments) == 0 {
+		return errors.New("sequence placement: ownership segment view is empty")
+	}
+	next := uint32(0)
+	for _, segment := range segments {
+		if segment.EndSlot >= SlotCount || segment.EndSlot < segment.StartSlot {
+			return fmt.Errorf(
+				"sequence placement: ownership segment [%d,%d] is out of range",
+				segment.StartSlot,
+				segment.EndSlot,
+			)
+		}
+		if segment.StartSlot != next {
+			return fmt.Errorf(
+				"sequence placement: ownership segment [%d,%d] does not continue "+
+					"the coverage at slot %d",
+				segment.StartSlot,
+				segment.EndSlot,
+				next,
+			)
+		}
+		switch segment.State {
+		case SlotOwned:
+			if segment.OwnerNodeID == "" || segment.OwnerInstanceID == "" {
+				return fmt.Errorf(
+					"sequence placement: ownership segment [%d,%d] is OWNED "+
+						"without a node and instance",
+					segment.StartSlot,
+					segment.EndSlot,
+				)
+			}
+		case SlotUnowned:
+			if segment.OwnerNodeID != "" || segment.OwnerInstanceID != "" {
+				return fmt.Errorf(
+					"sequence placement: ownership segment [%d,%d] is UNOWNED "+
+						"but names an owner",
+					segment.StartSlot,
+					segment.EndSlot,
+				)
+			}
+		default:
+			return fmt.Errorf(
+				"sequence placement: ownership segment [%d,%d] has unknown state %q",
+				segment.StartSlot,
+				segment.EndSlot,
+				segment.State,
+			)
+		}
+		if segment.QuietWindowOverdue && !segment.GrantAgeKnown {
+			return fmt.Errorf(
+				"sequence placement: ownership segment [%d,%d] is overdue "+
+					"without a grant time",
+				segment.StartSlot,
+				segment.EndSlot,
+			)
+		}
+		next = segment.EndSlot + 1
+	}
+	if next != SlotCount {
+		return fmt.Errorf(
+			"sequence placement: ownership segment view covers %d of %d slots",
+			next,
+			SlotCount,
+		)
+	}
+	return nil
+}
+
+// OwnershipSegmentsFromView compacts a per-slot authority view into the segment
+// form. It is the bridge for readers that hold the diagnostic slot view, and it
+// refuses a view that is not a complete cover rather than compacting a hole
+// into a wrong assignment.
+func OwnershipSegmentsFromView(
+	view []Ownership,
+	quietWindow time.Duration,
+) ([]OwnershipSegment, error) {
+	return ownershipSegmentsFromView(view, func(slot Ownership) bool {
+		return slot.State == SlotOwned && slot.GrantAgeKnown &&
+			slot.GrantedAgo >= quietWindow
+	})
+}
+
+// ownershipSegmentsFromView is the shared compaction. The classification is a
+// parameter so the publisher can compact a view without minting a quiet-window
+// judgement it does not make.
+func ownershipSegmentsFromView(
+	view []Ownership,
+	overdue func(Ownership) bool,
+) ([]OwnershipSegment, error) {
+	if len(view) != SlotCount {
+		return nil, fmt.Errorf(
+			"sequence placement: ownership view covers %d of %d slots",
+			len(view),
+			SlotCount,
+		)
+	}
+	ordered := append([]Ownership(nil), view...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].SlotID < ordered[j].SlotID })
+	segments := make([]OwnershipSegment, 0, 8)
+	for index, slot := range ordered {
+		if slot.SlotID != uint32(index) {
+			return nil, fmt.Errorf(
+				"sequence placement: ownership view is missing slot %d",
+				index,
+			)
+		}
+		isOverdue := slot.State == SlotOwned && overdue(slot)
+		last := len(segments) - 1
+		if last >= 0 && segments[last].EndSlot+1 == slot.SlotID &&
+			segments[last].State == slot.State &&
+			segments[last].OwnerNodeID == slot.OwnerNodeID &&
+			segments[last].OwnerInstanceID == slot.OwnerInstanceID &&
+			segments[last].Epoch == slot.Epoch &&
+			segments[last].GrantAgeKnown == (slot.GrantAgeKnown && slot.State == SlotOwned) &&
+			segments[last].QuietWindowOverdue == isOverdue {
+			segments[last].EndSlot = slot.SlotID
+			continue
+		}
+		segments = append(segments, OwnershipSegment{
+			StartSlot:          slot.SlotID,
+			EndSlot:            slot.SlotID,
+			OwnerNodeID:        slot.OwnerNodeID,
+			OwnerInstanceID:    slot.OwnerInstanceID,
+			Epoch:              slot.Epoch,
+			State:              slot.State,
+			GrantAgeKnown:      slot.GrantAgeKnown && slot.State == SlotOwned,
+			QuietWindowOverdue: isOverdue,
+		})
+	}
+	if err := ValidateOwnershipSegments(segments); err != nil {
+		return nil, err
+	}
+	return segments, nil
+}
+
+// NodeInfo identifies a sequence service node that is currently live.
 type NodeInfo struct {
 	ID string
 	// InstanceID is the process that most recently registered this node id. The
 	// node id names a position in the fleet; the instance is what fences
 	// ownership, so a restarted node takes its id over from its predecessor.
 	InstanceID string
-	// State is ACTIVE or LEAVING. A node reads its own row, so marking it LEAVING
-	// is how a rollout asks it to hand its slots back without an orchestrator
-	// having to talk to the process (D14).
-	State NodeState
 	// LastSeenAt is when the node last registered. It is a wall-clock instant,
 	// not a tick, so liveness does not depend on a configured tick interval.
 	LastSeenAt time.Time
@@ -153,15 +325,67 @@ type SlotTarget struct {
 // The last two rules are what make a node failure recoverable by another node.
 // Neither preempts anything: it is the claim, inside the authority store, that
 // waits for the window before it may succeed.
-//
-// A node marked LEAVING is not in the live set: it has been asked to hand its
-// slots back, so its own next pass releases them rather than treating them as
-// still serving.
 func PlanTargets(
 	view []Ownership,
 	liveNodes []NodeInfo,
 	quietWindow time.Duration,
 ) []SlotTarget {
+	facts := make([]slotFacts, 0, len(view))
+	for _, slot := range view {
+		facts = append(facts, slotFacts{
+			slotID:          slot.SlotID,
+			state:           slot.State,
+			ownerNodeID:     slot.OwnerNodeID,
+			ownerInstanceID: slot.OwnerInstanceID,
+			grantAgeKnown:   slot.GrantAgeKnown,
+			overdue: slot.State == SlotOwned && slot.GrantAgeKnown &&
+				slot.GrantedAgo >= quietWindow,
+		})
+	}
+	return planTargets(facts, liveNodes)
+}
+
+// PlanTargetsFromSegments computes the intent for every slot from the compact
+// ownership view and the live node set.
+//
+// The segment view is refused unless it is a complete, ordered, gap-free cover
+// of the space, which is what makes it safe to expand into per-slot intent: a
+// short read must not look like a fleet that owns nothing.
+func PlanTargetsFromSegments(
+	segments []OwnershipSegment,
+	liveNodes []NodeInfo,
+) ([]SlotTarget, error) {
+	if err := ValidateOwnershipSegments(segments); err != nil {
+		return nil, err
+	}
+	facts := make([]slotFacts, 0, SlotCount)
+	for _, segment := range segments {
+		for slot := segment.StartSlot; slot <= segment.EndSlot; slot++ {
+			facts = append(facts, slotFacts{
+				slotID:          slot,
+				state:           segment.State,
+				ownerNodeID:     segment.OwnerNodeID,
+				ownerInstanceID: segment.OwnerInstanceID,
+				grantAgeKnown:   segment.GrantAgeKnown,
+				overdue:         segment.QuietWindowOverdue,
+			})
+		}
+	}
+	return planTargets(facts, liveNodes), nil
+}
+
+// slotFacts is the per-slot form of both ownership reads. The planner takes one
+// shape so the slot view and the segment view cannot disagree about a rule.
+type slotFacts struct {
+	slotID          uint32
+	state           SlotState
+	ownerNodeID     string
+	ownerInstanceID string
+	grantAgeKnown   bool
+	overdue         bool
+}
+
+func planTargets(facts []slotFacts, liveNodes []NodeInfo) []SlotTarget {
 	liveIDs := ActiveNodeIDs(liveNodes)
 	live := make(map[string]struct{}, len(liveIDs))
 	// instanceOf is the process the fleet last heard from for a node id. It is
@@ -169,9 +393,6 @@ func PlanTargets(
 	// a new process", and the two get opposite answers for an owned slot.
 	instanceOf := make(map[string]string, len(liveIDs))
 	for _, node := range liveNodes {
-		if node.State == NodeLeaving {
-			continue
-		}
 		live[node.ID] = struct{}{}
 		instanceOf[node.ID] = node.InstanceID
 	}
@@ -193,36 +414,37 @@ func PlanTargets(
 		return filtered
 	}
 
-	targets := make([]SlotTarget, 0, len(view))
-	for _, slot := range view {
-		target := SlotTarget{SlotID: slot.SlotID}
-		_, ownerLive := live[slot.OwnerNodeID]
+	targets := make([]SlotTarget, 0, len(facts))
+	for _, slot := range facts {
+		target := SlotTarget{SlotID: slot.slotID}
+		_, ownerLive := live[slot.ownerNodeID]
 		switch {
-		case slot.State != SlotOwned:
+		case slot.state != SlotOwned:
 			// Nobody holds it: bootstrap, or it just came back from a release.
-			target.TargetNodeID = SplitOwner(slot.SlotID, liveIDs)
+			target.TargetNodeID = SplitOwner(slot.slotID, liveIDs)
 		case !ownerLive:
 			// The owner is not in the live set at all. Its row still names it,
 			// because a crash cannot release, so the slot has to be assigned to
 			// somebody who can claim it once the quiet window allows.
-			target.TargetNodeID = SplitOwner(slot.SlotID, otherNodes(slot.OwnerNodeID))
-		case instanceChanged(slot, instanceOf[slot.OwnerNodeID]):
+			target.TargetNodeID = SplitOwner(slot.slotID, otherNodes(slot.ownerNodeID))
+		case slot.ownerNodeID != "" && slot.ownerInstanceID != "" &&
+			instanceChanged(slot.ownerInstanceID, instanceOf[slot.ownerNodeID]):
 			// The node id is back under a new process. The slot belongs to the
 			// position, not to the process that vacated it, so the restart
 			// reclaims it: the claim it makes waits out the quiet window, which
 			// is exactly the safety margin the old process's lease needs.
-			target.TargetNodeID = slot.OwnerNodeID
-		case slot.GrantAgeKnown && slot.GrantedAgo >= quietWindow:
+			target.TargetNodeID = slot.ownerNodeID
+		case slot.overdue:
 			// The owner is the same live process but its grant has lapsed past
 			// the window, so it already refuses to serve the slot. Assign it
 			// away rather than back to a node whose own read stops inside the
 			// window.
-			target.TargetNodeID = SplitOwner(slot.SlotID, otherNodes(slot.OwnerNodeID))
+			target.TargetNodeID = SplitOwner(slot.slotID, otherNodes(slot.ownerNodeID))
 		default:
 			// A live owner with a fresh grant keeps its slots. An unknown age is
 			// treated as fresh: without one there is nothing that says the grant
 			// lapsed, and moving a serving slot on a guess is what D18 forbids.
-			target.TargetNodeID = slot.OwnerNodeID
+			target.TargetNodeID = slot.ownerNodeID
 		}
 		targets = append(targets, target)
 	}
@@ -233,10 +455,10 @@ func PlanTargets(
 // one holding the slot. Only a difference between two known instance ids counts:
 // a row that does not carry one says nothing, and treating it as a change would
 // move a slot on a missing field rather than on evidence.
-func instanceChanged(slot Ownership, liveInstanceID string) bool {
-	return slot.OwnerInstanceID != "" &&
+func instanceChanged(ownerInstanceID, liveInstanceID string) bool {
+	return ownerInstanceID != "" &&
 		liveInstanceID != "" &&
-		liveInstanceID != slot.OwnerInstanceID
+		liveInstanceID != ownerInstanceID
 }
 
 // SplitOwner returns the node the deterministic even split assigns to a slot.
@@ -268,14 +490,11 @@ func SplitOwner(slot uint32, liveNodes []string) string {
 	return ""
 }
 
-// ActiveNodeIDs returns the live nodes that are willing to serve, ordered by node
-// id, which is the order PlanTargets divides the space in.
+// ActiveNodeIDs returns the live nodes ordered by node id, which is the order
+// PlanTargets divides the space in.
 func ActiveNodeIDs(nodes []NodeInfo) []string {
 	ids := make([]string, 0, len(nodes))
 	for _, node := range nodes {
-		if node.State == NodeLeaving {
-			continue
-		}
 		ids = append(ids, node.ID)
 	}
 	sort.Strings(ids)
@@ -290,30 +509,55 @@ func ActiveNodeIDs(nodes []NodeInfo) []string {
 // decides which node id a slot belongs to. A node that read a stale or partial
 // answer must not replan against it, so both reads are all-or-nothing.
 type PlacementRepo interface {
-	// OwnershipView returns every slot's authority, ordered by slot id, with
-	// each grant's age measured by the storage clock.
-	OwnershipView(ctx context.Context) ([]Ownership, error)
+	// OwnershipSegments returns the compact authority view: contiguous runs of
+	// slots sharing one owner, instance, epoch, state and quiet-window
+	// classification, ordered by slot, with each run's grant age measured by the
+	// storage clock. The view must cover every slot exactly once; a caller
+	// refuses anything else rather than planning against a partial read.
+	OwnershipSegments(
+		ctx context.Context,
+		quietWindow time.Duration,
+	) ([]OwnershipSegment, error)
 	// LiveNodes returns the nodes whose liveness lease has not lapsed within
 	// ttl, judged by the storage clock rather than by this process's clock.
 	LiveNodes(ctx context.Context, ttl time.Duration) ([]NodeInfo, error)
 }
 
+// PublishResult reports what one published revision cost.
+type PublishResult struct {
+	// Revision is the directory revision the view was published under. A view
+	// identical to the one already stored returns the existing revision.
+	Revision int64
+	// PayloadBytes is the encoded size of the snapshot, whether it was written
+	// or matched against the one already stored.
+	PayloadBytes int
+	// RetentionDeleted counts route rows pruned by the retention bound in this
+	// publish. Rows removed by an earlier publish are not counted again.
+	RetentionDeleted int64
+}
+
 // PublisherRepo is the storage side of the directory publisher.
 type PublisherRepo interface {
-	// OwnershipView returns every slot's authority, ordered by slot id. The
-	// publisher snapshots exactly this view, which is why it reads no liveness
-	// and computes no targets: which node holds a slot is already the answer.
-	OwnershipView(ctx context.Context) ([]Ownership, error)
+	// OwnershipSegments returns the compact authority view, ordered by slot.
+	// The publisher snapshots exactly this view, which is why it reads no
+	// liveness and computes no targets: which node holds a slot is already the
+	// answer.
+	OwnershipSegments(
+		ctx context.Context,
+		quietWindow time.Duration,
+	) ([]OwnershipSegment, error)
 	// MaterialiseRoute publishes a snapshot of the ownership view under a
-	// revision it advances atomically, and returns that revision. The write is
-	// refused with ErrCoordinatorLost when the presented tenure is no longer
-	// the one in force.
+	// revision it advances atomically. The write is refused with
+	// ErrCoordinatorLost when the presented tenure is no longer the one in
+	// force. retention is how many of the newest revisions stay in the table;
+	// older rows are deleted in the same transaction.
 	MaterialiseRoute(
 		ctx context.Context,
-		view []Ownership,
+		segments []OwnershipSegment,
 		layoutVersion int64,
+		retention int,
 		lease CoordinatorLease,
-	) (int64, error)
+	) (PublishResult, error)
 }
 
 // CoordinatorRepo is the lease that keeps a single publisher in the fleet.
@@ -338,11 +582,9 @@ type CoordinatorRepo interface {
 // replica took the role over is refused rather than published on behalf of a role
 // nobody holds any more.
 //
-// Both reconcilers -- the node-side fallback and the placement control plane --
-// write through this one definition. Two copies of a credential check this
-// load-bearing is a second place for it to be wrong, and the whole point of the
-// check is that the two writers of one directory revision agree on when a tenure
-// has ended.
+// The publisher is the only writer of a directory revision, and it writes
+// through this one definition: a second copy of a credential check this
+// load-bearing is a second place for it to be wrong.
 type CoordinatorLease struct {
 	// Held is whether the caller held the role at all. A replica that did not take
 	// it must not plan, so this is what a non-holder checks before doing anything.
@@ -397,9 +639,23 @@ type ClaimOutcome struct {
 	NotBefore time.Time
 }
 
+// RenewGroup is the set of slots that share one authority fence: the same
+// instance holds them at the same epoch.
+type RenewGroup struct {
+	InstanceID string
+	Epoch      uint64
+	Slots      []uint32
+}
+
 // RenewRequest refreshes the grant time of slots the caller already holds.
+//
+// Authorities are grouped by instance and epoch rather than listed per slot.
+// The epoch-CAS predicate is what makes a renewal safe, and it is the same
+// predicate for every slot in a group, so one statement can carry the whole
+// group: a node renewing every slot it owns costs one round trip per ownership
+// generation instead of one per slot.
 type RenewRequest struct {
-	Authorities []SlotAuthority
+	Groups []RenewGroup
 }
 
 // ReservationAuthority is the authority a node presents when reserving ranges.
@@ -418,8 +674,7 @@ type ReservationAuthority struct {
 	Lease      time.Duration
 }
 
-// OwnershipRepo is the storage authority for slot ownership. Every mutation
-// commits the ownership change and its outbox event in one transaction.
+// OwnershipRepo is the storage authority for slot ownership.
 type OwnershipRepo interface {
 	// LoadOwnership reads the authority rows for the given slots, with each row's
 	// grant age measured by the storage clock. It must always be served by the
@@ -517,12 +772,11 @@ type LivenessRepo interface {
 // decides no placement and needs no view of liveness.
 type Publisher struct {
 	cfg         ControlPlaneConfig
+	quietWindow time.Duration
 	instanceID  string
 	placement   PublisherRepo
 	coordinator CoordinatorRepo
 	logger      *slog.Logger
-
-	trigger chan struct{}
 
 	// passes counts completed passes, which is what tells an operator the loop
 	// is alive without reading the placement tables.
@@ -544,6 +798,42 @@ type Publisher struct {
 	// is whether it returned an error. They are what Readiness answers from.
 	lastPass       atomic.Int64
 	lastPassFailed atomic.Bool
+	// viewSegments, routePayloadBytes and retentionDeleted are the
+	// low-cardinality facts about the most recent successful pass. They are kept
+	// here so the metrics layer reads the same values the unit tests do.
+	viewSegments      atomic.Int64
+	routePayloadBytes atomic.Int64
+	retentionDeleted  atomic.Int64
+	// observer receives the two pass facts that are only meaningful as events:
+	// how long the ownership read took, and how large the published payload was.
+	// It is nil unless a deployment asked for metrics.
+	observer atomic.Pointer[PublisherObserver]
+}
+
+// PublisherObserver receives low-cardinality facts about a publisher pass.
+//
+// The callbacks run on the pass goroutine, so they must not block; the metrics
+// layer records into OpenTelemetry instruments, which is a bounded operation.
+type PublisherObserver struct {
+	// OwnershipView reports the compact read's segment count and duration.
+	OwnershipView func(segments int, duration time.Duration)
+	// Published reports the encoded snapshot size and how many old revisions
+	// the retention bound pruned in this publish.
+	Published func(payloadBytes int, retentionDeleted int64)
+}
+
+// SetObserver installs the publisher's pass observer, replacing any previous
+// one. Passing a zero observer clears it, which is what the metrics layer does
+// when it is torn down.
+func (p *Publisher) SetObserver(observer PublisherObserver) {
+	if p == nil {
+		return
+	}
+	if observer.OwnershipView == nil && observer.Published == nil {
+		p.observer.Store(nil)
+		return
+	}
+	p.observer.Store(&observer)
 }
 
 // publisherReadinessStallFactor is how many pass intervals may pass with no
@@ -574,11 +864,20 @@ type PublisherStats struct {
 	CoordinatorLost int64
 	// Revision is the newest directory revision this replica published.
 	Revision int64
+	// OwnershipViewSegments is the segment count of the most recent successful
+	// compact ownership read.
+	OwnershipViewSegments int64
+	// RoutePayloadBytes is the encoded size of the most recent published (or
+	// matched) snapshot.
+	RoutePayloadBytes int64
+	// RetentionDeleted counts route revisions pruned by the retention bound.
+	RetentionDeleted int64
 }
 
 // NewPublisher constructs the publisher.
 func NewPublisher(
 	cfg ControlPlaneConfig,
+	quietWindow time.Duration,
 	instanceID string,
 	placementRepo PublisherRepo,
 	coordinator CoordinatorRepo,
@@ -589,23 +888,11 @@ func NewPublisher(
 	}
 	return &Publisher{
 		cfg:         cfg,
+		quietWindow: quietWindow,
 		instanceID:  instanceID,
 		placement:   placementRepo,
 		coordinator: coordinator,
 		logger:      logger,
-		trigger:     make(chan struct{}, 1),
-	}
-}
-
-// Trigger asks for a pass as soon as the loop can run one.
-//
-// It never blocks: a trigger that arrives while one is already pending carries
-// no extra information, because a pass reads the current state rather than the
-// event that prompted it.
-func (p *Publisher) Trigger() {
-	select {
-	case p.trigger <- struct{}{}:
-	default:
 	}
 }
 
@@ -617,7 +904,6 @@ func (p *Publisher) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-p.trigger:
 		case <-passTimer.C:
 		}
 		if err := p.Pass(ctx); err != nil && ctx.Err() == nil {
@@ -667,16 +953,42 @@ func (p *Publisher) Pass(ctx context.Context) (passErr error) {
 
 // publish snapshots the authority and records the revision it produced.
 func (p *Publisher) publish(ctx context.Context, lease CoordinatorLease) error {
-	view, err := p.placement.OwnershipView(ctx)
+	viewStarted := time.Now()
+	segments, err := p.placement.OwnershipSegments(ctx, p.quietWindow)
 	if err != nil {
 		return err
 	}
-	revision, err := p.placement.MaterialiseRoute(ctx, view, p.cfg.LayoutVersion, lease)
+	viewDuration := time.Since(viewStarted)
+	// A short or overlapping read is refused rather than published: a snapshot
+	// that misses slots would tell the fleet those slots are unowned, and every
+	// reader rejects it anyway, so writing it would only turn a clear failure
+	// into an unreadable directory.
+	if err := ValidateOwnershipSegments(segments); err != nil {
+		return err
+	}
+	result, err := p.placement.MaterialiseRoute(
+		ctx,
+		segments,
+		p.cfg.LayoutVersion,
+		p.cfg.RouteRetention,
+		lease,
+	)
 	if err != nil {
 		return err
 	}
-	p.unownedSlots.Store(countUnowned(view))
-	p.revision.Store(revision)
+	p.unownedSlots.Store(countUnowned(segments))
+	p.revision.Store(result.Revision)
+	p.viewSegments.Store(int64(len(segments)))
+	p.routePayloadBytes.Store(int64(result.PayloadBytes))
+	p.retentionDeleted.Add(result.RetentionDeleted)
+	if observer := p.observer.Load(); observer != nil {
+		if observer.OwnershipView != nil {
+			observer.OwnershipView(len(segments), viewDuration)
+		}
+		if observer.Published != nil {
+			observer.Published(result.PayloadBytes, result.RetentionDeleted)
+		}
+	}
 	return nil
 }
 
@@ -704,18 +1016,21 @@ func (p *Publisher) Readiness() PublisherReadiness {
 // Stats returns the publisher's counters.
 func (p *Publisher) Stats() PublisherStats {
 	return PublisherStats{
-		Passes:          p.passes.Load(),
-		UnownedSlots:    p.unownedSlots.Load(),
-		CoordinatorLost: p.coordinatorLost.Load(),
-		Revision:        p.revision.Load(),
+		Passes:                p.passes.Load(),
+		UnownedSlots:          p.unownedSlots.Load(),
+		CoordinatorLost:       p.coordinatorLost.Load(),
+		Revision:              p.revision.Load(),
+		OwnershipViewSegments: p.viewSegments.Load(),
+		RoutePayloadBytes:     p.routePayloadBytes.Load(),
+		RetentionDeleted:      p.retentionDeleted.Load(),
 	}
 }
 
-func countUnowned(view []Ownership) int64 {
+func countUnowned(segments []OwnershipSegment) int64 {
 	unowned := int64(0)
-	for _, slot := range view {
-		if slot.State != SlotOwned {
-			unowned++
+	for _, segment := range segments {
+		if segment.State != SlotOwned {
+			unowned += int64(segment.Slots())
 		}
 	}
 	return unowned

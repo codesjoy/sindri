@@ -76,6 +76,125 @@ func (d *PlacementData) OwnershipView(ctx context.Context) ([]biz.Ownership, err
 	return view, nil
 }
 
+// ownershipSegmentRow is one aggregated authority run as the segment query
+// returns it: a contiguous range of slot ids that share one owner story.
+type ownershipSegmentRow struct {
+	StartSlot       uint32  `gorm:"column:start_slot"`
+	EndSlot         uint32  `gorm:"column:end_slot"`
+	OwnerNodeID     *string `gorm:"column:owner_node_id"`
+	OwnerInstanceID *string `gorm:"column:owner_instance_id"`
+	Epoch           uint64  `gorm:"column:epoch"`
+	State           string  `gorm:"column:state"`
+	// GrantAgeKnown is 1 when the run's boundary row carried a grant time.
+	GrantAgeKnown int64 `gorm:"column:grant_age_known"`
+	Overdue       int64 `gorm:"column:overdue"`
+}
+
+// OwnershipSegments reads the compact authority view: contiguous runs of slots
+// sharing one owner, instance, epoch, state and quiet-window classification,
+// with each run's grant age measured by the storage clock.
+//
+// The aggregation is what keeps a hundred-node control plane's read
+// proportional to the number of runs rather than to SlotCount: at steady state
+// the answer is one or two runs per live node, not 16,384 rows. The viewer is
+// still served by this process's own connection, so it reads whichever server
+// that connection names -- production wiring points it at the primary, because
+// the grant age the quiet window is judged against must not be a replica's.
+func (d *PlacementData) OwnershipSegments(
+	ctx context.Context,
+	quietWindow time.Duration,
+) ([]biz.OwnershipSegment, error) {
+	if d == nil || d.db == nil {
+		return nil, errors.New("sequence placement: database is required")
+	}
+	if quietWindow < 0 {
+		return nil, errors.New("sequence placement: quiet window must not be negative")
+	}
+	age, err := OwnershipAgeExpression(d.db.Name())
+	if err != nil {
+		return nil, err
+	}
+	statement, err := ownershipSegmentsStatement(d.db.Name(), age)
+	if err != nil {
+		return nil, err
+	}
+	var rows []ownershipSegmentRow
+	if err := d.db.WithContext(ctx).
+		Raw(statement, quietWindow.Microseconds()).
+		Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf("read slot ownership segments: %w", err)
+	}
+	segments := make([]biz.OwnershipSegment, 0, len(rows))
+	for _, row := range rows {
+		segment := biz.OwnershipSegment{
+			StartSlot:          row.StartSlot,
+			EndSlot:            row.EndSlot,
+			Epoch:              row.Epoch,
+			State:              biz.SlotState(row.State),
+			GrantAgeKnown:      row.GrantAgeKnown == 1,
+			QuietWindowOverdue: row.Overdue == 1,
+		}
+		if row.OwnerNodeID != nil {
+			segment.OwnerNodeID = *row.OwnerNodeID
+		}
+		if row.OwnerInstanceID != nil {
+			segment.OwnerInstanceID = *row.OwnerInstanceID
+		}
+		segments = append(segments, segment)
+	}
+	if err := biz.ValidateOwnershipSegments(segments); err != nil {
+		return nil, err
+	}
+	return segments, nil
+}
+
+// ownershipSegmentsStatement builds the gaps-and-islands aggregation.
+//
+// The island key is "slot id minus the row number within this partition", which
+// is constant exactly for consecutive slot ids that share every attribute in
+// the partition. Each dialect spells the cast differently only because a
+// subtraction of two unsigned integers would otherwise be the one expression
+// that overflows here.
+func ownershipSegmentsStatement(dialect, age string) (string, error) {
+	var island string
+	const partition = "PARTITION BY owner_node_id, owner_instance_id, epoch, state, " +
+		"grant_age_known, overdue ORDER BY slot_id"
+	switch dialect {
+	case "postgres":
+		island = "CAST(slot_id AS bigint) - ROW_NUMBER() OVER (" + partition + ")"
+	case "mysql":
+		// MySQL's ROW_NUMBER() is BIGINT UNSIGNED, and signed-minus-unsigned is
+		// evaluated in the unsigned domain, so the first row of the space would
+		// fail with an out-of-range error instead of producing the run key. Both
+		// sides are cast to SIGNED so the subtraction is the signed one the
+		// island key needs.
+		island = "CAST(slot_id AS SIGNED) - " +
+			"CAST(ROW_NUMBER() OVER (" + partition + ") AS SIGNED)"
+	case "sqlite":
+		island = "slot_id - ROW_NUMBER() OVER (" + partition + ")"
+	default:
+		return "", fmt.Errorf("sequence placement: unsupported dialect %q", dialect)
+	}
+	return "WITH classified AS (" +
+		"SELECT slot_id, " +
+		"CASE WHEN state = 'OWNED' THEN owner_node_id ELSE NULL END AS owner_node_id, " +
+		"CASE WHEN state = 'OWNED' THEN owner_instance_id ELSE NULL END AS owner_instance_id, " +
+		"CASE WHEN state = 'OWNED' THEN epoch ELSE 0 END AS epoch, " +
+		"state, " +
+		"CASE WHEN granted_at IS NOT NULL THEN 1 ELSE 0 END AS grant_age_known, " +
+		"CASE WHEN state = 'OWNED' AND granted_at IS NOT NULL AND (" + age + ") >= ? " +
+		"THEN 1 ELSE 0 END AS overdue " +
+		"FROM slot_ownership" +
+		"), islands AS (" +
+		"SELECT classified.*, " + island + " AS island FROM classified" +
+		") SELECT MIN(slot_id) AS start_slot, MAX(slot_id) AS end_slot, " +
+		"owner_node_id, owner_instance_id, epoch, state, " +
+		"MIN(grant_age_known) AS grant_age_known, MIN(overdue) AS overdue " +
+		"FROM islands GROUP BY island, owner_node_id, owner_instance_id, epoch, state, " +
+		"grant_age_known, overdue " +
+		"ORDER BY start_slot", nil
+}
+
 // LiveNodes returns the nodes whose liveness lease has not lapsed.
 //
 // The cutoff is a storage-clock expression rather than an instant this process
@@ -113,7 +232,6 @@ func (d *PlacementData) LiveNodes(
 		live = append(live, biz.NodeInfo{
 			ID:         row.NodeID,
 			InstanceID: row.InstanceID,
-			State:      biz.NodeActive,
 			LastSeenAt: row.LastSeenAt,
 		})
 	}
@@ -194,8 +312,7 @@ func (d *PlacementData) AcquireCoordinator(
 	return held, nil
 }
 
-// MaterialiseRoute publishes a snapshot of the ownership view and returns its
-// revision.
+// MaterialiseRoute publishes a snapshot of the compact ownership view.
 //
 // The revision comes from sequence_route_state, which is seeded above every
 // version already published, so a materialised snapshot can never carry a
@@ -204,6 +321,11 @@ func (d *PlacementData) AcquireCoordinator(
 // when ownership changed, which keeps a stable fleet from growing the route
 // table and from telling every client to refresh on a timer.
 //
+// Every publish -- including one that matched an identical snapshot -- prunes
+// revisions older than the retention bound in the same transaction. The bound
+// is enforced on the write rather than by a maintenance job so the table can
+// never exceed it, even if no pass ever changes the payload again.
+//
 // The caller's tenure is locked and confirmed before anything is published, so a
 // pass that lost the role cannot push a directory the fleet has moved past. The
 // revision advance and the insert are in that same transaction, which is what
@@ -211,22 +333,28 @@ func (d *PlacementData) AcquireCoordinator(
 // it.
 func (d *PlacementData) MaterialiseRoute(
 	ctx context.Context,
-	view []biz.Ownership,
+	segments []biz.OwnershipSegment,
 	layoutVersion int64,
+	retention int,
 	lease biz.CoordinatorLease,
-) (int64, error) {
+) (biz.PublishResult, error) {
 	if d == nil || d.db == nil {
-		return 0, errors.New("sequence placement: database is required")
+		return biz.PublishResult{}, errors.New("sequence placement: database is required")
 	}
-	payload, err := biz.EncodeOwnershipView(view, layoutVersion)
+	if retention <= 0 {
+		return biz.PublishResult{}, errors.New(
+			"sequence placement: route retention must be positive",
+		)
+	}
+	payload, err := biz.EncodeOwnershipSegments(segments, layoutVersion)
 	if err != nil {
-		return 0, err
+		return biz.PublishResult{}, err
 	}
 	now, err := StorageNowExpression(d.db.Name())
 	if err != nil {
-		return 0, err
+		return biz.PublishResult{}, err
 	}
-	var revision int64
+	result := biz.PublishResult{PayloadBytes: len(payload)}
 	err = d.db.WithContext(ctx).Transaction(func(tx *gormio.DB) error {
 		if err := GuardCoordinator(ctx, tx, d.db.Name(), lease); err != nil {
 			return err
@@ -239,32 +367,91 @@ func (d *PlacementData) MaterialiseRoute(
 			// bytes: a jsonb column re-serialises what it stores, so identical
 			// directories do not come back byte-identical.
 			if biz.SameRoutePayload(latest.Payload, payload) {
-				revision = latest.Version
-				return nil
+				result.Revision = latest.Version
+				break
+			}
+			if err := writeMaterialisedRoute(
+				ctx,
+				tx,
+				d.db.Name(),
+				now,
+				payload,
+				&result,
+			); err != nil {
+				return err
 			}
 		case errors.Is(readErr, gormio.ErrRecordNotFound):
+			if err := writeMaterialisedRoute(
+				ctx,
+				tx,
+				d.db.Name(),
+				now,
+				payload,
+				&result,
+			); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("read latest route: %w", readErr)
 		}
-
-		next, advanceErr := AdvanceRouteRevision(ctx, tx, d.db.Name())
-		if advanceErr != nil {
-			return advanceErr
+		deleted, pruneErr := pruneRoutes(ctx, tx, result.Revision, retention)
+		if pruneErr != nil {
+			return pruneErr
 		}
-		revision = next
-		if err := tx.Exec(
-			"INSERT INTO sequence_routes (version, payload, created_at) VALUES (?, ?, "+now+")",
-			revision,
-			payload,
-		).Error; err != nil {
-			return fmt.Errorf("insert materialised route: %w", err)
-		}
+		result.RetentionDeleted = deleted
 		return nil
 	})
 	if err != nil {
-		return 0, err
+		return biz.PublishResult{}, err
 	}
-	return revision, nil
+	return result, nil
+}
+
+// writeMaterialisedRoute advances the directory revision and inserts the
+// snapshot that carries it.
+func writeMaterialisedRoute(
+	ctx context.Context,
+	tx *gormio.DB,
+	dialect string,
+	now string,
+	payload []byte,
+	result *biz.PublishResult,
+) error {
+	next, err := AdvanceRouteRevision(ctx, tx, dialect)
+	if err != nil {
+		return err
+	}
+	if err := tx.WithContext(ctx).Exec(
+		"INSERT INTO sequence_routes (version, payload, created_at) VALUES (?, ?, "+now+")",
+		next,
+		payload,
+	).Error; err != nil {
+		return fmt.Errorf("insert materialised route: %w", err)
+	}
+	result.Revision = next
+	return nil
+}
+
+// pruneRoutes deletes every revision older than the retention bound, counted
+// back from the newest one this publish is leaving in place.
+func pruneRoutes(
+	ctx context.Context,
+	tx *gormio.DB,
+	revision int64,
+	retention int,
+) (int64, error) {
+	oldestKept := revision - int64(retention)
+	if oldestKept < 1 {
+		return 0, nil
+	}
+	result := tx.WithContext(ctx).Exec(
+		"DELETE FROM sequence_routes WHERE version <= ?",
+		oldestKept,
+	)
+	if result.Error != nil {
+		return 0, fmt.Errorf("prune materialised routes: %w", result.Error)
+	}
+	return result.RowsAffected, nil
 }
 
 // clockOffsetExpression returns the dialect expression for the storage clock
@@ -424,11 +611,9 @@ func OwnershipAgeExpression(dialect string) (string, error) {
 // after acquiring one. The writer acquires the role at the start of a pass and may
 // spend a while planning, and this is the check that stops a pass that overran --
 // or one that was simply slow enough for another replica's takeover to commit --
-// from publishing a decision on behalf of a role it no longer holds. Both writers
-// of one directory revision run it: the node-side fallback reconciler and the
-// placement control plane. They must agree on when a tenure has ended, so the
-// predicate lives here rather than in each of them, where a divergence would let
-// one writer keep writing on a tenure the other had already taken over.
+// from publishing a decision on behalf of a role it no longer holds. It is the
+// publisher's write path that runs it, and the predicate lives here so the write
+// and the takeover it races are defined against the same state.
 //
 // The lock, not the comparison, is the point. Taking it as a write keeps the row
 // locked until the caller commits, so a replica taking the role over cannot commit

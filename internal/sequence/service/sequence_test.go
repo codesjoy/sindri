@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/codesjoy/pkg/basic/xerror"
 	"github.com/codesjoy/sindri/gen/go/sequence/reason"
@@ -187,11 +188,9 @@ func TestFetchNextFailureCarriesTheProtocolEnvelope(t *testing.T) {
 // particular has no safe resolution except to discard the range and retry, so a
 // caller that cannot recognise it cannot retry safely at all.
 //
-// The slot-not-owned case ends as a stale directory rather than as itself, and
-// that is the point of mapping it: FetchNext reads that reason as "the caller is
-// pointed at the wrong node" and sends it to refresh the route, which is the only
-// useful reaction to a node that lost the slot. Pinning it here keeps the two
-// reserve-time ownership failures from being collapsed into one reaction.
+// FetchNext waits out a route-version handoff and then retries the allocation.
+// When the node still does not own the slot, the retried authority failure is
+// returned as itself; the client refresh path is what reacts to the reason.
 func TestFetchNextCarriesTheEnvelopeForAnAuthorityFailure(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -214,7 +213,7 @@ func TestFetchNextCarriesTheEnvelopeForAnAuthorityFailure(t *testing.T) {
 		{
 			name:   "slot not owned",
 			store:  fmt.Errorf("reserve ranges: %w: slot 3", biz.ErrSlotNotOwned),
-			reason: reason.Reason_SEQUENCE_ROUTE_EXPIRED,
+			reason: reason.Reason_SEQUENCE_SLOT_NOT_OWNER,
 			retry:  sequencepkg.RetryAfterRefresh,
 		},
 	}
@@ -434,7 +433,7 @@ func TestFetchNextValidatesRouteMetadata(t *testing.T) {
 	}
 
 	ctx := metadata.WithInContext(context.Background(), metadata.New(map[string]string{
-		sequencepkg.VersionMetaKey: "2",
+		sequencepkg.VersionMetaKey: "1",
 	}))
 	_, err := svc.FetchNext(ctx, &sequencev1.FetchNextRequest{Key: key})
 	assert.True(t, xerror.IsReason(err, reason.Reason_SEQUENCE_ROUTE_EXPIRED))
@@ -453,6 +452,93 @@ func TestFetchNextStopsWaitingWhenContextIsCanceled(t *testing.T) {
 	cancel()
 	_, err := svc.FetchNext(ctx, &sequencev1.FetchNextRequest{Key: key})
 	assert.ErrorIs(t, err, context.Canceled)
+}
+
+// TestWaitForRouteVersionWaitsAtTheCurrentPublishedVersion covers the handoff
+// race the route cache and allocator version are separate for: the cache can
+// already publish version N while this process is still applying it. A caller at
+// N must wait for the local barrier, while a caller behind N is genuinely stale.
+func TestWaitForRouteVersionWaitsAtTheCurrentPublishedVersion(t *testing.T) {
+	allocator := readyAllocator(&sequenceStore{})
+	allocator.Open(1, 0, nil)
+	route := biz.NewRouteCache()
+	route.UpdateRoute(&biz.Route{
+		Version: 2,
+		Nodes:   []biz.RouteNode{{NodeID: "node-a", Slots: []uint32{0}}},
+	})
+	svc := NewSequenceService(allocator, route)
+
+	ctx := withRequestMetadata(context.Background(), map[string]string{
+		sequencepkg.VersionMetaKey: "2",
+	})
+	waited := make(chan error, 1)
+	go func() {
+		waited <- svc.waitForRouteVersion(ctx)
+	}()
+
+	select {
+	case err := <-waited:
+		t.Fatalf("wait returned before the allocator applied version 2: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	allocator.Reconcile(2, 0, nil, false)
+	allocator.ApplyRoute(0)
+	require.NoError(t, <-waited)
+
+	expiredCtx := withRequestMetadata(context.Background(), map[string]string{
+		sequencepkg.VersionMetaKey: "1",
+	})
+	err := svc.waitForRouteVersion(expiredCtx)
+	assert.True(t, xerror.IsReason(err, reason.Reason_SEQUENCE_ROUTE_EXPIRED))
+}
+
+// TestWaitForRouteVersionAheadOfTheCacheWaitsAndCancels covers the other side of
+// the handoff window: a caller that knows a newer version than this node's route
+// cache is not expired, it is early, so it waits for the allocator to reach that
+// version and the wait is bounded by the caller's own context.
+func TestWaitForRouteVersionAheadOfTheCacheWaitsAndCancels(t *testing.T) {
+	allocator := readyAllocator(&sequenceStore{})
+	allocator.Open(1, 0, nil)
+	route := biz.NewRouteCache()
+	route.UpdateRoute(&biz.Route{
+		Version: 2,
+		Nodes:   []biz.RouteNode{{NodeID: "node-a", Slots: []uint32{0}}},
+	})
+	svc := NewSequenceService(allocator, route)
+
+	ctx, cancel := context.WithCancel(withRequestMetadata(
+		context.Background(),
+		map[string]string{sequencepkg.VersionMetaKey: "3"},
+	))
+	waited := make(chan error, 1)
+	go func() {
+		waited <- svc.waitForRouteVersion(ctx)
+	}()
+
+	select {
+	case err := <-waited:
+		t.Fatalf("a caller ahead of the cache returned early: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-waited:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("waiting for a newer version ignored the caller's cancellation")
+	}
+
+	// The same wait still answers once the allocator applies the version.
+	applied := make(chan error, 1)
+	go func() {
+		applied <- svc.waitForRouteVersion(withRequestMetadata(
+			context.Background(),
+			map[string]string{sequencepkg.VersionMetaKey: "3"},
+		))
+	}()
+	allocator.Reconcile(3, 0, nil, false)
+	allocator.ApplyRoute(0)
+	require.NoError(t, <-applied)
 }
 
 func TestGetRouteResponses(t *testing.T) {

@@ -64,7 +64,7 @@ func indexOf(values []string, want string) int {
 }
 
 func active(id, instance string) NodeInfo {
-	return NodeInfo{ID: id, InstanceID: instance, State: NodeActive}
+	return NodeInfo{ID: id, InstanceID: instance}
 }
 
 // TestPlanTargetsNeverMovesAHealthySlot is decision D18 in the planner: a node
@@ -178,31 +178,6 @@ func TestPlanTargetsMovesASlotWhoseGrantLapsed(t *testing.T) {
 	)
 }
 
-// TestPlanTargetsExcludesLeavingNodes covers the rollout instruction: a node
-// marked LEAVING is not in the live set, so its slots are assigned away and it is
-// never chosen as the destination of anybody else's. Its own pass is what
-// releases the authority; the plan never preempts it.
-func TestPlanTargetsExcludesLeavingNodes(t *testing.T) {
-	view := []Ownership{
-		{
-			SlotID: 0, State: SlotOwned, OwnerNodeID: "node-a",
-			OwnerInstanceID: "instance-a", Epoch: 2,
-		},
-		{SlotID: 1, State: SlotUnowned},
-	}
-	live := []NodeInfo{
-		{ID: "node-a", InstanceID: "instance-a", State: NodeLeaving},
-		active("node-b", "instance-b"),
-	}
-	targets := PlanTargets(view, live, time.Second)
-
-	require.Len(t, targets, 2)
-	assert.Equal(t, "node-b", targets[0].TargetNodeID,
-		"a leaving owner's slots have to move")
-	assert.Equal(t, "node-b", targets[1].TargetNodeID,
-		"the leaving node must not receive new slots")
-}
-
 // TestPlanTargetsAssignsNothingWithoutAUsableNode keeps the empty answers
 // explicit: with no live node, or with only the node that cannot be its own
 // reassignment target, the answer is "nobody claims this" rather than handing
@@ -219,67 +194,70 @@ func TestPlanTargetsAssignsNothingWithoutAUsableNode(t *testing.T) {
 	require.Len(t, only, 1)
 	assert.Empty(t, only[0].TargetNodeID)
 
-	// The owner is marked LEAVING, so it is not live and its own node is not a
-	// destination; with nobody else in the fleet the slot is held back.
-	leaving := PlanTargets([]Ownership{{
+	// A lapsed owner is not in the live set, and its own node is not a valid
+	// destination for its slots, so with nobody else in the fleet the slot is
+	// held back.
+	lapsed := PlanTargets([]Ownership{{
 		SlotID: 0, State: SlotOwned, OwnerNodeID: "node-a",
 		OwnerInstanceID: "instance-a", Epoch: 1,
-	}}, []NodeInfo{{
-		ID: "node-a", InstanceID: "instance-a", State: NodeLeaving,
-	}}, time.Second)
-	require.Len(t, leaving, 1)
-	assert.Empty(t, leaving[0].TargetNodeID)
+	}}, nil, time.Second)
+	require.Len(t, lapsed, 1)
+	assert.Empty(t, lapsed[0].TargetNodeID)
 }
 
-func TestActiveNodeIDsSkipsLeavingNodesAndOrdersTheRest(t *testing.T) {
+func TestActiveNodeIDsOrdersTheLiveSet(t *testing.T) {
 	nodes := []NodeInfo{
-		{ID: "node-b", State: NodeActive},
-		{ID: "node-a", State: NodeActive},
-		{ID: "node-c", State: NodeLeaving},
+		{ID: "node-b"},
+		{ID: "node-a"},
+		{ID: "node-c"},
 	}
-	assert.Equal(t, []string{"node-a", "node-b"}, ActiveNodeIDs(nodes))
+	assert.Equal(t, []string{"node-a", "node-b", "node-c"}, ActiveNodeIDs(nodes))
 }
 
 // It has no method that could write placement at all. That is deliberate: the
 // publisher must materialise authority and nothing else, and a test double that
 // could accept intent would let a regression back in without failing here.
 type fakePublisherRepo struct {
-	view       []Ownership
+	segments   []OwnershipSegment
 	viewErr    error
 	publishErr error
 	// published records the view handed to the last write, so a test can pin
 	// that it is exactly the authority that was read.
-	published []Ownership
+	published []OwnershipSegment
 	// leases records, in order, the tenure every write was made under.
 	leases   []CoordinatorLease
 	revision int64
 	writes   int
 }
 
-func (f *fakePublisherRepo) OwnershipView(context.Context) ([]Ownership, error) {
+func (f *fakePublisherRepo) OwnershipSegments(
+	context.Context,
+	time.Duration,
+) ([]OwnershipSegment, error) {
 	if f.viewErr != nil {
 		return nil, f.viewErr
 	}
-	return f.view, nil
+	return f.segments, nil
 }
 
 func (f *fakePublisherRepo) MaterialiseRoute(
 	_ context.Context,
-	view []Ownership,
+	segments []OwnershipSegment,
 	layoutVersion int64,
+	retention int,
 	lease CoordinatorLease,
-) (int64, error) {
+) (PublishResult, error) {
 	if f.publishErr != nil {
-		return 0, f.publishErr
+		return PublishResult{}, f.publishErr
 	}
 	f.leases = append(f.leases, lease)
-	if f.writes > 0 && reflect.DeepEqual(f.published, view) {
-		return f.revision, nil
+	if f.writes > 0 && reflect.DeepEqual(f.published, segments) {
+		return PublishResult{Revision: f.revision, PayloadBytes: len(segments)}, nil
 	}
 	f.writes++
-	f.published = view
+	f.published = segments
 	f.revision++
-	return f.revision, nil
+	return PublishResult{Revision: f.revision, PayloadBytes: len(segments)}, nil
 }
 
 // blockingPublisherRepo holds a pass inside its first read until the pass's own
@@ -288,7 +266,10 @@ type blockingPublisherRepo struct {
 	*fakePublisherRepo
 }
 
-func (b *blockingPublisherRepo) OwnershipView(ctx context.Context) ([]Ownership, error) {
+func (b *blockingPublisherRepo) OwnershipSegments(
+	ctx context.Context,
+	_ time.Duration,
+) ([]OwnershipSegment, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
@@ -326,19 +307,29 @@ func testPublisherConfig() ControlPlaneConfig {
 	}
 }
 
-func oneSlotView() []Ownership {
-	return []Ownership{
-		{SlotID: 0, State: SlotOwned, OwnerNodeID: "node-a", Epoch: 1},
-	}
+// oneOwnerSegments is the whole space owned by one instance. The publisher
+// refuses anything that is not a complete cover, so every pass test starts from
+// this shape.
+func oneOwnerSegments() []OwnershipSegment {
+	return []OwnershipSegment{{
+		StartSlot:       0,
+		EndSlot:         SlotCount - 1,
+		OwnerNodeID:     "node-a",
+		OwnerInstanceID: "instance-a",
+		Epoch:           1,
+		State:           SlotOwned,
+		GrantAgeKnown:   true,
+	}}
 }
 
 // TestPassPublishesOnlyWhileHoldingTheLease pins the single-writer rule: a
 // replica without the role reads nothing and writes nothing.
 func TestPassPublishesOnlyWhileHoldingTheLease(t *testing.T) {
-	repo := &fakePublisherRepo{view: oneSlotView()}
+	repo := &fakePublisherRepo{segments: oneOwnerSegments()}
 
 	follower := NewPublisher(
 		testPublisherConfig(),
+		time.Second,
 		testPublisherInstanceID,
 		repo,
 		&fakeCoordinator{held: false},
@@ -349,6 +340,7 @@ func TestPassPublishesOnlyWhileHoldingTheLease(t *testing.T) {
 
 	leader := NewPublisher(
 		testPublisherConfig(),
+		time.Second,
 		testPublisherInstanceID,
 		repo,
 		&fakeCoordinator{held: true},
@@ -362,20 +354,25 @@ func TestPassPublishesOnlyWhileHoldingTheLease(t *testing.T) {
 // job. It decides no placement: the directory it writes is the ownership view,
 // slot for slot, and the epoch of each slot travels with it.
 func TestPassMaterialisesTheAuthorityViewItRead(t *testing.T) {
-	view := []Ownership{
-		{SlotID: 0, State: SlotOwned, OwnerNodeID: "node-a", Epoch: 4},
-		{SlotID: 1, State: SlotUnowned},
+	segments := []OwnershipSegment{
+		{
+			StartSlot: 0, EndSlot: 0,
+			OwnerNodeID: "node-a", OwnerInstanceID: "instance-a",
+			Epoch: 4, State: SlotOwned, GrantAgeKnown: true,
+		},
+		{StartSlot: 1, EndSlot: SlotCount - 1, State: SlotUnowned},
 	}
-	repo := &fakePublisherRepo{view: view}
+	repo := &fakePublisherRepo{segments: segments}
 	publisher := NewPublisher(
-		testPublisherConfig(), testPublisherInstanceID, repo, &fakeCoordinator{held: true}, nil,
+		testPublisherConfig(), time.Second, testPublisherInstanceID, repo,
+		&fakeCoordinator{held: true}, nil,
 	)
 
 	require.NoError(t, publisher.Pass(context.Background()))
 
-	assert.Equal(t, view, repo.published, "the directory is the authority view")
+	assert.Equal(t, segments, repo.published, "the directory is the authority view")
 	assert.Equal(t, int64(1), publisher.Stats().Revision)
-	assert.Equal(t, int64(1), publisher.Stats().UnownedSlots)
+	assert.Equal(t, int64(SlotCount-1), publisher.Stats().UnownedSlots)
 	assert.Equal(t, int64(1), publisher.Stats().Passes)
 }
 
@@ -385,9 +382,9 @@ func TestPassMaterialisesTheAuthorityViewItRead(t *testing.T) {
 // the epoch replaces with a comparison, and the comparison is what a takeover
 // turns false.
 func TestPassPublishesUnderTheTenureItAcquired(t *testing.T) {
-	repo := &fakePublisherRepo{view: oneSlotView()}
+	repo := &fakePublisherRepo{segments: oneOwnerSegments()}
 	publisher := NewPublisher(
-		testPublisherConfig(), testPublisherInstanceID,
+		testPublisherConfig(), time.Second, testPublisherInstanceID,
 		repo,
 		&fakeCoordinator{held: true, epoch: 7},
 		nil,
@@ -407,9 +404,9 @@ func TestPassPublishesUnderTheTenureItAcquired(t *testing.T) {
 // replica's. The pass is not a failure -- the new publisher republishes the
 // current view -- but the refusal has to be visible.
 func TestPassAbandonsAPublishItLostTheRoleFor(t *testing.T) {
-	repo := &fakePublisherRepo{view: oneSlotView(), publishErr: ErrCoordinatorLost}
+	repo := &fakePublisherRepo{segments: oneOwnerSegments(), publishErr: ErrCoordinatorLost}
 	publisher := NewPublisher(
-		testPublisherConfig(), testPublisherInstanceID,
+		testPublisherConfig(), time.Second, testPublisherInstanceID,
 		repo,
 		&fakeCoordinator{held: true, epoch: 7},
 		nil,
@@ -428,7 +425,7 @@ func TestPassIsBoundedSoItCannotOutliveItsLease(t *testing.T) {
 	cfg := testPublisherConfig()
 	cfg.PassTimeout = 10 * time.Millisecond
 	publisher := NewPublisher(
-		cfg, testPublisherInstanceID,
+		cfg, time.Second, testPublisherInstanceID,
 		&blockingPublisherRepo{&fakePublisherRepo{}},
 		&fakeCoordinator{held: true, epoch: 7},
 		nil,
@@ -442,9 +439,14 @@ func TestPassIsBoundedSoItCannotOutliveItsLease(t *testing.T) {
 // fleet from growing the route table: an identical view returns the revision
 // already published rather than minting a new one.
 func TestPassRepublishesNothingWhileTheAuthorityIsUnchanged(t *testing.T) {
-	repo := &fakePublisherRepo{view: oneSlotView()}
+	repo := &fakePublisherRepo{segments: oneOwnerSegments()}
 	publisher := NewPublisher(
-		testPublisherConfig(), testPublisherInstanceID, repo, &fakeCoordinator{held: true}, nil,
+		testPublisherConfig(),
+		time.Second,
+		testPublisherInstanceID,
+		repo,
+		&fakeCoordinator{held: true},
+		nil,
 	)
 
 	require.NoError(t, publisher.Pass(context.Background()))
@@ -467,8 +469,9 @@ func TestReadinessReportsTheLoopsState(t *testing.T) {
 	// told the replica is serving.
 	fresh := NewPublisher(
 		testPublisherConfig(),
+		time.Second,
 		testPublisherInstanceID,
-		&fakePublisherRepo{},
+		&fakePublisherRepo{segments: oneOwnerSegments()},
 		&fakeCoordinator{held: true},
 		nil,
 	)
@@ -483,7 +486,7 @@ func TestReadinessReportsTheLoopsState(t *testing.T) {
 	failing := testPublisherConfig()
 	failing.PassTimeout = 10 * time.Millisecond
 	failed := NewPublisher(
-		failing, testPublisherInstanceID,
+		failing, time.Second, testPublisherInstanceID,
 		&blockingPublisherRepo{&fakePublisherRepo{}},
 		&fakeCoordinator{held: true},
 		nil,
@@ -501,7 +504,9 @@ func TestReadinessReportsTheLoopsState(t *testing.T) {
 	stalling := testPublisherConfig()
 	stalling.ReconcileInterval = time.Millisecond
 	stalled := NewPublisher(
-		stalling, testPublisherInstanceID, &fakePublisherRepo{}, &fakeCoordinator{held: true}, nil,
+		stalling, time.Second, testPublisherInstanceID,
+		&fakePublisherRepo{segments: oneOwnerSegments()},
+		&fakeCoordinator{held: true}, nil,
 	)
 	require.NoError(t, stalled.Pass(context.Background()))
 	time.Sleep(5 * time.Millisecond)
@@ -514,7 +519,12 @@ func TestReadinessReportsTheLoopsState(t *testing.T) {
 func TestReadinessDoesNotMakeAFailedPassUnready(t *testing.T) {
 	repo := &fakePublisherRepo{viewErr: errUnreachable}
 	publisher := NewPublisher(
-		testPublisherConfig(), testPublisherInstanceID, repo, &fakeCoordinator{held: true}, nil,
+		testPublisherConfig(),
+		time.Second,
+		testPublisherInstanceID,
+		repo,
+		&fakeCoordinator{held: true},
+		nil,
 	)
 
 	require.Error(t, publisher.Pass(context.Background()))

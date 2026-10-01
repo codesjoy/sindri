@@ -247,6 +247,7 @@ func TestLoadAppliesPlaneDefaults(t *testing.T) {
 	assert.Equal(t, ModeBoth, cfg.Mode)
 	assert.Equal(t, 15*time.Second, cfg.DataPlane.HA.NodeTTL)
 	assert.Equal(t, int64(1), cfg.ControlPlane.LayoutVersion)
+	assert.Equal(t, 64, cfg.ControlPlane.RouteRetention)
 	assert.Equal(t, 10*time.Second, cfg.ControlPlane.CoordinatorLease)
 	assert.Equal(t, 5*time.Second, cfg.ControlPlane.ReconcileInterval)
 	assert.Equal(t, 3*time.Second, cfg.ControlPlane.PassTimeout)

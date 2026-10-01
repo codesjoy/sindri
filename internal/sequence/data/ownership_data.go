@@ -26,30 +26,6 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// Ownership event types recorded in the outbox. A renewal is deliberately not
-// one of them: it moves no ownership, so it accelerates no route and is not
-// worth a row per slot per renewal cycle.
-const (
-	ownershipEventGrant   = "GRANT"
-	ownershipEventRelease = "RELEASE"
-)
-
-// OwnershipOutboxModel is one ownership change event. Events only accelerate
-// route materialisation; a lost event delays convergence and never changes
-// authoritative ownership (section 5.3).
-type OwnershipOutboxModel struct {
-	EventID         uint64    `gorm:"column:event_id;primaryKey;autoIncrement:true"`
-	SlotID          uint32    `gorm:"column:slot_id;not null"`
-	OwnerNodeID     *string   `gorm:"column:owner_node_id;size:256"`
-	OwnerInstanceID *string   `gorm:"column:owner_instance_id;size:256"`
-	Epoch           uint64    `gorm:"column:epoch;not null"`
-	EventType       string    `gorm:"column:event_type;size:16;not null"`
-	CreatedAt       time.Time `gorm:"column:created_at;not null"`
-}
-
-// TableName returns the ownership outbox table name.
-func (OwnershipOutboxModel) TableName() string { return "ownership_outbox" }
-
 // ownershipRow is the column subset the authority decisions need.
 type ownershipRow struct {
 	SlotID          uint32     `gorm:"column:slot_id"`
@@ -263,15 +239,6 @@ func (d *ownershipData) claimPostgres(
 			request.InstanceID, request.QuietWindow.Seconds()).Scan(&granted).Error; err != nil {
 			return fmt.Errorf("claim slot ownership: %w", err)
 		}
-		if err := insertOwnershipEvents(
-			ctx,
-			tx,
-			d.db.Name(),
-			ownershipEventGrant,
-			granted,
-		); err != nil {
-			return err
-		}
 		var readErr error
 		outcomes, readErr = d.readClaimOutcomes(ctx, tx, request, granted)
 		return readErr
@@ -347,11 +314,6 @@ func (d *ownershipData) claimTransactional(
 				Order("slot_id").
 				Scan(&granted).Error; err != nil {
 				return fmt.Errorf("read claimed slot ownership: %w", err)
-			}
-			if err := insertOwnershipEvents(
-				ctx, tx, d.db.Name(), ownershipEventGrant, granted,
-			); err != nil {
-				return err
 			}
 		}
 		outcomes = buildClaimOutcomes(request, locked, granted, now)
@@ -434,24 +396,31 @@ func (d *ownershipData) RenewSlots(
 	if d == nil || d.db == nil {
 		return nil, errors.New("sequence ownership: database is required")
 	}
-	if len(request.Authorities) == 0 {
+	if len(request.Groups) == 0 {
 		return nil, nil
 	}
-	now, err := StorageNowExpression(d.db.Name())
+	dialect := d.db.Name()
+	now, err := StorageNowExpression(dialect)
 	if err != nil {
 		return nil, err
 	}
 	var renewed []biz.Ownership
 	err = d.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		for start := 0; start < len(request.Authorities); start += statementChunkSize {
-			end := min(start+statementChunkSize, len(request.Authorities))
-			chunk, renewErr := renewSlotChunk(
-				ctx, tx, d.db.Name(), now, request.Authorities[start:end],
-			)
-			if renewErr != nil {
-				return renewErr
+		for _, group := range request.Groups {
+			if group.InstanceID == "" {
+				return errors.New("sequence ownership: instance id is required to renew slots")
 			}
-			renewed = append(renewed, chunk...)
+			for start := 0; start < len(group.Slots); start += statementChunkSize {
+				end := min(start+statementChunkSize, len(group.Slots))
+				chunk, renewErr := renewSlotChunk(
+					ctx, tx, dialect, now, group.InstanceID, group.Epoch,
+					group.Slots[start:end],
+				)
+				if renewErr != nil {
+					return renewErr
+				}
+				renewed = append(renewed, chunk...)
+			}
 		}
 		return nil
 	})
@@ -461,33 +430,51 @@ func (d *ownershipData) RenewSlots(
 	return renewed, nil
 }
 
-// renewSlotChunk renews one batch of the authorities the caller already holds and
+// renewSlotChunk renews one batch of slots that share an instance and epoch, and
 // returns the rows it actually renewed.
 //
-// Only rows the caller still owns at the epoch it presented come back: a slot
-// missing from the result is one a takeover already replaced, and the caller
-// fences it rather than assuming the renewal happened. One batch is the set of
-// rows one pair of statements locks, which is why the caller splits a whole-space
-// renewal -- a node renewing every slot it owns would otherwise hold locks on all
-// of them for the length of the statement, and carry every slot as a bind
-// parameter in one statement on top of that.
+// The epoch-CAS predicate is the whole safety property: a row whose owner or
+// epoch moved since the caller read it is left alone, so a renewal can never
+// resurrect authority a takeover already replaced. Only rows the caller still
+// owns at the epoch it presented come back; a slot missing from the result is one
+// a takeover replaced, and the caller fences it rather than assuming the renewal
+// happened. The caller splits a whole-space renewal so a statement carries a
+// bounded number of bind parameters and locks.
 func renewSlotChunk(
 	ctx context.Context,
 	tx *gorm.DB,
 	dialect string,
 	now string,
-	authorities []biz.SlotAuthority,
+	instanceID string,
+	epoch uint64,
+	slots []uint32,
 ) ([]biz.Ownership, error) {
-	slots := make([]uint32, len(authorities))
-	for index, authority := range authorities {
-		slots[index] = authority.SlotID
+	if dialect == "postgres" {
+		// One statement both renews and reports which rows still matched, so the
+		// takeovers this renewal lost to are exactly the slots it omits.
+		query := "UPDATE slot_ownership SET granted_at = " + now +
+			", updated_at = " + now + " " +
+			"WHERE state = 'OWNED' AND owner_instance_id = ? AND epoch = ? " +
+			"AND slot_id IN ? RETURNING " + ownershipColumns
+		var rows []ownershipRow
+		if err := tx.WithContext(ctx).
+			Raw(query, instanceID, int64(epoch), slots).
+			Scan(&rows).Error; err != nil {
+			return nil, fmt.Errorf("renew slot ownership: %w", err)
+		}
+		return ownershipRows(rows), nil
 	}
-	// Locking the rows serialises renewal against a concurrent takeover, so
-	// a renewal can never resurrect a lease a takeover already replaced.
+	// MySQL has no UPDATE ... RETURNING, and SQLite shares the same transaction
+	// shape in the component tests, so the matching rows are locked and read
+	// first and the update then touches exactly those. Locking is what
+	// serialises renewal against a concurrent takeover.
 	var locked []ownershipRow
 	lockQuery := tx.WithContext(ctx).Table("slot_ownership").
 		Select(ownershipColumns).
-		Where("slot_id IN ?", slots).
+		Where(
+			"state = ? AND owner_instance_id = ? AND epoch = ? AND slot_id IN ?",
+			string(biz.SlotOwned), instanceID, epoch, slots,
+		).
 		Order("slot_id")
 	if dialect != "sqlite" {
 		lockQuery = lockQuery.Clauses(clause.Locking{Strength: "UPDATE"})
@@ -495,52 +482,31 @@ func renewSlotChunk(
 	if err := lockQuery.Scan(&locked).Error; err != nil {
 		return nil, fmt.Errorf("lock slot ownership for renewal: %w", err)
 	}
-	lockedBySlot := make(map[uint32]ownershipRow, len(locked))
-	for _, row := range locked {
-		lockedBySlot[row.SlotID] = row
-	}
-
-	renewable := make([]uint32, 0, len(authorities))
-	for _, authority := range authorities {
-		row, ok := lockedBySlot[authority.SlotID]
-		if !ok || row.State != string(biz.SlotOwned) {
-			continue
-		}
-		if row.OwnerInstanceID == nil || *row.OwnerInstanceID != authority.InstanceID {
-			continue
-		}
-		if row.Epoch != authority.Epoch {
-			continue
-		}
-		renewable = append(renewable, authority.SlotID)
-	}
-	if len(renewable) == 0 {
+	if len(locked) == 0 {
 		return nil, nil
 	}
-	if err := tx.WithContext(ctx).Exec(
-		"UPDATE slot_ownership SET granted_at = "+now+", updated_at = "+now+
-			" WHERE slot_id IN ?", renewable,
-	).Error; err != nil {
+	renewable := make([]uint32, 0, len(locked))
+	for _, row := range locked {
+		renewable = append(renewable, row.SlotID)
+	}
+	if err := tx.WithContext(ctx).Table("slot_ownership").
+		Where("slot_id IN ?", renewable).
+		Updates(map[string]any{
+			"granted_at": gorm.Expr(now),
+			"updated_at": gorm.Expr(now),
+		}).Error; err != nil {
 		return nil, fmt.Errorf("renew slot ownership: %w", err)
 	}
-	var rows []ownershipRow
-	if err := tx.WithContext(ctx).Table("slot_ownership").
-		Select(ownershipColumns).
-		Where("slot_id IN ?", renewable).
-		Order("slot_id").
-		Scan(&rows).Error; err != nil {
-		return nil, fmt.Errorf("read renewed slot ownership: %w", err)
-	}
-	// A renewal records no outbox event on purpose. It changes neither the
-	// owner nor the epoch, so it cannot change a materialised route, which is
-	// the only thing the outbox exists to accelerate. An event per slot per
-	// cycle would instead grow the table with the slot count: the fleet would
-	// append O(slot_count / RenewInterval) rows every second and read none.
+	return ownershipRows(locked), nil
+}
+
+// ownershipRows converts authority rows to the domain shape.
+func ownershipRows(rows []ownershipRow) []biz.Ownership {
 	renewed := make([]biz.Ownership, 0, len(rows))
 	for _, row := range rows {
 		renewed = append(renewed, row.ownership())
 	}
-	return renewed, nil
+	return renewed
 }
 
 func (d *ownershipData) ReleaseSlots(
@@ -612,11 +578,6 @@ func releaseSlotChunk(
 		if err := tx.Raw(query, args...).Scan(&revoked).Error; err != nil {
 			return 0, fmt.Errorf("release slot ownership: %w", err)
 		}
-		if err := insertOwnershipEvents(
-			ctx, tx, dialect, ownershipEventRelease, revoked,
-		); err != nil {
-			return 0, err
-		}
 		return int64(len(revoked)), nil
 	}
 
@@ -649,53 +610,5 @@ func releaseSlotChunk(
 	if err := tx.Exec(update, args...).Error; err != nil {
 		return 0, fmt.Errorf("release slot ownership: %w", err)
 	}
-	if err := insertOwnershipEvents(
-		ctx, tx, dialect, ownershipEventRelease, matched,
-	); err != nil {
-		return 0, err
-	}
 	return int64(len(matched)), nil
-}
-
-// insertOwnershipEvents writes the outbox rows in the same transaction as the
-// ownership change, so a materialised route can never observe a change whose
-// event is missing (section 5.3).
-func insertOwnershipEvents(
-	ctx context.Context,
-	tx *gorm.DB,
-	dialect string,
-	eventType string,
-	rows []ownershipRow,
-) error {
-	if len(rows) == 0 {
-		return nil
-	}
-	now, err := StorageNowExpression(dialect)
-	if err != nil {
-		return err
-	}
-	var query strings.Builder
-	query.WriteString(
-		"INSERT INTO ownership_outbox " +
-			"(slot_id, owner_node_id, owner_instance_id, epoch, event_type, created_at) VALUES ",
-	)
-	args := make([]any, 0, len(rows)*6)
-	for index, row := range rows {
-		if index > 0 {
-			query.WriteString(", ")
-		}
-		query.WriteString("(?, ?, ?, ?, ?, " + now + ")")
-		args = append(
-			args,
-			row.SlotID,
-			row.OwnerNodeID,
-			row.OwnerInstanceID,
-			row.Epoch,
-			eventType,
-		)
-	}
-	if err := tx.WithContext(ctx).Exec(query.String(), args...).Error; err != nil {
-		return fmt.Errorf("record ownership event: %w", err)
-	}
-	return nil
 }

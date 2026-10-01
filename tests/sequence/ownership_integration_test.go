@@ -161,8 +161,9 @@ func TestSlotOwnershipContractAcrossDialects(t *testing.T) {
 			before := loadSlotOwnership(t, repo, slotID).GrantedAgo
 			time.Sleep(50 * time.Millisecond)
 			staleRenew, err := repo.RenewSlots(ctx, biz.RenewRequest{
-				Authorities: []biz.SlotAuthority{{
-					SlotID: slotID, InstanceID: ownershipOwnerA, Epoch: base + 1,
+				Groups: []biz.RenewGroup{{
+					InstanceID: ownershipOwnerA, Epoch: base + 1,
+					Slots: []uint32{slotID},
 				}},
 			})
 			require.NoError(t, err)
@@ -176,8 +177,9 @@ func TestSlotOwnershipContractAcrossDialects(t *testing.T) {
 			// compared, and the newer one can be the larger of the two.
 			beforeRenew := loadSlotOwnership(t, repo, slotID).GrantedAgo
 			renewed, err := repo.RenewSlots(ctx, biz.RenewRequest{
-				Authorities: []biz.SlotAuthority{{
-					SlotID: slotID, InstanceID: ownershipOwnerB, Epoch: base + 2,
+				Groups: []biz.RenewGroup{{
+					InstanceID: ownershipOwnerB, Epoch: base + 2,
+					Slots: []uint32{slotID},
 				}},
 			})
 			require.NoError(t, err)
@@ -217,8 +219,13 @@ func TestSlotOwnershipContractAcrossDialects(t *testing.T) {
 			require.True(t, reacquired.Granted)
 			require.Equal(t, base+3, reacquired.Ownership.Epoch)
 
-			// Every ownership change must leave an outbox event.
-			require.Greater(t, countRows(t, db, "ownership_outbox"), int64(0))
+			// The authority row is the record of every change: it names the new
+			// generation, which is what a reader of the fleet acts on now that no
+			// outbox mirrors it.
+			current := loadSlotOwnership(t, repo, slotID)
+			require.Equal(t, biz.SlotOwned, current.State)
+			require.Equal(t, ownershipOwnerA, current.OwnerInstanceID)
+			require.Equal(t, base+3, current.Epoch)
 		})
 	}
 }

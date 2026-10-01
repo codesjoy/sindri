@@ -290,21 +290,25 @@ func TestRuntimeMemorySampler(t *testing.T) {
 // the series can be asserted against values that came out of a real pass rather
 // than against the zero value of a publisher nobody drove.
 type publisherMetricRepo struct {
-	view     []biz.Ownership
+	segments []biz.OwnershipSegment
 	revision int64
 }
 
-func (f *publisherMetricRepo) OwnershipView(context.Context) ([]biz.Ownership, error) {
-	return f.view, nil
+func (f *publisherMetricRepo) OwnershipSegments(
+	context.Context,
+	time.Duration,
+) ([]biz.OwnershipSegment, error) {
+	return f.segments, nil
 }
 
 func (f *publisherMetricRepo) MaterialiseRoute(
 	context.Context,
-	[]biz.Ownership,
+	[]biz.OwnershipSegment,
 	int64,
+	int,
 	biz.CoordinatorLease,
-) (int64, error) {
-	return f.revision, nil
+) (biz.PublishResult, error) {
+	return biz.PublishResult{Revision: f.revision, PayloadBytes: 128}, nil
 }
 
 type publisherMetricCoordinator struct{}
@@ -321,19 +325,25 @@ func (publisherMetricCoordinator) AcquireCoordinator(
 func testPublisher(t *testing.T) *biz.Publisher {
 	t.Helper()
 	repo := &publisherMetricRepo{
-		view: []biz.Ownership{
-			{SlotID: 0, OwnerInstanceID: "instance-a", State: biz.SlotOwned, Epoch: 1},
-			{SlotID: 1, State: biz.SlotUnowned},
+		segments: []biz.OwnershipSegment{
+			{
+				StartSlot: 0, EndSlot: 0,
+				OwnerNodeID: "node-a", OwnerInstanceID: "instance-a",
+				State: biz.SlotOwned, Epoch: 1, GrantAgeKnown: true,
+			},
+			{StartSlot: 1, EndSlot: biz.SlotCount - 1, State: biz.SlotUnowned},
 		},
 		revision: 9,
 	}
 	publisher := biz.NewPublisher(
 		biz.ControlPlaneConfig{
 			LayoutVersion:     1,
+			RouteRetention:    64,
 			CoordinatorLease:  10 * time.Second,
 			ReconcileInterval: 5 * time.Second,
 			PassTimeout:       3 * time.Second,
 		},
+		time.Second,
 		"instance-a",
 		repo,
 		publisherMetricCoordinator{},
@@ -386,7 +396,17 @@ func TestPublisherMetricsPublishThePublisherCounters(t *testing.T) {
 	unowned, ok := byName["sequence.control.unowned_slots"].Data.(metricdata.Gauge[int64])
 	require.True(t, ok, "sequence.control.unowned_slots must be an int64 gauge")
 	require.Len(t, unowned.DataPoints, 1)
-	assert.Equal(t, int64(1), unowned.DataPoints[0].Value)
+	assert.Equal(t, int64(biz.SlotCount-1), unowned.DataPoints[0].Value)
+
+	viewSegments, ok := byName["sequence.control.ownership_view_segments"].Data.(metricdata.Gauge[int64])
+	require.True(t, ok, "sequence.control.ownership_view_segments must be an int64 gauge")
+	require.Len(t, viewSegments.DataPoints, 1)
+	assert.Equal(t, int64(2), viewSegments.DataPoints[0].Value)
+
+	payloadBytes, ok := byName["sequence.control.route_payload_bytes"].Data.(metricdata.Gauge[int64])
+	require.True(t, ok, "sequence.control.route_payload_bytes must be an int64 gauge")
+	require.Len(t, payloadBytes.DataPoints, 1)
+	assert.Equal(t, int64(128), payloadBytes.DataPoints[0].Value)
 
 	lost, ok := byName["sequence.control.coordinator_lost"].Data.(metricdata.Sum[int64])
 	require.True(t, ok, "sequence.control.coordinator_lost must be an int64 counter")

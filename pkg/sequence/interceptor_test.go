@@ -99,20 +99,22 @@ func TestSequenceInterceptorSendsNoEpochWithoutAnOwnershipView(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestSequenceInterceptorRejectsABatchSpanningEpochs covers the same-epoch clause
-// of appendix A.6. Two keys can share an owner and still sit under different
-// epochs, and the server validates a batch against the anchor's epoch, so such a
-// batch would be checked against an epoch that does not describe every key in it.
-func TestSequenceInterceptorRejectsABatchSpanningEpochs(t *testing.T) {
+// TestSequenceInterceptorSendsABatchSpanningEpochs pins that a batch is grouped
+// by owner, not by epoch. The server fences every key against its own slot gate,
+// so epochs may differ within one owner's group; the anchor epoch is only the
+// caller's routing hint.
+func TestSequenceInterceptorSendsABatchSpanningEpochs(t *testing.T) {
 	third := uint32(SlotCount / 3)
 	router := newSegmentedTestRouter(t, testSegmentedRoute(1, 1,
 		testSegment{nodeID: "node-a", epoch: 5, from: 0, to: third - 1},
 		testSegment{nodeID: "node-b", epoch: 6, from: third, to: 2*third - 1},
 		testSegment{nodeID: "node-a", epoch: 7, from: 2 * third, to: SlotCount - 1},
 	))
+	first := keyInSlotRange(t, 0, third)
+	second := keyInSlotRange(t, 2*third, SlotCount)
 	request := &sequencev1.FetchNextBatchRequest{Requests: []*sequencev1.FetchNextRequest{
-		{Key: keyInSlotRange(t, 0, third)},
-		{Key: keyInSlotRange(t, 2*third, SlotCount)},
+		{Key: first},
+		{Key: second},
 	}}
 	calls := 0
 	err := newUnaryClientInterceptor(router)(
@@ -120,13 +122,20 @@ func TestSequenceInterceptorRejectsABatchSpanningEpochs(t *testing.T) {
 		fetchNextBatchFullMethod,
 		request,
 		&sequencev1.FetchNextBatchResponse{},
-		func(context.Context, string, any, any) error {
+		func(ctx context.Context, _ string, _, response any) error {
 			calls++
+			outgoing, ok := metadata.FromOutContext(ctx)
+			require.True(t, ok)
+			assert.Equal(t, []string{"5"}, outgoing.Get(SlotEpochMetaKey))
+			response.(*sequencev1.FetchNextBatchResponse).Results = []*sequencev1.FetchNextBatchResult{
+				{Id: 1, Count: 1, Key: first},
+				{Id: 2, Count: 1, Key: second},
+			}
 			return nil
 		},
 	)
-	require.ErrorIs(t, err, ErrBatchRouteChanged)
-	assert.Zero(t, calls, "a batch spanning epochs must not reach an owner")
+	require.NoError(t, err)
+	assert.Equal(t, 1, calls)
 }
 
 func TestSequenceInterceptorRefreshesAndRetriesRouteErrorOnce(t *testing.T) {

@@ -202,6 +202,9 @@ type Allocator struct {
 	// renewalSucceeded and renewalFailed count renewal rounds per slot.
 	renewalSucceeded atomic.Int64
 	renewalFailed    atomic.Int64
+	// renewalObserver receives the duration and size of each grouped renewal
+	// round trip. It is nil unless a deployment asked for metrics.
+	renewalObserver atomic.Pointer[RenewalBatchObserver]
 	// gateFenced counts slots closed by a local fence rather than by a route
 	// change.
 	gateFenced atomic.Int64
@@ -370,9 +373,8 @@ type Readiness struct {
 func (obj *Allocator) Readiness() Readiness {
 	// The fence is reported first because it is the one unready state of the three
 	// that a restart does not clear and only a human can act on, and because an
-	// instance can be both fenced and stopping: an operator who marks a fenced
-	// node LEAVING makes it drain and release, which would otherwise hide the
-	// fence behind a "stopping" that reads like an ordinary rollout.
+	// instance can be both fenced and stopping: a shutdown would otherwise hide
+	// the fence behind a "stopping" that reads like an ordinary rollout.
 	if _, fenced := obj.Fenced(); fenced {
 		return Readiness{Reason: "fenced"}
 	}

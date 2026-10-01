@@ -115,17 +115,25 @@ func newProbeAllocator(t *testing.T) *biz.Allocator {
 // run yet, so the probe's control half starts in its initializing state.
 type handlerPublisherRepo struct{}
 
-func (handlerPublisherRepo) OwnershipView(context.Context) ([]biz.Ownership, error) {
-	return nil, nil
+func (handlerPublisherRepo) OwnershipSegments(
+	context.Context,
+	time.Duration,
+) ([]biz.OwnershipSegment, error) {
+	return []biz.OwnershipSegment{{
+		StartSlot: 0, EndSlot: biz.SlotCount - 1,
+		OwnerNodeID: "node-a", OwnerInstanceID: "instance-1",
+		State: biz.SlotOwned, Epoch: 1, GrantAgeKnown: true,
+	}}, nil
 }
 
 func (handlerPublisherRepo) MaterialiseRoute(
 	context.Context,
-	[]biz.Ownership,
+	[]biz.OwnershipSegment,
 	int64,
+	int,
 	biz.CoordinatorLease,
-) (int64, error) {
-	return 1, nil
+) (biz.PublishResult, error) {
+	return biz.PublishResult{Revision: 1, PayloadBytes: 64}, nil
 }
 
 type handlerCoordinatorRepo struct{}
@@ -145,10 +153,12 @@ func newProbePublisher(t *testing.T) *biz.Publisher {
 	return biz.NewPublisher(
 		biz.ControlPlaneConfig{
 			LayoutVersion:     1,
+			RouteRetention:    64,
 			CoordinatorLease:  10 * time.Second,
 			ReconcileInterval: time.Minute,
 			PassTimeout:       time.Second,
 		},
+		time.Second,
 		"instance-1",
 		handlerPublisherRepo{},
 		handlerCoordinatorRepo{},

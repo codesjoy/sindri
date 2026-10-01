@@ -94,7 +94,6 @@ func TestGeneratedClientDrivesServiceAllocatorAndSQLiteRepo(t *testing.T) {
 	require.NoError(t, db.AutoMigrate(
 		&sequencedata.SequenceModel{},
 		&sequencedata.RouteModel{},
-		&sequencedata.OwnershipOutboxModel{},
 	))
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
@@ -167,7 +166,6 @@ func TestAllocatorPrefetchesDatabaseRangeBeforeExhaustion(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(
 		&sequencedata.SequenceModel{},
-		&sequencedata.OwnershipOutboxModel{},
 	))
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
@@ -220,7 +218,6 @@ func TestGeneratedClientDrivesBatchAllocation(t *testing.T) {
 	require.NoError(t, db.AutoMigrate(
 		&sequencedata.SequenceModel{},
 		&sequencedata.RouteModel{},
-		&sequencedata.OwnershipOutboxModel{},
 	))
 	sqlDB, err := db.DB()
 	require.NoError(t, err)

@@ -602,7 +602,11 @@ func TestAllocatorCleanupIgnoresReplacedSlotMap(t *testing.T) {
 	assert.Same(t, newState, value)
 }
 
-func TestAllocatorCleanupWaitsForAllocationAndRechecksUse(t *testing.T) {
+// TestAllocatorReconcileAndCleanupDoNotBlockOnReservationIO pins the lock scope
+// of the allocation path: a range reservation that is stuck in storage must not
+// hold the allocator's slot lock, or every reconciliation would queue behind a
+// slow statement and stall the whole node.
+func TestAllocatorReconcileAndCleanupDoNotBlockOnReservationIO(t *testing.T) {
 	key := "blocked-orders"
 	clock := &fakeClock{now: time.Unix(6000, 0)}
 	store := &blockingRangeStore{
@@ -618,6 +622,20 @@ func TestAllocatorCleanupWaitsForAllocationAndRechecksUse(t *testing.T) {
 	}()
 	<-store.started
 
+	// The reservation is inside storage, and the slot lock must already be
+	// released: both a reconcile (which takes the write lock) and a cleanup pass
+	// have to complete while it is still in flight.
+	reconcileDone := make(chan struct{})
+	go func() {
+		allocator.CommitRoute(2, 0, []uint32{SlotForKey(key)})
+		close(reconcileDone)
+	}()
+	select {
+	case <-reconcileDone:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile blocked behind an in-flight reservation")
+	}
+
 	cleanupDone := make(chan struct{})
 	go func() {
 		allocator.cleanupIdle()
@@ -625,18 +643,18 @@ func TestAllocatorCleanupWaitsForAllocationAndRechecksUse(t *testing.T) {
 	}()
 	select {
 	case <-cleanupDone:
-		t.Fatal("cleanup completed while allocation held the slot read lock")
-	case <-time.After(20 * time.Millisecond):
+	case <-time.After(time.Second):
+		t.Fatal("cleanup blocked behind an in-flight reservation")
 	}
+
+	// The in-flight key survives the pass: the eviction re-checks its state and
+	// sees the fetch attached to it.
+	_, state := allocatorKeyState(t, allocator, key)
+	assert.NotNil(t, state.fetch, "the in-flight key was not evicted")
 
 	close(store.release)
 	require.NoError(t, <-fetchDone)
-	select {
-	case <-cleanupDone:
-	case <-time.After(time.Second):
-		t.Fatal("cleanup did not finish after allocation completed")
-	}
-	_, state := allocatorKeyState(t, allocator, key)
+	_, state = allocatorKeyState(t, allocator, key)
 	assert.Equal(t, clock.Now().UnixNano(), state.lastUsed.Load())
 }
 

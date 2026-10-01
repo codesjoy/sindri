@@ -359,10 +359,18 @@ type ControlPlaneConfig struct {
 	// under. A deployment whose nodes disagree about it routes by a different
 	// key-to-slot rule, so the value travels in every snapshot.
 	LayoutVersion int64 `mapstructure:"layout_version" default:"1"`
+	// RouteRetention is how many of the newest directory revisions stay in
+	// sequence_routes. A publish deletes every older row in the same
+	// transaction, so the table is bounded no matter how long the fleet runs.
+	// Clients only ever read the newest revision, so the bound costs nothing
+	// while keeping a rollback window an operator can inspect.
+	RouteRetention int `mapstructure:"route_retention" default:"64"`
 	// CoordinatorLease is how long one replica keeps the publisher role.
 	CoordinatorLease time.Duration `mapstructure:"coordinator_lease" default:"10s"`
-	// ReconcileInterval is the longest a pass may wait for a trigger. Events
-	// drive passes; this only guarantees convergence when one is missed.
+	// ReconcileInterval is how often the coordinator runs a publish pass. There
+	// is no event channel to drive it: a pass reads the current authority state,
+	// so the cadence is what bounds how long a change takes to reach the
+	// directory.
 	ReconcileInterval time.Duration `mapstructure:"reconcile_interval" default:"5s"`
 	// PassTimeout bounds one pass. It must stay below CoordinatorLease: a pass
 	// publishes under the tenure it acquired when it started, so one allowed to
@@ -375,6 +383,9 @@ type ControlPlaneConfig struct {
 func (c ControlPlaneConfig) Validate() error {
 	if c.LayoutVersion <= 0 {
 		return errors.New("controlplane.layout_version must be positive")
+	}
+	if c.RouteRetention <= 0 {
+		return errors.New("controlplane.route_retention must be positive")
 	}
 	if c.CoordinatorLease <= 0 {
 		return errors.New("controlplane.coordinator_lease must be positive")

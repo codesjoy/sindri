@@ -116,6 +116,9 @@ type leaseOwnershipFake struct {
 	// granted, so a test can assert exactly what a caller asked the authority for.
 	claims       int
 	claimedSlots []uint32
+	// renewRequests records, in order, what each renewal asked the authority to
+	// refresh, so a test can pin the batching as well as the outcome.
+	renewRequests []RenewRequest
 }
 
 func newLeaseOwnershipFake() *leaseOwnershipFake {
@@ -183,20 +186,23 @@ func (f *leaseOwnershipFake) RenewSlots(
 ) ([]Ownership, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.renewRequests = append(f.renewRequests, request)
 	if f.renewErr != nil {
 		return nil, f.renewErr
 	}
 	if f.dropRenewals {
 		return nil, nil
 	}
-	rows := make([]Ownership, 0, len(request.Authorities))
-	for _, authority := range request.Authorities {
-		row, ok := f.rows[authority.SlotID]
-		if !ok || row.Epoch != authority.Epoch ||
-			row.OwnerInstanceID != authority.InstanceID {
-			continue
+	rows := make([]Ownership, 0, len(request.Groups))
+	for _, group := range request.Groups {
+		for _, slotID := range group.Slots {
+			row, ok := f.rows[slotID]
+			if !ok || row.Epoch != group.Epoch ||
+				row.OwnerInstanceID != group.InstanceID {
+				continue
+			}
+			rows = append(rows, row)
 		}
-		rows = append(rows, row)
 	}
 	return rows, nil
 }
@@ -342,6 +348,54 @@ func TestRenewalIsPacedByTheConfiguredInterval(t *testing.T) {
 	now = int64(3 * time.Second)
 	allocator.RenewLeases()
 	assert.Equal(t, int64(1), allocator.LeaseStats().RenewalSucceeded)
+}
+
+// TestRenewalIsGroupedByEpochAndSkipsDrainingSlots pins the batched contract:
+// every slot this instance holds at the same epoch travels in one group, so the
+// renewal costs one statement per ownership generation, and a slot that is
+// draining is not renewed at all -- its authority is on its way out, and
+// refreshing it would pin the slot to a node that is giving it up.
+func TestRenewalIsGroupedByEpochAndSkipsDrainingSlots(t *testing.T) {
+	key := "lease-renewal-grouping"
+	var now int64
+	allocator, ownership := leaseAllocator(t, key, func() int64 { return now })
+	firstSlot := SlotForKey(key)
+
+	// A second slot at a different epoch, as if it were taken over separately.
+	secondSlotID := SlotForKey(key + "-second")
+	require.NotEqual(t, firstSlot, secondSlotID)
+	ownership.rows[secondSlotID] = Ownership{
+		SlotID:          secondSlotID,
+		State:           SlotOwned,
+		OwnerInstanceID: allocator.instanceID,
+		Epoch:           9,
+	}
+	second := &allocationSlot{}
+	second.epoch.Store(9)
+	allocator.slotsMu.Lock()
+	allocator.slots[secondSlotID] = second
+	allocator.slotsMu.Unlock()
+
+	now = int64(4 * time.Second)
+	allocator.RenewLeases()
+	require.Len(t, ownership.renewRequests, 1)
+	groups := ownership.renewRequests[0].Groups
+	require.Len(t, groups, 2, "each ownership generation is one group")
+	assert.Equal(t, allocator.instanceID, groups[0].InstanceID)
+	assert.Equal(t, uint64(1), groups[0].Epoch)
+	assert.Equal(t, []uint32{firstSlot}, groups[0].Slots)
+	assert.Equal(t, uint64(9), groups[1].Epoch)
+	assert.Equal(t, []uint32{secondSlotID}, groups[1].Slots)
+
+	// Draining the second slot keeps it out of the next renewal, which now
+	// carries a single group.
+	second.draining.Store(true)
+	now = int64(8 * time.Second)
+	allocator.RenewLeases()
+	require.Len(t, ownership.renewRequests, 2)
+	groups = ownership.renewRequests[1].Groups
+	require.Len(t, groups, 1)
+	assert.Equal(t, []uint32{firstSlot}, groups[0].Slots)
 }
 
 // TestAFencedInstanceStopsRenewingItsGrants pins the half of the fence that lets

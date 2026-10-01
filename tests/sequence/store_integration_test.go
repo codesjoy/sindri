@@ -161,6 +161,49 @@ func TestSequenceStoreContractAcrossDialects(t *testing.T) {
 	}
 }
 
+// TestOwnershipOutboxMigrationRollsForwardAndBackAcrossDialects pins the one
+// migration whose Down section has to rebuild a dropped table: the outbox was
+// removed because nothing read it, so the rollback restores an empty table an
+// operator can still roll forward again.
+//
+// The provider is driven outside TestMain's single Up so both statements run on
+// a real server per dialect, and the migration is left in its Up state so the
+// rest of the suite sees the schema it expects.
+func TestOwnershipOutboxMigrationRollsForwardAndBackAcrossDialects(t *testing.T) {
+	// The migration immediately before the drop. Rolling back to it rebuilds the
+	// outbox; rolling forward again removes it.
+	const beforeOutboxDrop = int64(20261001000000)
+	for _, item := range harnesses {
+		t.Run(item.name, func(t *testing.T) {
+			ctx := context.Background()
+			provider, db, err := openMigrationProvider(item)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, db.Close()) }()
+
+			exists, err := tableExists(ctx, db, item, "ownership_outbox")
+			require.NoError(t, err)
+			require.False(t, exists, "Up must leave the outbox dropped")
+
+			_, err = provider.DownTo(ctx, beforeOutboxDrop)
+			require.NoError(t, err)
+			exists, err = tableExists(ctx, db, item, "ownership_outbox")
+			require.NoError(t, err)
+			require.True(t, exists, "Down must rebuild the outbox")
+			var count int64
+			require.NoError(t, db.QueryRowContext(
+				ctx, "SELECT COUNT(*) FROM ownership_outbox",
+			).Scan(&count))
+			require.Zero(t, count, "the rebuilt outbox starts empty")
+
+			_, err = provider.Up(ctx)
+			require.NoError(t, err)
+			exists, err = tableExists(ctx, db, item, "ownership_outbox")
+			require.NoError(t, err)
+			require.False(t, exists, "rolling forward again must drop the outbox")
+		})
+	}
+}
+
 // TestSequenceProcessLifecycleAcrossDialects runs the real cmd/sequence binary
 // against every enabled dialect. It replaces the old in-process bundle
 // assertion: what a deployment can observe is the process's readiness surface
@@ -219,7 +262,8 @@ func runSequenceProcessLifecycle(t *testing.T, database *harness) {
 		instanceID := ownedInstanceForNode(t, db, nodeID)
 		require.NotEmpty(t, instanceID, "the process claimed no slot authority")
 		require.Equal(t, int64(1), livenessRows(t, db, nodeID))
-		outboxWatermark := ownershipEventWatermark(t, db)
+		heldAuthority := loadAuthorityGenerations(t, db, instanceID)
+		require.NotEmpty(t, heldAuthority, "the process held no slot authority to release")
 
 		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -227,10 +271,10 @@ func runSequenceProcessLifecycle(t *testing.T, database *harness) {
 
 		// The shutdown path is visible in the database, and it is asserted the
 		// way a deployment sees it: the process released the authority it held
-		// (the release events are written by the shutdown hook), it stopped
+		// (the generation observed before the stop is gone), it stopped
 		// renewing its liveness row so the node ages out of the fleet's live
 		// set, and the slots it held are assignable to the next process.
-		requireReleaseEventsRecorded(t, db, outboxWatermark)
+		requireAuthorityVacated(t, db, heldAuthority)
 		waitForNodeToLeaveLiveSet(t, db, nodeID)
 		requireAuthorityAssignable(t, db, []uint32{0, 1, 2, 3})
 	})
@@ -619,24 +663,63 @@ func openGORM(t *testing.T, item *harness) *gorm.DB {
 }
 
 func applyMigrations(ctx context.Context, item *harness) error {
-	db, err := sql.Open(item.sqlDriver, item.dsn)
+	provider, db, err := openMigrationProvider(item)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+	_, err = provider.Up(ctx)
+	return err
+}
+
+// openMigrationProvider opens the service's migration directory against the
+// harness database. The caller owns the returned pool.
+func openMigrationProvider(
+	item *harness,
+) (*goose.Provider, *sql.DB, error) {
+	db, err := sql.Open(item.sqlDriver, item.dsn)
+	if err != nil {
+		return nil, nil, err
+	}
 	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
-		return errors.New("resolve integration test path")
+		_ = db.Close()
+		return nil, nil, errors.New("resolve integration test path")
 	}
 	directory := filepath.Join(
 		filepath.Dir(filename), "..", "..", "migrations", "sequence", item.name,
 	)
 	provider, err := goose.NewProvider(item.dialect, db, os.DirFS(directory))
 	if err != nil {
-		return err
+		_ = db.Close()
+		return nil, nil, err
 	}
-	_, err = provider.Up(ctx)
-	return err
+	return provider, db, nil
+}
+
+// tableExists reports whether a table is present in the harness schema,
+// spelled per dialect because the information schema is not portable.
+func tableExists(
+	ctx context.Context,
+	db *sql.DB,
+	item *harness,
+	table string,
+) (bool, error) {
+	placeholder, schema := "?", "DATABASE()"
+	if item.name == "postgres" {
+		placeholder, schema = "$1", "current_schema()"
+	}
+	var count int64
+	err := db.QueryRowContext(
+		ctx,
+		"SELECT COUNT(*) FROM information_schema.tables "+
+			"WHERE table_name = "+placeholder+" AND table_schema = "+schema,
+		table,
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 func startPostgres(ctx context.Context) (*harness, error) {

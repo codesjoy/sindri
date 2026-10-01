@@ -17,7 +17,6 @@ package biz
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -164,27 +163,26 @@ func (m *NodeManager) Heartbeat() {
 // The whole view is required. A partial read -- an empty table because a
 // migration has not run, or a replica that has not caught up -- would otherwise
 // look like a fleet that owns nothing, and the node would release every slot it
-// serves on the strength of it.
+// serves on the strength of it. The compact segment read is validated before it
+// is planned against, and a view that fails validation leaves the previous plan
+// in force: the caller keeps the last good desired set rather than acting on a
+// read it cannot trust.
 func (m *NodeManager) planSlots(ctx context.Context) ([]uint32, error) {
 	if m.placement == nil {
 		return m.desiredSlots, nil
 	}
-	view, err := m.placement.OwnershipView(ctx)
+	segments, err := m.placement.OwnershipSegments(ctx, m.allocator.QuietWindow())
 	if err != nil {
 		return nil, err
-	}
-	if len(view) != SlotCount {
-		return nil, fmt.Errorf(
-			"sequence placement view covers %d of %d slots",
-			len(view),
-			SlotCount,
-		)
 	}
 	live, err := m.placement.LiveNodes(ctx, m.nodeTTL)
 	if err != nil {
 		return nil, err
 	}
-	targets := PlanTargets(view, live, m.allocator.QuietWindow())
+	targets, err := PlanTargetsFromSegments(segments, live)
+	if err != nil {
+		return nil, err
+	}
 	desired := make([]uint32, 0, len(targets))
 	for _, target := range targets {
 		if target.TargetNodeID == m.nodeID {
