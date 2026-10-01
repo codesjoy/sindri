@@ -31,6 +31,104 @@ import (
 	"google.golang.org/genproto/googleapis/rpc/code"
 )
 
+// keyInSlotRange returns a key that hashes into a slot range, so a test can build
+// a batch whose keys land in chosen segments.
+func keyInSlotRange(t *testing.T, from, to uint32) string {
+	t.Helper()
+	for i := 0; i < 1_000_000; i++ {
+		key := "key-" + strconv.Itoa(i)
+		if slot := SlotForKey(key); slot >= from && slot < to {
+			return key
+		}
+	}
+	t.Fatalf("no key hashes into slots [%d,%d)", from, to)
+	return ""
+}
+
+// TestSequenceInterceptorSendsTheLayoutAndEpoch pins appendix A.3 from the caller
+// side: every attempt carries the slot layout its keys were hashed under and the
+// epoch it believes the target slot is at, which is what lets an owner tell a
+// caller that is behind from one that is ahead.
+func TestSequenceInterceptorSendsTheLayoutAndEpoch(t *testing.T) {
+	router := newSegmentedTestRouter(t, testSegmentedRoute(3, 9,
+		testSegment{nodeID: "node-a", epoch: 5, from: 0, to: SlotCount - 1},
+	))
+	middleware := newUnaryClientInterceptor(router)
+	reply := &sequencev1.FetchNextResponse{}
+	calls := 0
+	err := middleware(
+		context.Background(),
+		fetchNextFullMethod,
+		&sequencev1.FetchNextRequest{Key: "orders"},
+		reply,
+		func(ctx context.Context, _ string, _, response any) error {
+			calls++
+			outgoing, ok := metadata.FromOutContext(ctx)
+			require.True(t, ok)
+			assert.Equal(t, []string{"9"}, outgoing.Get(LayoutVersionMetaKey))
+			assert.Equal(t, []string{"5"}, outgoing.Get(SlotEpochMetaKey))
+			response.(*sequencev1.FetchNextResponse).Id = 42
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, int64(42), reply.GetId())
+}
+
+// TestSequenceInterceptorSendsNoEpochWithoutAnOwnershipView pins the other half:
+// a snapshot that carries no segments must not make the caller invent an epoch,
+// because an invented one is a claim about ownership the caller cannot make.
+func TestSequenceInterceptorSendsNoEpochWithoutAnOwnershipView(t *testing.T) {
+	router := newSegmentedTestRouter(t, testRoute(3, "node-a"))
+	middleware := newUnaryClientInterceptor(router)
+	err := middleware(
+		context.Background(),
+		fetchNextFullMethod,
+		&sequencev1.FetchNextRequest{Key: "orders"},
+		&sequencev1.FetchNextResponse{},
+		func(ctx context.Context, _ string, _, response any) error {
+			outgoing, ok := metadata.FromOutContext(ctx)
+			require.True(t, ok)
+			assert.Empty(t, outgoing.Get(SlotEpochMetaKey))
+			assert.Empty(t, outgoing.Get(LayoutVersionMetaKey))
+			response.(*sequencev1.FetchNextResponse).Id = 1
+			return nil
+		},
+	)
+	require.NoError(t, err)
+}
+
+// TestSequenceInterceptorRejectsABatchSpanningEpochs covers the same-epoch clause
+// of appendix A.6. Two keys can share an owner and still sit under different
+// epochs, and the server validates a batch against the anchor's epoch, so such a
+// batch would be checked against an epoch that does not describe every key in it.
+func TestSequenceInterceptorRejectsABatchSpanningEpochs(t *testing.T) {
+	third := uint32(SlotCount / 3)
+	router := newSegmentedTestRouter(t, testSegmentedRoute(1, 1,
+		testSegment{nodeID: "node-a", epoch: 5, from: 0, to: third - 1},
+		testSegment{nodeID: "node-b", epoch: 6, from: third, to: 2*third - 1},
+		testSegment{nodeID: "node-a", epoch: 7, from: 2 * third, to: SlotCount - 1},
+	))
+	request := &sequencev1.FetchNextBatchRequest{Requests: []*sequencev1.FetchNextRequest{
+		{Key: keyInSlotRange(t, 0, third)},
+		{Key: keyInSlotRange(t, 2*third, SlotCount)},
+	}}
+	calls := 0
+	err := newUnaryClientInterceptor(router)(
+		context.Background(),
+		fetchNextBatchFullMethod,
+		request,
+		&sequencev1.FetchNextBatchResponse{},
+		func(context.Context, string, any, any) error {
+			calls++
+			return nil
+		},
+	)
+	require.ErrorIs(t, err, ErrBatchRouteChanged)
+	assert.Zero(t, calls, "a batch spanning epochs must not reach an owner")
+}
+
 func TestSequenceInterceptorRefreshesAndRetriesRouteErrorOnce(t *testing.T) {
 	var loads int
 	router, err := NewRouter(func(

@@ -22,6 +22,9 @@ x-sequence-image: &sequence-image
 
 x-sequence-environment: &sequence-environment
   SKULD_SEQUENCE_APP_NAME: ${SKULD_SEQUENCE_APP_NAME:-github.com.codesjoy.skuld.sequence}
+  # The external stack serves one node, so it runs both halves: there is no
+  # separate publisher to deploy next to it.
+  SKULD_SEQUENCE_MODE: ${SKULD_SEQUENCE_MODE:-both}
   SKULD_SEQUENCE_DRIVER: ${SKULD_SEQUENCE_DRIVER:?set SKULD_SEQUENCE_DRIVER to postgres or mysql}
   SKULD_SEQUENCE_DSN: ${SKULD_SEQUENCE_DSN:?set SKULD_SEQUENCE_DSN}
   SKULD_OTLP_ENDPOINT: ${SKULD_OTLP_ENDPOINT:?set SKULD_OTLP_ENDPOINT}
@@ -56,6 +59,9 @@ services:
         condition: service_completed_successfully
     ports:
       - "${SKULD_SEQUENCE_GRPC_PORT:-19010}:19010"
+      # The admin listener stays unpublished: it carries the high-availability
+      # report and binds loopback inside the container. Read it from inside the
+      # container rather than widening the operator surface onto the network.
     restart: unless-stopped
     mem_limit: ${SKULD_SEQUENCE_MEMORY_LIMIT:?set SKULD_SEQUENCE_MEMORY_LIMIT}
     networks: [external-dependencies]

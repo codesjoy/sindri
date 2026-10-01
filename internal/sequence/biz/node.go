@@ -16,26 +16,12 @@ package biz
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 )
-
-// NodeConfig contains node heartbeat and route polling settings.
-type NodeConfig struct {
-	ID                    string        `mapstructure:"id"`
-	HeartbeatTimeoutTicks int64         `mapstructure:"heartbeat_timeout_ticks"`
-	RouteQueryTimeout     time.Duration `mapstructure:"route_query_timeout"`
-}
-
-// NodeInfo identifies a sequence service node.
-type NodeInfo struct {
-	ID string
-}
-
-// NodeRepo persists sequence node registration state.
-type NodeRepo interface {
-	RegisterNode(ctx context.Context, node *NodeInfo) error
-}
 
 // NodeManager tracks node liveness and applies route assignments.
 type NodeManager struct {
@@ -44,74 +30,175 @@ type NodeManager struct {
 	heartbeatElapsed  int64
 	heartbeatTimeout  int64
 	routeQueryTimeout time.Duration
+	nodeTTL           time.Duration
 
 	allocator *Allocator
 	routeRepo RouteRepo
+	liveness  LivenessRepo
+	placement PlacementRepo
 	route     *RouteCache
+	// clock compares the storage lease clock with the local one. It is optional:
+	// without it the node serves on the asserted bounds alone, which is what a
+	// deployment gets before it has evidence.
+	clock *StorageClockMonitor
+	// desiredSlots is the last plan this node computed. It is kept so a failed
+	// ownership or liveness read leaves the previous plan in force rather than
+	// releasing every slot on a storage blip.
+	desiredSlots []uint32
 
 	logger *slog.Logger
 }
 
 // NewNodeManager constructs a node manager with the supplied dependencies.
 func NewNodeManager(
-	cfg *NodeConfig,
+	cfg DataPlaneConfig,
 	allocator *Allocator,
 	routeRepo RouteRepo,
+	liveness LivenessRepo,
+	placement PlacementRepo,
 	route *RouteCache,
+	clock *StorageClockMonitor,
 	logger *slog.Logger,
 ) *NodeManager {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &NodeManager{
-		nodeID:            cfg.ID,
-		heartbeatTimeout:  cfg.HeartbeatTimeoutTicks,
-		routeQueryTimeout: cfg.RouteQueryTimeout,
+		nodeID:            cfg.Node.ID,
+		heartbeatTimeout:  cfg.Node.HeartbeatTimeoutTicks,
+		routeQueryTimeout: cfg.Node.RouteQueryTimeout,
+		nodeTTL:           cfg.HA.NodeTTL,
 
 		allocator: allocator,
 		routeRepo: routeRepo,
+		liveness:  liveness,
+		placement: placement,
 		route:     route,
+		clock:     clock,
 		logger:    logger,
 	}
 }
 
-// Heartbeat refreshes the route and updates the node's allocation state.
+// Heartbeat refreshes this node's leases, reads the directory, and replans the
+// slots the node should hold.
+//
+// The plan is recomputed on every heartbeat rather than only when a new
+// directory appears, because none of the events that move a slot between nodes
+// change the directory by themselves: a node dying, an instance being replaced
+// under the same node id, or a grant lapsing past the quiet window all show up
+// in the ownership and liveness rows, and only a node that reads them can act.
+// The published revision is what delays a client's view of the move, not the
+// move itself.
 func (m *NodeManager) Heartbeat() {
+	// The clock comparison comes first: it decides whether any of the bounds the
+	// rest of this function relies on are still known to hold.
+	if m.clock != nil {
+		if err := m.clock.Observe(context.Background()); err != nil &&
+			errors.Is(err, ErrStorageClockViolation) {
+			// An unreachable store is not a clock violation: the allocation path
+			// already fails those closed with their own retriable reason, and
+			// fencing on one would turn a storage blip into a dead instance.
+			m.allocator.Fence("storage clock exceeded its asserted drift or jump bound")
+		}
+	}
+
+	// Lease renewal runs off the heartbeat rather than the logical tick: the
+	// lease is a wall-clock quantity, so pacing it by a tick would make the
+	// safety window depend on the configured interval instead of on the
+	// deployment's real pause bound. A heartbeat that stalls lets leases expire
+	// early, which is the safe direction.
+	m.allocator.RenewLeases()
+
 	ctx, cancel := context.WithTimeout(context.Background(), m.routeQueryTimeout)
 	defer cancel()
+
+	// The live node set is renewed here, off the same heartbeat, so the placement
+	// authority sees this node without the node having to reach it: the row goes
+	// into the storage both of them already use. A failed renewal is logged and
+	// the heartbeat continues, because the two failures differ in what they cost:
+	// an unrenewed route is a node serving a stale directory, whereas an unrenewed
+	// row only makes the planner hand this node's slots elsewhere -- the node
+	// still holds its authority until it actually stops renewing leases.
+	if err := m.liveness.RenewLiveness(ctx, m.nodeID, m.allocator.InstanceID()); err != nil {
+		m.logger.Error("sequence liveness renewal failed", slog.Any("err", err))
+	}
+
 	paused := m.allocator.Paused()
-	route, err := m.routeRepo.GetNewerRoute(ctx, m.route.Version())
-	if err != nil {
+	route, routeErr := m.routeRepo.GetNewerRoute(ctx, m.route.Version())
+	if routeErr != nil {
 		m.logger.Error(
 			"sequence heartbeat failed",
-			slog.Any("err", err),
+			slog.Any("err", routeErr),
 			slog.Int64("elapsed", m.heartbeatElapsed),
 			slog.Bool("paused", paused),
 		)
 		return
 	}
 
-	if route == nil && paused && m.route.Version() > 0 {
-		route = m.route.Route()
-	}
 	if route != nil {
-		applyTicks := m.tick + m.heartbeatTimeout
-		var slots []uint32
-		for _, node := range route.Nodes {
-			if node.NodeID != m.nodeID {
-				continue
-			}
-			slots = node.Slots
-		}
-		if paused {
-			m.allocator.Open(route.Version, applyTicks, slots)
-		} else {
-			m.allocator.CommitRoute(route.Version, applyTicks, slots)
-		}
 		m.route.UpdateRoute(route)
 		m.logger.Debug("route change", slog.Any("route", route))
 	}
+
+	// Planning comes after the renewal and after the route read: the renewal is
+	// what tells the fleet this instance is the current process for this node
+	// id, and the route read is what makes the plan's version the newest one
+	// this node knows about.
+	desired, planErr := m.planSlots(ctx)
+	if planErr != nil {
+		m.logger.Error(
+			"sequence placement read failed",
+			slog.Any("err", planErr),
+			slog.Int64("elapsed", m.heartbeatElapsed),
+		)
+		return
+	}
+	m.desiredSlots = desired
+	m.allocator.Reconcile(m.route.Version(), m.tick+m.heartbeatTimeout, desired, paused)
 	m.heartbeatElapsed = 0
+}
+
+// planSlots computes the slots this node should hold, from the ownership and
+// liveness rows the fleet shares.
+//
+// The whole view is required. A partial read -- an empty table because a
+// migration has not run, or a replica that has not caught up -- would otherwise
+// look like a fleet that owns nothing, and the node would release every slot it
+// serves on the strength of it.
+func (m *NodeManager) planSlots(ctx context.Context) ([]uint32, error) {
+	if m.placement == nil {
+		return m.desiredSlots, nil
+	}
+	view, err := m.placement.OwnershipView(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(view) != SlotCount {
+		return nil, fmt.Errorf(
+			"sequence placement view covers %d of %d slots",
+			len(view),
+			SlotCount,
+		)
+	}
+	live, err := m.placement.LiveNodes(ctx, m.nodeTTL)
+	if err != nil {
+		return nil, err
+	}
+	targets := PlanTargets(view, live, m.allocator.QuietWindow())
+	desired := make([]uint32, 0, len(targets))
+	for _, target := range targets {
+		if target.TargetNodeID == m.nodeID {
+			desired = append(desired, target.SlotID)
+		}
+	}
+	return desired, nil
+}
+
+// InstanceID returns the process identity this node claims slots and renews
+// liveness under. It is what tells a restarted node from its predecessor in both
+// records: the ownership epoch is fenced on it, and the liveness row reports it.
+func (m *NodeManager) InstanceID() string {
+	return m.allocator.InstanceID()
 }
 
 // BaseTick applies the current route or pauses allocation after a timeout.
@@ -138,4 +225,161 @@ func (m *NodeManager) CurrentTick() int64 {
 // Pause prevents further allocations until the next route is opened.
 func (m *NodeManager) Pause() {
 	m.allocator.Pause()
+}
+
+// monotonicClock measures elapsed time from process start.
+//
+// Section 3.4 derives the local deadline from a reading taken *before* a
+// request is sent, so the reading must never move backwards. time.Time carries
+// a monotonic component only within a process, and converting it to UnixNano
+// drops that component, so the anchor is kept as a time.Time and every reading
+// is taken with time.Since. The resulting value is a plain int64 of
+// nanoseconds since start, which is safe to publish through an atomic.
+type monotonicClock struct {
+	anchor time.Time
+}
+
+func newMonotonicClock() monotonicClock {
+	return monotonicClock{anchor: time.Now()}
+}
+
+// now returns nanoseconds elapsed since the process anchor.
+func (c monotonicClock) now() int64 {
+	return int64(time.Since(c.anchor))
+}
+
+// ErrStorageClockViolation reports that the storage clock moved differently from
+// the local clock by more than the deployment's bound.
+//
+// It is the one platform failure this repository can detect at runtime. Neither
+// PostgreSQL nor MySQL can bound a forward jump of the storage host clock, so
+// J_max and delta are operator assertions; this monitor is what turns them from
+// an assumption into evidence, and the only thing that enforces them once the
+// fleet is running (appendix E).
+var ErrStorageClockViolation = errors.New(
+	"sequence: storage clock exceeded the asserted drift or jump bound",
+)
+
+// StorageClockMonitor compares successive readings of the storage lease clock
+// with the local monotonic clock.
+//
+// Every safety bound in this protocol is expressed in storage time, but the node
+// measures its own lease locally. The difference between the two elapsed times
+// is therefore a term in the bound rather than a curiosity: within delta a lag is
+// harmless because W covers it, and beyond delta it is not, because the local
+// deadline could then outlive the storage lease it is supposed to sit inside.
+//
+// A violation is sticky. Once the difference has exceeded the bound, the node
+// cannot reconstruct which of its earlier decisions were made while the bound
+// held, so it stops serving until an operator has looked at the platform: the
+// appendix G.2 admission evidence is what it is waiting for.
+type StorageClockMonitor struct {
+	driftBound time.Duration
+	jumpBound  time.Duration
+
+	now  func() time.Time
+	read func(context.Context) (time.Time, error)
+
+	mu          sync.Mutex
+	armed       bool
+	lastStorage time.Time
+	lastLocal   time.Time
+	drift       time.Duration
+	forwardJump time.Duration
+	violated    bool
+}
+
+// NewStorageClockMonitor constructs a monitor for the asserted bounds.
+func NewStorageClockMonitor(
+	driftBound time.Duration,
+	jumpBound time.Duration,
+	now func() time.Time,
+	read func(context.Context) (time.Time, error),
+) *StorageClockMonitor {
+	return &StorageClockMonitor{
+		driftBound: driftBound,
+		jumpBound:  jumpBound,
+		now:        now,
+		read:       read,
+	}
+}
+
+// Observe reads the storage clock once and compares it with the local clock.
+//
+// The first observation only arms the monitor: with nothing to compare against,
+// a difference cannot be computed, and inventing one from a single reading would
+// be measuring the offset between two clocks rather than the drift between two
+// elapsed intervals. That offset is exactly what the protocol is designed not to
+// depend on.
+func (m *StorageClockMonitor) Observe(ctx context.Context) error {
+	storage, err := m.read(ctx)
+	if err != nil {
+		// An unreachable store is a storage failure, not a clock one. The
+		// allocation path already fails those closed with their own reason.
+		return err
+	}
+	local := m.now()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.armed {
+		m.armed = true
+		m.lastStorage = storage
+		m.lastLocal = local
+		return nil
+	}
+	storageDelta := storage.Sub(m.lastStorage)
+	localDelta := local.Sub(m.lastLocal)
+	m.lastStorage = storage
+	m.lastLocal = local
+
+	drift := storageDelta - localDelta
+	m.drift = drift
+	if drift > m.forwardJump {
+		m.forwardJump = drift
+	}
+	if !m.violated && (drift > m.jumpBound || absDuration(drift) > m.driftBound) {
+		m.violated = true
+	}
+	if m.violated {
+		return ErrStorageClockViolation
+	}
+	return nil
+}
+
+// Violated reports whether the monitor has seen the storage clock exceed its
+// bound. It stays true for the life of the process.
+func (m *StorageClockMonitor) Violated() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.violated
+}
+
+// StorageClockStats is a low-cardinality snapshot of the clock comparison.
+type StorageClockStats struct {
+	// Drift is the signed difference between the storage clock's elapsed time and
+	// the local clock's over the last interval.
+	Drift time.Duration
+	// ForwardJump is the largest forward difference observed.
+	ForwardJump time.Duration
+	// Violated reports whether a bound was exceeded.
+	Violated bool
+}
+
+// Stats returns the current comparison.
+func (m *StorageClockMonitor) Stats() StorageClockStats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return StorageClockStats{
+		Drift:       m.drift,
+		ForwardJump: m.forwardJump,
+		Violated:    m.violated,
+	}
+}
+
+func absDuration(value time.Duration) time.Duration {
+	if value < 0 {
+		return -value
+	}
+	return value
 }

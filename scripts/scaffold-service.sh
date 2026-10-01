@@ -72,7 +72,6 @@ render() {
 stage="$tmp_dir/tree"
 mkdir -p \
 	"$stage/cmd/$service" \
-	"$stage/internal/$service/app" \
 	"$stage/internal/$service/biz" \
 	"$stage/internal/$service/conf" \
 	"$stage/internal/$service/data" \
@@ -85,11 +84,11 @@ mkdir -p \
 	"$stage/.github/workflows"
 
 render scripts/templates/service/main.go.tmpl "$stage/cmd/$service/main.go"
+render scripts/templates/service/wire.go.tmpl "$stage/cmd/$service/wire.go"
 render scripts/templates/service/config.yaml.tmpl "$stage/configs/$service.yaml"
 render scripts/templates/service/release.yaml.tmpl "$stage/releases/services/$service.yaml"
 render "scripts/templates/service/workflow.$profile.yml.tmpl" "$stage/.github/workflows/$service.yml"
 for directory in \
-	"$stage/internal/$service/app" \
 	"$stage/internal/$service/biz" \
 	"$stage/internal/$service/conf" \
 	"$stage/internal/$service/data" \

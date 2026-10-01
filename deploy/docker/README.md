@@ -14,9 +14,53 @@ docker compose -f deploy/docker/compose.yaml up --build -d
 ```
 
 Sequence gRPC is available on `localhost:19010`; Grafana is available on `http://localhost:3000`.
-The migration job creates the Sequence tables but does not publish a route.
-Sequence starts successfully without a route, but allocation remains paused
-until an operator inserts a valid route snapshot as described in the quick start.
+The high-availability report answers on the container's admin listener. It binds
+loopback and is deliberately not published, so read it from inside the container:
+
+```sh
+docker compose -f deploy/docker/compose.yaml exec sequence \
+  bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080; printf "GET /healthz HTTP/1.0\r\n\r\n" >&3; cat <&3'
+```
+The migration job creates the Sequence tables, including the slot ownership and
+placement tables. There is no central placement decision: each node plans its
+own slots from `slot_ownership` and `sequence_node_liveness` on every heartbeat,
+claims what its plan hands it, and serves it. The publisher half of the same
+process snapshots that authority into `sequence_routes` under a coordinator
+lease, so clients can follow the moves. Allocation is paused until the first
+directory appears, which the quick start shows how to watch.
+
+One image runs every shape, selected by `SKULD_SEQUENCE_MODE` (or `--mode`):
+
+- `both` — the local default: the data plane and the publisher in one process,
+  sharing one database pool.
+- `data` — allocator, heartbeat, RPC and local planning. No directory is
+  published by this process.
+- `control` — the publisher only: coordinator lease, route materialisation and
+  control-plane readiness. It never claims a slot or renews a liveness row.
+
+A production StatefulSet normally runs its members as `data` and one (or a
+small number of) separate Deployment replicas as `control`. The publisher only
+decides how quickly a move becomes visible to clients; it is not a precondition
+for a node to own or serve a slot. Losing it leaves the fleet serving the last
+directory. A missing or invalid mode fails the process at startup rather than
+picking a shape silently. See
+[../../docs/sequence.md](../../docs/sequence.md) section 2.
+
+The two shapes differ by one setting:
+
+```yaml
+# StatefulSet member: serves ids and plans its own slots.
+env:
+  - name: SKULD_SEQUENCE_MODE
+    value: data
+  - name: SKULD_SEQUENCE_NODE_ID
+    valueFrom: {fieldRef: {fieldPath: metadata.name}}
+---
+# Deployment replica: publishes the directory and nothing else.
+env:
+  - name: SKULD_SEQUENCE_MODE
+    value: control
+```
 The sequence container has a 1 GiB hard memory limit by default. With
 `app.sequence.runtime.memory_limit: auto`, sequence detects that cgroup limit
 and sets the Go runtime soft limit to 80% of it. The allocator stops admitting
@@ -42,6 +86,7 @@ export SKULD_SEQUENCE_DRIVER=postgres
 export SKULD_SEQUENCE_DSN='postgres://skuld_sequence:password@db.example.com:5432/skuld_sequence?sslmode=require'
 export SKULD_OTLP_ENDPOINT='otel-collector.example.com:4317'
 export SKULD_SEQUENCE_APP_NAME=github.com.codesjoy.skuld.sequence.user
+export SKULD_SEQUENCE_MODE=both
 export SKULD_SEQUENCE_NODE_ID=sequence-prod-1
 export SKULD_SEQUENCE_MEMORY_LIMIT=2g
 docker compose -f deploy/docker/compose.external.yaml up --build -d

@@ -45,6 +45,31 @@ const (
 	Reason_SEQUENCE_ROUTE_EXPIRED      Reason = 152
 	Reason_SEQUENCE_CAPACITY_EXHAUSTED Reason = 153
 	Reason_SEQUENCE_ROUTE_UNAVAILABLE  Reason = 154
+	// The request was made against an ownership epoch that is not the one in
+	// force, so the caller's directory view is not current: it is either behind
+	// the owner, in which case the response carries the epoch to move to, or ahead
+	// of it, in which case it must refresh before retrying.
+	Reason_SEQUENCE_EPOCH_STALE Reason = 155
+	// The slot is not being served while its ownership settles, and retrying
+	// shortly is the right response. Either an instance holds the slot but its
+	// grant is too old for its own fence to accept, or a candidate is still
+	// inside its quiet window before it may take the slot over.
+	Reason_SEQUENCE_OWNER_RECOVERING Reason = 156
+	// The local lease that fenced the slot lapsed before the request linearised.
+	// The allocation was discarded rather than served.
+	Reason_SEQUENCE_LEASE_EXPIRED Reason = 157
+	// The request is malformed and retrying it unchanged cannot help.
+	Reason_SEQUENCE_INVALID_ARGUMENT Reason = 158
+	// A range reservation's write may or may not have committed: the statement was
+	// sent but its outcome could not be read. The range must be treated as lost
+	// rather than guessed at, so the caller retries and accepts the hole; a retry
+	// can never hand out an id that was already handed out.
+	Reason_SEQUENCE_COMMIT_UNCERTAIN Reason = 159
+	// The authority store could not complete the reservation and the outcome is
+	// not in doubt: nothing was handed out. Unlike an uncertain commit this needs
+	// no special handling -- retrying later is correct and safe, because a retry
+	// reserves a new range and can never reissue an id.
+	Reason_SEQUENCE_STORAGE_UNAVAILABLE Reason = 160
 )
 
 // Enum value maps for Reason.
@@ -56,14 +81,26 @@ var (
 		152: "SEQUENCE_ROUTE_EXPIRED",
 		153: "SEQUENCE_CAPACITY_EXHAUSTED",
 		154: "SEQUENCE_ROUTE_UNAVAILABLE",
+		155: "SEQUENCE_EPOCH_STALE",
+		156: "SEQUENCE_OWNER_RECOVERING",
+		157: "SEQUENCE_LEASE_EXPIRED",
+		158: "SEQUENCE_INVALID_ARGUMENT",
+		159: "SEQUENCE_COMMIT_UNCERTAIN",
+		160: "SEQUENCE_STORAGE_UNAVAILABLE",
 	}
 	Reason_value = map[string]int32{
-		"REASON_UNSPECIFIED":          0,
-		"SEQUENCE_ALLOCATOR_PAUSED":   150,
-		"SEQUENCE_SLOT_NOT_OWNER":     151,
-		"SEQUENCE_ROUTE_EXPIRED":      152,
-		"SEQUENCE_CAPACITY_EXHAUSTED": 153,
-		"SEQUENCE_ROUTE_UNAVAILABLE":  154,
+		"REASON_UNSPECIFIED":           0,
+		"SEQUENCE_ALLOCATOR_PAUSED":    150,
+		"SEQUENCE_SLOT_NOT_OWNER":      151,
+		"SEQUENCE_ROUTE_EXPIRED":       152,
+		"SEQUENCE_CAPACITY_EXHAUSTED":  153,
+		"SEQUENCE_ROUTE_UNAVAILABLE":   154,
+		"SEQUENCE_EPOCH_STALE":         155,
+		"SEQUENCE_OWNER_RECOVERING":    156,
+		"SEQUENCE_LEASE_EXPIRED":       157,
+		"SEQUENCE_INVALID_ARGUMENT":    158,
+		"SEQUENCE_COMMIT_UNCERTAIN":    159,
+		"SEQUENCE_STORAGE_UNAVAILABLE": 160,
 	}
 )
 
@@ -98,14 +135,20 @@ var File_sequence_reason_reason_proto protoreflect.FileDescriptor
 
 const file_sequence_reason_reason_proto_rawDesc = "" +
 	"\n" +
-	"\x1csequence/reason/reason.proto\x12\x1fcodesjoy.sindri.sequence.reason\x1a\x1fcodesjoy/reason/v1/reason.proto*\xdd\x01\n" +
+	"\x1csequence/reason/reason.proto\x12\x1fcodesjoy.sindri.sequence.reason\x1a\x1fcodesjoy/reason/v1/reason.proto*\xb6\x03\n" +
 	"\x06Reason\x12\x16\n" +
 	"\x12REASON_UNSPECIFIED\x10\x00\x12#\n" +
 	"\x19SEQUENCE_ALLOCATOR_PAUSED\x10\x96\x01\x1a\x03\xa8E\x0e\x12!\n" +
 	"\x17SEQUENCE_SLOT_NOT_OWNER\x10\x97\x01\x1a\x03\xa8E\t\x12 \n" +
 	"\x16SEQUENCE_ROUTE_EXPIRED\x10\x98\x01\x1a\x03\xa8E\t\x12%\n" +
 	"\x1bSEQUENCE_CAPACITY_EXHAUSTED\x10\x99\x01\x1a\x03\xa8E\b\x12$\n" +
-	"\x1aSEQUENCE_ROUTE_UNAVAILABLE\x10\x9a\x01\x1a\x03\xa8E\t\x1a\x04\xa0E\x90NB\x85\x02\n" +
+	"\x1aSEQUENCE_ROUTE_UNAVAILABLE\x10\x9a\x01\x1a\x03\xa8E\t\x12\x1e\n" +
+	"\x14SEQUENCE_EPOCH_STALE\x10\x9b\x01\x1a\x03\xa8E\t\x12#\n" +
+	"\x19SEQUENCE_OWNER_RECOVERING\x10\x9c\x01\x1a\x03\xa8E\x0e\x12 \n" +
+	"\x16SEQUENCE_LEASE_EXPIRED\x10\x9d\x01\x1a\x03\xa8E\t\x12#\n" +
+	"\x19SEQUENCE_INVALID_ARGUMENT\x10\x9e\x01\x1a\x03\xa8E\x03\x12#\n" +
+	"\x19SEQUENCE_COMMIT_UNCERTAIN\x10\x9f\x01\x1a\x03\xa8E\x0e\x12&\n" +
+	"\x1cSEQUENCE_STORAGE_UNAVAILABLE\x10\xa0\x01\x1a\x03\xa8E\x0e\x1a\x04\xa0E\x90NB\x85\x02\n" +
 	"#com.codesjoy.sindri.sequence.reasonB\vReasonProtoP\x01Z1github.com/codesjoy/sindri/gen/go/sequence/reason\xa2\x02\x04CSSR\xaa\x02\x1fCodesjoy.Sindri.Sequence.Reason\xca\x02\x1fCodesjoy\\Sindri\\Sequence\\Reason\xe2\x02+Codesjoy\\Sindri\\Sequence\\Reason\\GPBMetadata\xea\x02\"Codesjoy::Sindri::Sequence::Reasonb\x06proto3"
 
 var (

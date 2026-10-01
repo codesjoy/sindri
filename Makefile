@@ -141,8 +141,8 @@ proto-breaking-check: ## Reject breaking Proto changes against main
 wire: ## Regenerate Wire output for SERVICE
 	$(call require-tool,$(WIRE),wire,$(WIRE_VERSION))
 	@test -x "$$(command -v gofmt 2>/dev/null || true)" || { echo 'gofmt is required' >&2; exit 1; }
-	@test -d "internal/$(SERVICE)/app" || { echo "unknown service: $(SERVICE)" >&2; exit 2; }
-	cd "internal/$(SERVICE)/app" && GOCACHE=$(GOCACHE) WIRE_BIN="$(WIRE)" sh ../../../scripts/generate-wire.sh
+	@test -d "cmd/$(SERVICE)" || { echo "unknown service: $(SERVICE)" >&2; exit 2; }
+	cd "cmd/$(SERVICE)" && GOCACHE=$(GOCACHE) WIRE_BIN="$(WIRE)" sh ../../scripts/generate-wire.sh
 
 go-lint: ## Run golangci-lint once per module
 	$(call require-tool,$(GOLANGCI_LINT),golangci-lint,$(GOLANGCI_LINT_VERSION))

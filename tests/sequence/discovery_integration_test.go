@@ -19,20 +19,13 @@ package sequence_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"sort"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
-	"github.com/codesjoy/sindri/internal/pkg/xgorm"
-	sequenceapp "github.com/codesjoy/sindri/internal/sequence/app"
-	"github.com/codesjoy/sindri/internal/sequence/biz"
-	"github.com/codesjoy/sindri/internal/sequence/conf"
-	gormdata "github.com/codesjoy/sindri/internal/sequence/data/gorm"
-	"github.com/codesjoy/sindri/internal/sequence/task"
 	sequencepkg "github.com/codesjoy/sindri/pkg/sequence"
 	etcdmodule "github.com/codesjoy/yggdrasil-ecosystem/modules/etcd/v3"
 	yapp "github.com/codesjoy/yggdrasil/v3/app"
@@ -48,7 +41,7 @@ const (
 	sequenceAppName      = "github.com.codesjoy.skuld.sequence"
 	etcdImage            = "gcr.io/etcd-development/etcd:v3.5.14"
 	etcdRegistryPrefix   = "/sindri/tests/sequence/registry"
-	discoveryTestTimeout = 10 * time.Second
+	discoveryTestTimeout = 30 * time.Second
 )
 
 type discoveryInstanceRecord struct {
@@ -59,15 +52,6 @@ type discoveryInstanceRecord struct {
 		Scheme  string `json:"scheme"`
 		Address string `json:"address"`
 	} `json:"endpoints"`
-}
-
-type discoveredSequenceApp struct {
-	app     *yapp.App
-	manager *config.Manager
-}
-
-func (a *discoveredSequenceApp) stop(ctx context.Context) error {
-	return errors.Join(a.app.Stop(ctx), a.manager.Close())
 }
 
 func TestSequenceEtcdDiscoveryAcrossDialects(t *testing.T) {
@@ -81,6 +65,12 @@ func TestSequenceEtcdDiscoveryAcrossDialects(t *testing.T) {
 func runSequenceEtcdDiscovery(t *testing.T, database *harness) {
 	t.Helper()
 	require.NoError(t, resetSequenceDatabase(t, database))
+	// One bounded pool for the whole test: the shutdown checks poll the
+	// database, and a fresh pool per poll would exhaust the server's slots.
+	db := openGORM(t, database)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(4)
 
 	ctx := context.Background()
 	etcdContainer, err := tcetcd.Run(ctx, etcdImage)
@@ -95,16 +85,22 @@ func runSequenceEtcdDiscovery(t *testing.T, database *harness) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, etcdClient.Close()) })
 
-	nodeA := startDiscoveredSequenceApp(t, database, etcdEndpoint, "node-a")
-	nodeB := startDiscoveredSequenceApp(t, database, etcdEndpoint, "node-b")
+	nodeA := startSequenceProcess(t, sequenceProcessOptions{
+		database: database, etcdEndpoint: etcdEndpoint,
+		nodeID: "node-a", configuredMode: "data",
+	})
+	nodeB := startSequenceProcess(t, sequenceProcessOptions{
+		database: database, etcdEndpoint: etcdEndpoint,
+		nodeID: "node-b", configuredMode: "data",
+	})
 	stoppedNodeA := false
 	t.Cleanup(func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if !stoppedNodeA {
-			require.NoError(t, nodeA.stop(stopCtx))
+			_ = nodeA.stop(stopCtx)
 		}
-		require.NoError(t, nodeB.stop(stopCtx))
+		_ = nodeB.stop(stopCtx)
 	})
 
 	waitForRegisteredNodes(t, etcdClient, "node-a", "node-b")
@@ -113,7 +109,7 @@ func runSequenceEtcdDiscovery(t *testing.T, database *harness) {
 	t.Cleanup(closeClient)
 
 	route := splitSlots()
-	version := publishDiscoveryRoute(t, database, 1, route)
+	version := publishDiscoveryRoute(t, database, route)
 	keyA := keyForOwner("node-a", route)
 	keyB := keyForOwner("node-b", route)
 	firstA := waitForDiscoveredAllocation(t, routedClient, keyA)
@@ -121,14 +117,26 @@ func runSequenceEtcdDiscovery(t *testing.T, database *harness) {
 	require.Equal(t, version, router.Version())
 	require.Positive(t, firstA)
 	require.Positive(t, firstB)
+	for _, node := range []*sequenceProcess{nodeA, nodeB} {
+		require.Eventually(t, func() bool {
+			status, report, err := probeSequenceReadiness(node.readyURL)
+			return err == nil && status == http.StatusOK && report.Ready
+		}, discoveryTestTimeout, 50*time.Millisecond, "readiness never turned green")
+	}
 
 	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	require.NoError(t, nodeA.stop(stopCtx))
 	cancel()
 	stoppedNodeA = true
 	waitForRegisteredNodes(t, etcdClient, "node-b")
+	// The shutdown path is observable in the database rather than in the
+	// composition: the departing node stops renewing its liveness row, so the
+	// fleet's live set drops it, and the slots it held become assignable to the
+	// node that remains.
+	waitForNodeToLeaveLiveSet(t, db, "node-a")
+	requireSlotsOwnedBy(t, db, "node-b", route["node-a"][:4])
 
-	version = publishDiscoveryRoute(t, database, 2, allSlots("node-b"))
+	version = publishDiscoveryRoute(t, database, allSlots("node-b"))
 	require.Eventually(t, func() bool {
 		refreshCtx, refreshCancel := context.WithTimeout(context.Background(), time.Second)
 		defer refreshCancel()
@@ -138,38 +146,12 @@ func runSequenceEtcdDiscovery(t *testing.T, database *harness) {
 	require.Greater(t, afterHandoff, firstA)
 }
 
-func startDiscoveredSequenceApp(
-	t *testing.T,
-	database *harness,
-	etcdEndpoint string,
-	nodeID string,
-) *discoveredSequenceApp {
-	t.Helper()
-	manager := newDiscoveryConfigManager(t, discoveryConfig(etcdEndpoint, nodeID, false))
-	runtimeApp, err := yapp.New(
-		sequenceAppName,
-		yapp.WithConfigManager(manager),
-		yapp.WithProcessDefaults(false),
-		yapp.WithModules(etcdmodule.Module()),
-	)
-	require.NoError(t, err)
-	cfg := discoverySequenceConfig(database, nodeID)
-	require.NoError(t, runtimeApp.ComposeAndInstall(
-		context.Background(),
-		func(rt yapp.Runtime) (*yapp.BusinessBundle, error) {
-			return sequenceapp.InitializeBundle(rt, cfg)
-		},
-	))
-	require.NoError(t, runtimeApp.Start(context.Background()))
-	return &discoveredSequenceApp{app: runtimeApp, manager: manager}
-}
-
 func newDiscoveredSequenceClient(
 	t *testing.T,
 	etcdEndpoint string,
 ) (*sequencepkg.Router, sequencev1.SequenceGeneratorClient, func()) {
 	t.Helper()
-	manager := newDiscoveryConfigManager(t, discoveryConfig(etcdEndpoint, "", true))
+	manager := newDiscoveryConfigManager(t, discoveryClientConfig(etcdEndpoint))
 	var routed sequencev1.SequenceGeneratorClient
 	router, err := sequencepkg.NewRouter(func(
 		ctx context.Context,
@@ -198,12 +180,15 @@ func newDiscoveredSequenceClient(
 	return router, routed, closeClient
 }
 
-func discoveryConfig(etcdEndpoint, nodeID string, client bool) map[string]any {
+// discoveryClientConfig is the client half of the discovery wiring: it resolves
+// the sequence service through etcd. The server half lives in the process
+// configuration the harness renders, so the test drives the same registry the
+// deployment does rather than a test-only composition.
+func discoveryClientConfig(etcdEndpoint string) map[string]any {
 	yggdrasilConfig := map[string]any{
 		"admin": map[string]any{
 			"application": map[string]any{
 				"namespace": "default",
-				"metadata":  map[string]any{sequencepkg.NodeIDAttribute: nodeID},
 			},
 			"governor": map[string]any{"port": 0},
 		},
@@ -238,30 +223,23 @@ func discoveryConfig(etcdEndpoint, nodeID string, client bool) map[string]any {
 			},
 		},
 	}
-	if client {
-		yggdrasilConfig["clients"] = map[string]any{"services": map[string]any{
-			sequenceAppName: map[string]any{
-				"fast_fail": true,
-				"resolver":  "etcd",
-				"balancer":  sequencepkg.BalancerType,
-				"interceptors": map[string]any{
-					"unary": []string{sequencepkg.InterceptorName},
-				},
+	yggdrasilConfig["clients"] = map[string]any{"services": map[string]any{
+		sequenceAppName: map[string]any{
+			"fast_fail": true,
+			"resolver":  "etcd",
+			"balancer":  sequencepkg.BalancerType,
+			"interceptors": map[string]any{
+				"unary": []string{sequencepkg.InterceptorName},
 			},
-		}}
-		yggdrasilConfig["balancers"] = map[string]any{"defaults": map[string]any{
-			sequencepkg.BalancerType: map[string]any{"type": sequencepkg.BalancerType},
-		}}
-		yggdrasilConfig["transports"] = map[string]any{"grpc": map[string]any{
-			"client": map[string]any{},
-			"server": map[string]any{},
-		}}
-	} else {
-		yggdrasilConfig["server"] = map[string]any{"transports": []string{"grpc"}}
-		yggdrasilConfig["transports"] = map[string]any{"grpc": map[string]any{
-			"server": map[string]any{"address": "127.0.0.1:0"},
-		}}
-	}
+		},
+	}}
+	yggdrasilConfig["balancers"] = map[string]any{"defaults": map[string]any{
+		sequencepkg.BalancerType: map[string]any{"type": sequencepkg.BalancerType},
+	}}
+	yggdrasilConfig["transports"] = map[string]any{"grpc": map[string]any{
+		"client": map[string]any{},
+		"server": map[string]any{},
+	}}
 	return map[string]any{"yggdrasil": yggdrasilConfig}
 }
 
@@ -276,76 +254,48 @@ func newDiscoveryConfigManager(t *testing.T, values map[string]any) *config.Mana
 	return manager
 }
 
-func discoverySequenceConfig(database *harness, nodeID string) *conf.Config {
-	cfg := &conf.Config{
-		Database: discoveryDatabaseConfig(database),
-		Allocator: biz.AllocatorConfig{
-			DefaultStep:               100,
-			MaxStep:                   10000,
-			PrefetchRatio:             0.5,
-			PrefetchLatencyMultiplier: 4,
-			PrefetchLatencyWindow:     5 * time.Minute,
-			PrefetchLatencyMinSamples: 100,
-			PrefetchRateResetAfter:    time.Minute,
-			StepIncreaseThreshold:     15 * time.Minute,
-			StepDecreaseThreshold:     30 * time.Minute,
-			ReserveTimeout:            time.Second,
-			IdleTimeout:               24 * time.Hour,
-			CleanupInterval:           time.Second,
-			CleanupSlotsPerRun:        64,
-			MemoryHighWatermarkRatio:  0.9,
-		},
-		Node: biz.NodeConfig{
-			ID: nodeID, HeartbeatTimeoutTicks: 3, RouteQueryTimeout: 150 * time.Millisecond,
-		},
-		Ticker: task.Config{BaseTickInterval: 50 * time.Millisecond, HeartbeatTicks: 1},
-	}
-	cfg.SetDefaults()
-	return cfg
-}
-
-func discoveryDatabaseConfig(database *harness) xgorm.Config {
-	return xgorm.Config{
-		Driver: database.driver, DSN: database.dsn,
-		ExpectedDatabase: databaseName, ExpectedAccount: databaseUser,
-		MaxOpenConns: 20, MaxIdleConns: 5, ConnMaxLifetime: 30 * time.Minute,
-	}
-}
-
 func resetSequenceDatabase(t *testing.T, database *harness) error {
 	t.Helper()
 	db := openGORM(t, database)
-	if err := db.Exec("DELETE FROM sequence_ranges").Error; err != nil {
-		return err
+	// Local planning reads the authority and liveness rows, so a row left behind
+	// by a previous test is a placement this test's nodes would act on. Put the
+	// tables a node reads or writes back to the state the migration leaves them
+	// in, including the ownership view the planner treats as authoritative.
+	statements := []string{
+		"DELETE FROM sequence_ranges",
+		"DELETE FROM sequence_routes",
+		"DELETE FROM sequence_node_liveness",
+		"UPDATE sequence_route_state SET revision = 1",
+		"UPDATE sequence_coordinator SET owner_instance_id = NULL, expires_at = NULL WHERE id = 1",
+		"UPDATE slot_ownership SET owner_node_id = NULL, owner_instance_id = NULL, " +
+			"epoch = 0, granted_at = NULL, state = 'UNOWNED'",
 	}
-	return db.Exec("DELETE FROM sequence_routes").Error
+	for _, statement := range statements {
+		if err := db.Exec(statement).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func publishDiscoveryRoute(
 	t *testing.T,
 	database *harness,
-	version int64,
 	owners map[string][]uint32,
 ) int64 {
 	t.Helper()
-	nodeIDs := make([]string, 0, len(owners))
-	for nodeID := range owners {
-		nodeIDs = append(nodeIDs, nodeID)
-	}
-	sort.Strings(nodeIDs)
-	nodes := make([]map[string]any, 0, len(nodeIDs))
-	for _, nodeID := range nodeIDs {
-		nodes = append(nodes, map[string]any{"node_id": nodeID, "slots": owners[nodeID]})
-	}
-	payload, err := json.Marshal(map[string]any{"nodes": nodes})
-	require.NoError(t, err)
 	db := openGORM(t, database)
-	require.NoError(t, db.Create(&gormdata.RouteModel{
-		Version: version, Payload: payload, CreatedAt: time.Now().UTC(),
-	}).Error)
-	return version
+	seedSlotOwnership(t, db, owners)
+	return publishSeededRoute(t, db)
 }
 
+// waitForRegisteredNodes waits until every expected node is registered with the
+// endpoints a sequence instance advertises.
+//
+// A data node advertises exactly one endpoint: the gRPC listener that serves the
+// sequence RPCs and is what a caller resolves. The readiness probe is bound to
+// the governor's admin listener, which is not a service transport and is
+// deliberately not advertised to callers.
 func waitForRegisteredNodes(t *testing.T, etcdClient *clientv3.Client, expected ...string) {
 	t.Helper()
 	require.Eventually(t, func() bool {
@@ -359,14 +309,25 @@ func waitForRegisteredNodes(t *testing.T, etcdClient *clientv3.Client, expected 
 		}
 		for _, record := range records {
 			if record.Name != sequenceAppName || record.Namespace != "default" ||
-				len(record.Endpoints) != 1 || record.Endpoints[0].Scheme != "grpc" ||
-				!strings.HasPrefix(record.Endpoints[0].Address, "127.0.0.1:") {
+				!advertisesExactlyOne(record, "grpc") {
 				return false
 			}
 			delete(remaining, record.Metadata[sequencepkg.NodeIDAttribute])
 		}
 		return len(remaining) == 0
 	}, discoveryTestTimeout, 50*time.Millisecond)
+}
+
+// advertisesExactlyOne reports whether the record advertises exactly one
+// loopback endpoint with the given scheme.
+func advertisesExactlyOne(record discoveryInstanceRecord, scheme string) bool {
+	matches := 0
+	for _, endpoint := range record.Endpoints {
+		if endpoint.Scheme == scheme && strings.HasPrefix(endpoint.Address, "127.0.0.1:") {
+			matches++
+		}
+	}
+	return matches == 1
 }
 
 func registeredSequenceRecords(

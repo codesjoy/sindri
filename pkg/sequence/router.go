@@ -50,6 +50,13 @@ type RouteLoader func(
 type compiledRoute struct {
 	snapshot *sequencev1.RouteSnapshot
 	owners   [SlotCount]string
+	// epochs is the per-slot ownership generation from the snapshot's segments.
+	// Zero means the snapshot carried no ownership view, which is what a
+	// pre-authority snapshot looks like; a caller then has no epoch to send and
+	// the server answers without an epoch comparison.
+	epochs        [SlotCount]uint64
+	hasEpochs     bool
+	layoutVersion int64
 }
 
 type refreshCall struct {
@@ -113,6 +120,45 @@ func (r *Router) Snapshot() *sequencev1.RouteSnapshot {
 		return nil
 	}
 	return proto.Clone(r.current.snapshot).(*sequencev1.RouteSnapshot)
+}
+
+// LayoutVersion returns the slot layout the current snapshot was minted under,
+// or zero when no snapshot has been loaded.
+//
+// A caller sends this with its requests so an owner that hashes keys under a
+// different layout can refuse, rather than answer for slot numbers that mean
+// something else on the caller's side.
+func (r *Router) LayoutVersion() int64 {
+	if r == nil {
+		return 0
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.current == nil {
+		return 0
+	}
+	return r.current.layoutVersion
+}
+
+// EpochOf returns the ownership epoch the current snapshot records for a slot.
+//
+// The second result is false when the snapshot carries no ownership view, which
+// is when the server cannot be told an epoch at all; the caller then sends none
+// and the server answers without comparing one.
+func (r *Router) EpochOf(slot uint32) (uint64, bool) {
+	if r == nil {
+		return 0, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.current == nil || !r.current.hasEpochs || slot >= SlotCount {
+		return 0, false
+	}
+	epoch := r.current.epochs[slot]
+	if epoch == 0 {
+		return 0, false
+	}
+	return epoch, true
 }
 
 // Update validates and publishes a route snapshot.
@@ -288,7 +334,62 @@ func compileRoute(snapshot *sequencev1.RouteSnapshot) (*compiledRoute, error) {
 			SlotCount,
 		)
 	}
+	compiled.layoutVersion = snapshot.GetLayoutVersion()
+	if err := compileSegments(compiled, snapshot.GetSegments()); err != nil {
+		return nil, err
+	}
 	return compiled, nil
+}
+
+// compileSegments records the per-slot epoch view carried by the snapshot.
+//
+// The segments are the authority-backed view, so they must cover every slot
+// exactly once and in order; a snapshot that does not is refused rather than
+// partly applied, because a caller holding a half-filled epoch table would send
+// an epoch for some slots and none for others without knowing which. Absent
+// segments are accepted: that is a snapshot from before ownership was
+// authoritative, and it simply carries no epochs.
+func compileSegments(compiled *compiledRoute, segments []*sequencev1.RouteSegment) error {
+	if len(segments) == 0 {
+		return nil
+	}
+	next := uint32(0)
+	for _, segment := range segments {
+		if segment == nil {
+			return fmt.Errorf("%w: route segment is nil", ErrInvalidRoute)
+		}
+		start, end := segment.GetStartSlot(), segment.GetEndSlot()
+		if end >= SlotCount || end < start {
+			return fmt.Errorf(
+				"%w: route segment [%d,%d] is out of range",
+				ErrInvalidRoute,
+				start,
+				end,
+			)
+		}
+		if start != next {
+			return fmt.Errorf(
+				"%w: route segment does not continue the coverage at slot %d",
+				ErrInvalidRoute,
+				next,
+			)
+		}
+		epoch := segment.GetSlotEpoch()
+		for slot := start; slot <= end; slot++ {
+			compiled.epochs[slot] = epoch
+		}
+		next = end + 1
+	}
+	if next != SlotCount {
+		return fmt.Errorf(
+			"%w: route segments cover %d of %d slots",
+			ErrInvalidRoute,
+			next,
+			SlotCount,
+		)
+	}
+	compiled.hasEpochs = true
+	return nil
 }
 
 func (r *Router) ownerTable() [SlotCount]string {

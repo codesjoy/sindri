@@ -252,8 +252,8 @@ github.com/codesjoy/yggdrasil-ecosystem/modules/polaris/v3 v3.0.0-20260429033927
 github.com/codesjoy/yggdrasil-ecosystem/modules/polaris/v3 v3.0.0-20260429033927-d1bc68f367b9/go.mod h1:VrcoVuVxQ6kq09/FQuq1K/LbCsRd/R9Nwk8AmvbI5M8=
 github.com/codesjoy/yggdrasil-ecosystem/modules/protovalidate/v3 v3.0.0-20260429033927-d1bc68f367b9 h1:8muy9qjPvaVACERlKCKvsSjZ6u3gJJ1PmmBbOHttKP8=
 github.com/codesjoy/yggdrasil-ecosystem/modules/protovalidate/v3 v3.0.0-20260429033927-d1bc68f367b9/go.mod h1:PcI/+4jRKTCmn6Y/E8DRZeAo/BL/FV2gp2IC6mZmM6E=
-github.com/codesjoy/yggdrasil/v3 v3.0.0-rc.4 h1:ULBfIMzCKsiS8Hv2tKhHmPDmnOgAmxTHfydC7K6EmNo=
-github.com/codesjoy/yggdrasil/v3 v3.0.0-rc.4/go.mod h1:+pkbfCmTJjxfZtESXHzc5YaSBla0VdCYdVZKbgVVzFM=
+github.com/codesjoy/yggdrasil/v3 v3.0.0-rc.5 h1:gHGIGjmVh+u0CzGyii7TFhGtPrIgZ9SWgqpLmxep5IA=
+github.com/codesjoy/yggdrasil/v3 v3.0.0-rc.5/go.mod h1:+pkbfCmTJjxfZtESXHzc5YaSBla0VdCYdVZKbgVVzFM=
 github.com/containerd/errdefs v1.0.0 h1:tg5yIfIlQIrxYtu9ajqY42W3lpS19XqdxRQeEwYG8PI=
 github.com/containerd/errdefs v1.0.0/go.mod h1:+YBYIdtsnF4Iw6nWZhJcqGSg/dwvV7tyJ/kCkyJ2k+M=
 github.com/containerd/errdefs/pkg v0.3.0 h1:9IKJ06FvyNlexW690DXuQNx2KA2cUJXx151Xdx3ZPPE=

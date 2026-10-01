@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package metrics
+package conf
 
 import (
 	"errors"
@@ -23,18 +23,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestManagedMemory(t *testing.T) {
-	assert.Equal(t, uint64(70), managedMemory(100, 30))
-	assert.Equal(t, uint64(0), managedMemory(30, 30))
-	assert.Equal(t, uint64(0), managedMemory(30, 40))
-}
-
-func TestRuntimeMemorySampler(t *testing.T) {
-	managed, limit := NewRuntimeMemorySampler().MemoryUsage()
-	assert.Positive(t, managed)
-	assert.Positive(t, limit)
-}
 
 func TestValidateMemoryLimit(t *testing.T) {
 	require.NoError(t, ValidateMemoryLimit(MinimumMemoryLimit))
@@ -187,9 +175,12 @@ func TestConfigureMemoryLimit(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var applied int64
+			var memoryLimit *string
+			if test.explicit {
+				memoryLimit = &test.configured
+			}
 			result, err := configureMemoryLimit(
-				test.configured,
-				test.explicit,
+				memoryLimit,
 				test.ratio,
 				nil,
 				memoryLimitDependencies{
@@ -221,7 +212,8 @@ func TestConfigureMemoryLimitAppliesRuntimeSetting(t *testing.T) {
 	previous := debug.SetMemoryLimit(-1)
 	t.Cleanup(func() { debug.SetMemoryLimit(previous) })
 
-	result, err := ConfigureMemoryLimit("128MiB", true, 0.8, nil)
+	memoryLimit := "128MiB"
+	result, err := ConfigureMemoryLimit(&memoryLimit, 0.8, nil)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(128<<20), result.LimitBytes)
 	assert.Equal(t, int64(128<<20), debug.SetMemoryLimit(-1))

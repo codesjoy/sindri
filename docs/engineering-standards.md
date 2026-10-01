@@ -70,14 +70,18 @@ RPC/REST servers, and background-task lifecycle.
 
 | Package | Responsibility | Boundary |
 | --- | --- | --- |
-| `app` | Wire assembly, lifecycle, and registration | MUST NOT contain domain invariants |
-| `conf` | Runtime decoding, defaults, and validation | MUST NOT depend on `app` |
+| `cmd/<service>` | Process entry point, Wire assembly, lifecycle, and registration | MUST NOT contain domain invariants, SQL, or business rules |
+| `conf` | Runtime decoding, defaults, and validation | MUST NOT depend on `cmd/<service>` |
 | `biz` | Aggregates, use cases, repository interfaces, and domain events | MUST NOT depend on transport or persistence implementations |
 | `data` | Database repositories, external clients, and transaction adapters | MUST NOT expose writes that bypass use cases |
 | `service` | RPC/REST handlers, resource-name conversion, and error mapping | MUST NOT build non-parameterized SQL |
 | `task`/`consumer` | Background and event-driven adapters | MUST call business interfaces, not persistence directly |
 
-The dependency direction is `service -> biz <- data`, assembled by `app`.
+The dependency direction is `service -> biz <- data`, assembled by
+`cmd/<service>`. `main.go` stays a process entry point: it parses process flags,
+names the application, and runs Yggdrasil with a short `compose` function that
+loads configuration and calls the Wire injector. `wire.go` carries the providers,
+the business bundle, and mode selection, and `wire_gen.go` is generated.
 
 - Handlers perform protocol validation, resource-name conversion, use-case calls,
   and error mapping only.
@@ -100,21 +104,34 @@ The dependency direction is `service -> biz <- data`, assembled by `app`.
 
 ### Configuration and Wire
 
-Each implementation package (`data`, `service`, `task`, or `consumer`) defines the
-smallest configuration type it needs. The service `conf.Config` is the immutable
-composition root: it decodes, applies defaults, validates modules, and validates
-cross-module invariants. Constructors receive their package config or explicit
-fields, never the whole `*conf.Config`, and must not mutate loaded configuration.
+Each implementation package (`biz`, `data`, `service`, `task`, or `consumer`)
+owns the configuration it reads: the type, its `mapstructure` tags, its
+`default` tags, and its `Validate`. The service `conf.Config` is the immutable
+composition root: it decodes, composes the package-owned sections, and validates
+only the invariants that cross package boundaries. Constructors receive their
+package config or explicit fields, never the whole `*conf.Config`, and must not
+mutate loaded configuration.
+
+Defaults belong on the fields as `default` tags. The framework's configuration
+snapshot applies them after decoding, so a key that was omitted and one stated
+as zero are the same thing: both keep the declared default. `SetDefaults` methods
+are therefore not part of the pattern, and `Validate` MUST refuse only values
+that are wrong at any size -- negative or out-of-range ones -- rather than
+zeroes the framework already filled in.
 
 The allowed dependency direction is:
 
 ```text
-app -> conf -> implementation configuration
-app -> data/service/task/consumer -> biz
+cmd/<service> -> conf -> implementation configuration
+cmd/<service> -> data/service/task/consumer -> biz
 ```
 
 Use `wire.FieldsOf` to expose fields from an already loaded root configuration;
-use `wire.Struct` only to construct a new structure from dependencies.
+use `wire.Struct` only to construct a new structure from dependencies. Providers
+MUST NOT merge one configuration section into another: when a value belongs to a
+different section, the package that owns the configuration reads both sections
+from the type it is given, and Wire only selects the section providers each role
+needs.
 
 ```go
 type Config struct {
@@ -205,3 +222,88 @@ module-isolation, and protocol-generation checks (normally `make build`,
   is available from the remote module source.
 - A dependency module's `replace` directive is ignored by its consumers. Local
   development replacement belongs in `go.work`, never in a published module.
+
+## 8. Git and change review
+
+Git history is part of the repository's engineering interface. Install the
+repository hooks with `make hooks.install`. The pre-commit and commit-msg hooks
+enforce local branch naming and commit-message policy.
+
+### 8.1 Branch names
+
+- Branch names MUST be `main`, `master`, `develop`, or use one of
+  `feature/<description>`, `fix/<description>`, `chore/<description>`,
+  `docs/<description>`, `refactor/<description>`, `release/<description>`, or
+  `hotfix/<description>`.
+- A branch description MUST start with a lowercase letter or digit and may then
+  contain lowercase letters, digits, `.`, `_`, `-`, or `/`.
+- A detached HEAD MUST NOT be used for changes.
+
+### 8.2 Commit messages
+
+Commit messages MUST use one of the following Conventional Commit types:
+`feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`,
+`chore`, or `revert`.
+
+The header MUST use `<type>(<scope>): <description>` or
+`<type>: <description>`. The type and scope MUST be lowercase.
+
+#### Scope selection
+
+[Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/#specification)
+defines `scope` as an optional noun describing a section of the codebase.
+[Angular's commit message format](https://github.com/angular/angular/blob/main/contributing-docs/commit-message-format.md)
+similarly uses the affected package or subsystem. Sindri keeps the field
+syntactically optional but applies these selection rules:
+
+- A commit MUST include a scope when exactly one service, module, bounded
+  context, or reusable package owns the change, even when the change spans
+  multiple layers within that owner. The commit type does not determine whether
+  a scope is needed: `test(sequence): ...` and `docs(sequence): ...` are valid.
+- A commit MUST omit the scope when no single stable owner exists.
+  Repository-wide `build`, `ci`, `docs`, and `chore` changes normally omit it;
+  `style`, `test`, and `revert` follow the same ownership test rather than a
+  type-specific exception. If a mixed change cannot be split, omit the scope
+  and list the affected areas in the body.
+- For cross-service workflows, the scope MUST be the service that owns the
+  user-facing operation. Omit the scope only when ownership is genuinely shared.
+- A scope MUST be one lowercase kebab-case name from a stable service, module,
+  or package boundary, such as `sequence`, `release`, or a reusable package
+  name. Choose the narrowest stable boundary name; do not encode a file or
+  function path.
+- A scope MUST NOT be a layer name (`biz`, `data`, `service`), file type, change
+  verb (`update`, `cleanup`), ticket or issue identifier, author name, release
+  number, or transient project name.
+
+The description MUST start with a lowercase letter, MUST NOT end with a period,
+and the complete header MUST NOT exceed 72 characters. Body lines MUST NOT
+exceed 100 characters.
+
+A small commit MAY omit the body. A body MUST be present when a commit changes
+at least 8 files, adds and deletes at least 200 lines in total, or contains
+multiple behavior changes. A required body MUST contain 1 to 4 concise bullet
+points.
+
+Breaking changes MUST include `!` in the header and a
+`BREAKING CHANGE: <description>` entry in the body. Migration and configuration
+changes MUST still be called out explicitly in the review.
+
+### 8.3 Pull requests and review
+
+Pull requests MUST explain the behavior and architecture impact, identify
+configuration, schema, and API changes, and list the exact commands run.
+Generated files and both dialect migrations MUST be included when their sources
+change.
+
+Each change review SHOULD answer:
+
+- What behavior or contract changed?
+- Which service, module, or package owns the change?
+- What validation and error behavior was added or preserved?
+- Are persistence, configuration, generated output, deployment, or release
+  files affected?
+- Which tests and verification commands were run?
+- Are compatibility, rollback, and observability concerns addressed?
+
+The module and service release rules in section 7 remain authoritative for
+tags, release manifests, and publication order.

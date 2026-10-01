@@ -22,6 +22,10 @@ x-sequence-image: &sequence-image
 
 x-sequence-environment: &sequence-environment
   SKULD_SEQUENCE_APP_NAME: ${SKULD_SEQUENCE_APP_NAME:-github.com.codesjoy.skuld.sequence}
+  # One image, three shapes. The local stack runs both halves in one process;
+  # a production StatefulSet runs its members as data and a separate replica as
+  # control, and the mode is the only difference.
+  SKULD_SEQUENCE_MODE: ${SKULD_SEQUENCE_MODE:-both}
   SKULD_SEQUENCE_DRIVER: ${SKULD_SEQUENCE_DRIVER:-postgres}
   SKULD_SEQUENCE_DSN: ${SKULD_SEQUENCE_DSN:-postgres://skuld_sequence:${SKULD_SEQUENCE_DB_PASSWORD:-skuld-local}@postgres:5432/skuld_sequence?sslmode=disable}
   SKULD_OTLP_ENDPOINT: ${SKULD_OTLP_ENDPOINT:-otel-collector:4317}
@@ -80,6 +84,13 @@ services:
         condition: service_started
     ports:
       - "${SKULD_SEQUENCE_GRPC_PORT:-19010}:19010"
+      # The admin listener is deliberately not published. It carries the
+      # high-availability report next to pprof and the config view, and it binds
+      # loopback inside the container; publishing it would be turning an operator
+      # surface back into a network one. Read it from inside the container:
+      #   docker compose -f deploy/docker/compose.yaml exec sequence \
+      #     bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080; \
+      #              printf "GET /healthz HTTP/1.0\r\n\r\n" >&3; cat <&3'
     restart: unless-stopped
     mem_limit: ${SKULD_SEQUENCE_MEMORY_LIMIT:-1g}
     networks: [backend, observability]

@@ -12,61 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package biz defines the sequence domain: range allocation, slot ownership,
+// placement planning, and the repository interfaces persistence implements.
+
 package biz
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"math"
-	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/codesjoy/pkg/basic/xerror"
-	"github.com/codesjoy/sindri/gen/go/sequence/reason"
+	"github.com/google/uuid"
 )
 
 const (
-	// DefaultStep is the default and minimum range size for each key.
-	DefaultStep int64 = 100
 	// MinStep is the smallest configurable default range size.
 	MinStep int64 = 10
-	// DefaultMaxStep is the default upper bound for dynamically sized ranges.
-	DefaultMaxStep int64 = 10000
-
-	// DefaultPrefetchRatio reserves the next range at the fallback consumed
-	// watermark while the adaptive rate estimate is unavailable.
-	DefaultPrefetchRatio = 0.5
-	// DefaultPrefetchLatencyMultiplier reserves enough time for several reserve attempts.
-	DefaultPrefetchLatencyMultiplier = 4.0
-	// DefaultPrefetchLatencyWindow bounds the age of reserve latency samples.
-	DefaultPrefetchLatencyWindow = 5 * time.Minute
-	// DefaultPrefetchLatencyMinSamples is the number of successful samples required
-	// before the observed p99 replaces the configured reserve timeout.
-	DefaultPrefetchLatencyMinSamples = 100
-	// DefaultPrefetchRateResetAfter resets a key's rate estimate after an idle gap.
-	DefaultPrefetchRateResetAfter = time.Minute
-	// DefaultStepIncreaseThreshold grows ranges expected to be exhausted quickly.
-	DefaultStepIncreaseThreshold = 15 * time.Minute
-	// DefaultStepDecreaseThreshold shrinks ranges expected to last a long time.
-	DefaultStepDecreaseThreshold = 30 * time.Minute
-	// DefaultReserveTimeout bounds each asynchronous range reservation.
-	DefaultReserveTimeout = time.Second
-	// DefaultIdleTimeout evicts key state that has not allocated an ID for a day.
-	DefaultIdleTimeout = 24 * time.Hour
-	// DefaultCleanupInterval advances incremental idle cleanup once per second.
-	DefaultCleanupInterval = time.Second
-	// DefaultCleanupSlotsPerRun bounds routing slots scanned in one cleanup pass.
-	DefaultCleanupSlotsPerRun = 64
-	// DefaultMemoryHighWatermarkRatio leaves headroom below GOMEMLIMIT.
-	DefaultMemoryHighWatermarkRatio = 0.9
 
 	maxCleanupCandidates = 1024
 	// MaxReserveLatencySamples bounds the process-local latency sample ring.
 	MaxReserveLatencySamples = 1024
+	// MaxLinearizationSamples bounds the appendix F.2 allocation record. It is a
+	// ring, so a long run costs a fixed amount of memory and the counters are what
+	// survive it.
+	MaxLinearizationSamples  = 4096
 	rateSampleInterval       = 10 * time.Millisecond
 	rateMinObservation       = 100 * time.Millisecond
 	latencyRecomputeInterval = time.Second
@@ -75,71 +48,6 @@ const (
 	minRetryBackoff          = 5 * time.Millisecond
 	maxRetryBackoff          = 250 * time.Millisecond
 )
-
-// AllocatorConfig contains immutable range allocation settings.
-type AllocatorConfig struct {
-	// LegacyStep only detects the removed allocator.step configuration.
-	LegacyStep                *int64        `mapstructure:"step"`
-	DefaultStep               int64         `mapstructure:"default_step"`
-	MaxStep                   int64         `mapstructure:"max_step"`
-	PrefetchRatio             float64       `mapstructure:"prefetch_ratio"`
-	PrefetchLatencyMultiplier float64       `mapstructure:"prefetch_latency_multiplier"`
-	PrefetchLatencyWindow     time.Duration `mapstructure:"prefetch_latency_window"`
-	PrefetchLatencyMinSamples int           `mapstructure:"prefetch_latency_min_samples"`
-	PrefetchRateResetAfter    time.Duration `mapstructure:"prefetch_rate_reset_after"`
-	StepIncreaseThreshold     time.Duration `mapstructure:"step_increase_threshold"`
-	StepDecreaseThreshold     time.Duration `mapstructure:"step_decrease_threshold"`
-	ReserveTimeout            time.Duration `mapstructure:"reserve_timeout"`
-	IdleTimeout               time.Duration `mapstructure:"idle_timeout"`
-	CleanupInterval           time.Duration `mapstructure:"cleanup_interval"`
-	CleanupSlotsPerRun        int           `mapstructure:"cleanup_slots_per_run"`
-	MemoryHighWatermarkRatio  float64       `mapstructure:"memory_high_watermark_ratio"`
-}
-
-func (c *AllocatorConfig) setDefaults() {
-	if c.DefaultStep == 0 {
-		c.DefaultStep = DefaultStep
-	}
-	if c.MaxStep == 0 {
-		c.MaxStep = DefaultMaxStep
-	}
-	if c.PrefetchRatio == 0 {
-		c.PrefetchRatio = DefaultPrefetchRatio
-	}
-	if c.PrefetchLatencyMultiplier == 0 {
-		c.PrefetchLatencyMultiplier = DefaultPrefetchLatencyMultiplier
-	}
-	if c.PrefetchLatencyWindow == 0 {
-		c.PrefetchLatencyWindow = DefaultPrefetchLatencyWindow
-	}
-	if c.PrefetchLatencyMinSamples == 0 {
-		c.PrefetchLatencyMinSamples = DefaultPrefetchLatencyMinSamples
-	}
-	if c.PrefetchRateResetAfter == 0 {
-		c.PrefetchRateResetAfter = DefaultPrefetchRateResetAfter
-	}
-	if c.StepIncreaseThreshold == 0 {
-		c.StepIncreaseThreshold = DefaultStepIncreaseThreshold
-	}
-	if c.StepDecreaseThreshold == 0 {
-		c.StepDecreaseThreshold = DefaultStepDecreaseThreshold
-	}
-	if c.ReserveTimeout == 0 {
-		c.ReserveTimeout = DefaultReserveTimeout
-	}
-	if c.IdleTimeout == 0 {
-		c.IdleTimeout = DefaultIdleTimeout
-	}
-	if c.CleanupInterval == 0 {
-		c.CleanupInterval = DefaultCleanupInterval
-	}
-	if c.CleanupSlotsPerRun == 0 {
-		c.CleanupSlotsPerRun = DefaultCleanupSlotsPerRun
-	}
-	if c.MemoryHighWatermarkRatio == 0 {
-		c.MemoryHighWatermarkRatio = DefaultMemoryHighWatermarkRatio
-	}
-}
 
 const (
 	// StatePaused indicates that the node must reject allocations.
@@ -150,7 +58,24 @@ const (
 
 // SequenceRepo persists ranges reserved for sequence keys.
 type SequenceRepo interface {
-	ReserveRanges(ctx context.Context, requests []ReservationRequest) ([]SequenceRange, error)
+	// ReserveRanges atomically advances the high watermark of every requested
+	// key and returns the reserved ranges. Every involved slot must still be
+	// held by the presented authority when the transaction runs (section 6.1);
+	// a result that cannot be confirmed must be reported as ErrCommitUncertain
+	// rather than inferred from a later read.
+	ReserveRanges(
+		ctx context.Context,
+		authority ReservationAuthority,
+		requests []ReservationRequest,
+	) ([]SequenceRange, error)
+}
+
+// reservationScope is the store and authority a reservation runs under. It
+// replaces the bare store parameter so a reservation can never be issued
+// without stating the authority it claims.
+type reservationScope struct {
+	store     SequenceRepo
+	authority ReservationAuthority
 }
 
 // ReservationRequest asks the repository to reserve a range for one key.
@@ -170,383 +95,481 @@ type SequenceRange struct {
 	End   int64
 }
 
-type rangeFetch struct {
-	done       chan struct{}
-	background bool
-	reserved   SequenceRange
-	err        error
+// AllocatorStats is a low-cardinality snapshot for allocator telemetry.
+type AllocatorStats struct {
+	CachedKeys        int64
+	AdmissionRejected int64
+	CleanupScanned    int64
+	CleanupEvicted    int64
+	PrefetchStarted   int64
+	PrefetchSucceeded int64
+	PrefetchFailed    int64
+	PrefetchRetries   int64
+	PrefetchFallback  int64
+	ReserveLatencyP99 time.Duration
 }
 
-type keyState struct {
-	allocator   *Allocator
-	next        atomic.Int64
-	start       atomic.Int64
-	end         atomic.Int64
-	generation  atomic.Uint64
-	initialized atomic.Bool
-	lastUsed    atomic.Int64
-	returned    atomic.Int64
-	prefetchAt  atomic.Int64
-	recentBlock atomic.Int64
-	rateGate    atomic.Int64
-	retired     atomic.Bool
-
-	mu           sync.Mutex
-	activeStep   int64
-	standby      *SequenceRange
-	fetch        *rangeFetch
-	retryAfter   time.Time
-	retryAttempt int
-	retryTimer   retryTimer
-
-	rateMu sync.Mutex
-	rate   keyRateEstimator
+// PrepareApply describes a route update scheduled for a future tick.
+type PrepareApply struct {
+	Version   int64
+	ApplyTick int64
+	Slots     []uint32
+	// Generation identifies this plan among the ones computed for the same
+	// version. A local replan may change the slot set without changing the
+	// published revision, so the version alone cannot tell a claim that
+	// belonged to a superseded plan from one that belongs to the current one.
+	Generation uint64
 }
 
-func (k *keyState) allocate(
-	ctx context.Context,
+// Allocator allocates monotonically increasing IDs from reserved ranges.
+type Allocator struct {
+	state atomic.Uint32
+	// stopping latches once the shutdown hook has run. It is separate from
+	// state because the two answer different questions: state says whether
+	// allocation is currently permitted, which a storage blip can change and
+	// change back, while stopping says this process is on its way out, which
+	// nothing reverses.
+	stopping atomic.Bool
+	// linearization records handed-out allocations when a deployment asks for it,
+	// and is nil otherwise. Its counters are the three that must stay at zero.
+	linearization    *LinearizationRecorder
+	linearizationSeq atomic.Uint64
+	// The appendix E counters. They are plain atomics because each one is
+	// incremented on a path that already holds whatever lock it needs, and the
+	// metrics layer reads them without touching the allocator's locks.
+	takeoversGranted atomic.Int64
+	takeoversRefused atomic.Int64
+	epochChanges     atomic.Int64
+	releasesReleased atomic.Int64
+	releasesFailed   atomic.Int64
+	drains           atomic.Int64
+	lastDrainMicros  atomic.Int64
+	lastPauseMicros  atomic.Int64
+	// fenced latches once a platform contract violation has been observed, and
+	// holds the reason. It is separate from stopping and from state because it is
+	// neither a transient condition nor an orderly exit: it says the bounds this
+	// instance's decisions rested on are no longer known to have held, which
+	// nothing in this process can undo.
+	fenced atomic.Pointer[string]
+
+	slotsMu       sync.RWMutex
+	slots         map[uint32]*allocationSlot
+	version       int64
+	versionCh     chan struct{}
+	cleanupSlots  []uint32
+	cleanupCursor int
+
+	store          SequenceRepo
+	ownership      OwnershipRepo
+	instanceID     string
+	cfg            AllocatorConfig
+	ha             HAConfig
+	nodeID         string
+	now            func() time.Time
+	memorySampler  MemorySampler
+	reserveLatency *reserveLatencyTracker
+	afterFunc      func(time.Duration, func()) retryTimer
+	randomFloat64  func() float64
+
+	prepareApply *PrepareApply
+	// planGeneration counts the local plans computed for this instance. It is
+	// what tells a claim that belongs to the plan in force from one that
+	// belonged to a plan a later heartbeat already replaced; both may carry the
+	// same published version, so the version cannot answer that question.
+	planGeneration    uint64
+	claimRetryAfter   atomic.Int64
+	lastCleanup       atomic.Int64
+	cachedKeys        atomic.Int64
+	admissionRejected atomic.Int64
+	cleanupScanned    atomic.Int64
+	cleanupEvicted    atomic.Int64
+	prefetchStarted   atomic.Int64
+	prefetchSucceeded atomic.Int64
+	prefetchFailed    atomic.Int64
+	prefetchRetries   atomic.Int64
+	prefetchFallback  atomic.Int64
+
+	// monoNow is the process-anchored monotonic source for every local-lease
+	// deadline and pause measurement. Wall time is never used for either. It is
+	// a field rather than a method call so a test can drive a process pause,
+	// mirroring the wall-clock now seam above.
+	monoNow func() int64
+	// leaseExpired counts allocations refused because the local lease lapsed.
+	leaseExpired atomic.Int64
+	// pauseViolations counts linearisations that outran MaxPause. Any non-zero
+	// value means the platform broke the bound the local lease was sized for.
+	pauseViolations atomic.Int64
+	// renewalSucceeded and renewalFailed count renewal rounds per slot.
+	renewalSucceeded atomic.Int64
+	renewalFailed    atomic.Int64
+	// gateFenced counts slots closed by a local fence rather than by a route
+	// change.
+	gateFenced atomic.Int64
+
+	logger *slog.Logger
+}
+
+// NewAllocator constructs a paused allocator with no locally owned slots.
+//
+// ownership may be nil, which disables the storage authority fence entirely;
+// production wiring always supplies it. The instance
+// identity is generated here and is unique per process start, which is what
+// makes it a valid fencing identity (section 5.1).
+func NewAllocator(
+	cfg DataPlaneConfig,
 	store SequenceRepo,
-	key string,
-	cfg AllocatorConfig,
-	now func() time.Time,
-) (int64, error) {
-	var (
-		candidate  int64
-		generation uint64
-		hadRange   bool
-	)
-	if k.initialized.Load() {
-		hadRange = true
-		generation = k.generation.Load()
-		candidate = k.next.Add(1)
-		if generation%2 == 0 && k.inActiveRange(candidate) &&
-			generation == k.generation.Load() {
-			k.afterAllocate(store, key, cfg, now, candidate, 1, generation)
-			return candidate, nil
-		}
+	ownership OwnershipRepo,
+	memorySampler MemorySampler,
+	logger *slog.Logger,
+) *Allocator {
+	if logger == nil {
+		logger = slog.Default()
 	}
-
-	id, idGeneration, err := k.allocateSlow(
-		ctx,
-		store,
-		key,
-		cfg,
-		now,
-		candidate,
-		generation,
-		hadRange,
-	)
-	if err != nil {
-		return 0, err
+	if memorySampler == nil {
+		panic("sequence allocator memory sampler is required")
 	}
-	k.afterAllocate(store, key, cfg, now, id, 1, idGeneration)
-	return id, nil
+	obj := &Allocator{
+		slots:         make(map[uint32]*allocationSlot),
+		versionCh:     make(chan struct{}),
+		store:         store,
+		ownership:     ownership,
+		instanceID:    uuid.NewString(),
+		cfg:           cfg.Allocator,
+		ha:            cfg.HA,
+		nodeID:        cfg.Node.ID,
+		now:           time.Now,
+		memorySampler: memorySampler,
+		reserveLatency: newReserveLatencyTracker(
+			cfg.Allocator.PrefetchLatencyWindow,
+			cfg.Allocator.PrefetchLatencyMinSamples,
+			time.Now,
+		),
+		afterFunc:     defaultRetryAfter,
+		randomFloat64: defaultRandomFloat64,
+		logger:        logger,
+	}
+	obj.monoNow = newMonotonicClock().now
+	obj.state.Store(StatePaused)
+	if cfg.HA.LinearizationRecording {
+		// Off by default: a record per allocation is not something the hot path
+		// carries unless a deployment has asked to prove the ordering property
+		// from its own traffic rather than from a test (appendix F.2).
+		obj.linearization = NewLinearizationRecorder(MaxLinearizationSamples)
+	}
+	return obj
 }
 
-func (k *keyState) allocateSlow(
-	ctx context.Context,
-	store SequenceRepo,
-	key string,
-	cfg AllocatorConfig,
-	now func() time.Time,
-	candidate int64,
-	generation uint64,
-	hadRange bool,
-) (int64, uint64, error) {
-	for {
-		k.mu.Lock()
-		if k.initialized.Load() {
-			currentGeneration := k.generation.Load()
-			if hadRange && generation == currentGeneration && k.inActiveRange(candidate) {
-				k.touch(now())
-				k.mu.Unlock()
-				return candidate, currentGeneration, nil
-			}
-
-			candidate = k.next.Add(1)
-			if k.inActiveRange(candidate) {
-				k.touch(now())
-				k.mu.Unlock()
-				return candidate, currentGeneration, nil
-			}
-		}
-
-		if k.standby != nil {
-			id, nextGeneration := k.activateStandbyLocked(now(), 1, cfg)
-			k.mu.Unlock()
-			return id, nextGeneration, nil
-		}
-
-		if k.fetch != nil {
-			fetch := k.fetch
-			k.mu.Unlock()
-			select {
-			case <-ctx.Done():
-				return 0, 0, ctx.Err()
-			case <-fetch.done:
-				if fetch.err != nil && !fetch.background {
-					return 0, 0, fetch.err
-				}
-				continue
-			}
-		}
-
-		step := cfg.DefaultStep
-		if k.initialized.Load() {
-			activeSize := k.end.Load() - k.start.Load() + 1
-			step = k.nextStepLocked(activeSize, cfg)
-		}
-		fetch := &rangeFetch{done: make(chan struct{})}
-		k.fetch = fetch
-		k.clearRetryLocked()
-		k.mu.Unlock()
-
-		started := time.Now()
-		reserved, err := reserveRange(ctx, store, key, step)
-		k.observeAllocationReserve(started, err)
-		k.completeFetch(fetch, reserved, err, cfg, now(), key)
-		if err != nil {
-			return 0, 0, err
-		}
+// LinearizationCounters returns the appendix F.1 counters and whether recording
+// is on. The second result matters as much as the first: without it a zero would
+// read as "checked and clean" rather than "not checked at all".
+func (obj *Allocator) LinearizationCounters() (LinearizationCounters, bool) {
+	if obj.linearization == nil {
+		return LinearizationCounters{}, false
 	}
+	return obj.linearization.Counters(), true
 }
 
-func (k *keyState) afterAllocate(
-	store SequenceRepo,
+// recordLinearization files a handed-out allocation when recording is on.
+//
+// The interval it records is the one this process can see: the request arriving
+// and the response leaving. That is narrower than the caller's own observable
+// window, so it only flags violations that happened strictly inside this
+// process's view, and everything it flags is a real one.
+func (obj *Allocator) recordLinearization(
 	key string,
-	cfg AllocatorConfig,
-	now func() time.Time,
-	id int64,
-	blockSize int64,
-	generation uint64,
+	state *keyState,
+	allocation SequenceAllocation,
+	started time.Time,
 ) {
-	k.recordReturned(id)
-	currentTime := now()
-	k.touch(currentTime)
-	start := k.start.Load()
-	end := k.end.Load()
-	if start <= 0 || end < start {
+	if obj.linearization == nil {
 		return
 	}
-	consumed := id - start + 1
-	if consumed <= 0 {
-		return
+	observation := LinearizationObservation{
+		Key:              key,
+		ID:               allocation.ID,
+		OwnerInstanceID:  obj.instanceID,
+		Epoch:            allocation.SlotEpoch,
+		LinearizationSeq: obj.linearizationSeq.Add(1),
+		RequestStart:     started,
+		ResponseReceived: obj.now(),
 	}
-	k.observeAllocation(currentTime, consumed, blockSize, generation, cfg)
-	if id < k.prefetchAt.Load() {
-		return
+	if state != nil {
+		observation.Generation = state.generation.Load()
 	}
-
-	k.mu.Lock()
-	if generation != k.generation.Load() || k.standby != nil || k.fetch != nil {
-		k.mu.Unlock()
-		return
-	}
-	if currentTime.Before(k.retryAfter) {
-		k.mu.Unlock()
-		return
-	}
-	currentStart := k.start.Load()
-	currentEnd := k.end.Load()
-	currentConsumed := id - currentStart + 1
-	currentSize := currentEnd - currentStart + 1
-	shouldPrefetch, fallback := k.prefetchDecisionLocked(id, cfg)
-	if currentConsumed <= 0 || currentSize <= 0 || !shouldPrefetch {
-		k.mu.Unlock()
-		return
-	}
-	step := k.nextStepLocked(currentSize, cfg)
-	fetch := &rangeFetch{
-		done:       make(chan struct{}),
-		background: true,
-	}
-	k.fetch = fetch
-	if k.retryTimer != nil {
-		k.retryTimer.Stop()
-		k.retryTimer = nil
-	}
-	k.retryAfter = time.Time{}
-	if k.allocator != nil {
-		k.allocator.prefetchStarted.Add(1)
-		if fallback {
-			k.allocator.prefetchFallback.Add(1)
-		}
-	}
-	k.mu.Unlock()
-
-	k.launchBackgroundPrefetch(store, key, fetch, step, cfg)
+	obj.linearization.Record(observation)
 }
 
-func (k *keyState) nextStepLocked(size int64, cfg AllocatorConfig) int64 {
-	step := k.activeStep
-	if step < cfg.DefaultStep {
-		step = cfg.DefaultStep
-	}
-	rate, ready := k.rateSnapshot()
-	if !ready || size <= 0 {
-		return step
-	}
-	seconds := float64(size) / rate
-	if seconds <= 0 {
-		return step
-	}
-	estimatedDuration := time.Duration(math.MaxInt64)
-	if seconds < float64(math.MaxInt64)/float64(time.Second) {
-		estimatedDuration = time.Duration(seconds * float64(time.Second))
-	}
-	switch {
-	case estimatedDuration <= cfg.StepIncreaseThreshold:
-		if step >= cfg.MaxStep/2 {
-			return cfg.MaxStep
-		}
-		return step * 2
-	case estimatedDuration >= cfg.StepDecreaseThreshold:
-		step /= 2
-		if step < cfg.DefaultStep {
-			return cfg.DefaultStep
-		}
-		return step
-	default:
-		return step
+// InstanceID returns the process-start identity presented as owner_instance_id.
+func (obj *Allocator) InstanceID() string { return obj.instanceID }
+
+// Stats returns allocator telemetry.
+func (obj *Allocator) Stats() AllocatorStats {
+	return AllocatorStats{
+		CachedKeys:        obj.cachedKeys.Load(),
+		AdmissionRejected: obj.admissionRejected.Load(),
+		CleanupScanned:    obj.cleanupScanned.Load(),
+		CleanupEvicted:    obj.cleanupEvicted.Load(),
+		PrefetchStarted:   obj.prefetchStarted.Load(),
+		PrefetchSucceeded: obj.prefetchSucceeded.Load(),
+		PrefetchFailed:    obj.prefetchFailed.Load(),
+		PrefetchRetries:   obj.prefetchRetries.Load(),
+		PrefetchFallback:  obj.prefetchFallback.Load(),
+		ReserveLatencyP99: obj.observedReserveP99(),
 	}
 }
 
-func (k *keyState) completeFetch(
-	fetch *rangeFetch,
-	reserved SequenceRange,
-	err error,
-	cfg AllocatorConfig,
-	now time.Time,
-	key string,
-) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if k.fetch != fetch {
-		return
-	}
-	fetch.reserved = reserved
-	fetch.err = err
-	if err == nil {
-		k.standby = &fetch.reserved
-		k.clearRetryLocked()
-		if k.allocator != nil && fetch.background {
-			k.allocator.prefetchSucceeded.Add(1)
-		}
-	} else if fetch.background {
-		if k.allocator != nil {
-			k.allocator.prefetchFailed.Add(1)
-		}
-		k.scheduleRetryLocked(key, cfg, now)
-	}
-	k.fetch = nil
-	close(fetch.done)
+// Pause disables allocation while retaining already reserved local ranges.
+func (obj *Allocator) Pause() {
+	obj.state.Store(StatePaused)
 }
 
-func (k *keyState) activateStandbyLocked(
-	now time.Time,
-	advance int64,
-	cfg AllocatorConfig,
-) (int64, uint64) {
-	reserved := *k.standby
-	k.standby = nil
-	// Odd generations prevent optimistic readers from consuming partially
-	// published bounds while the active range is changing.
-	k.generation.Add(1)
-	k.next.Store(reserved.Start + advance - 1)
-	k.activeStep = reserved.End - reserved.Start + 1
-	k.start.Store(reserved.Start)
-	k.end.Store(reserved.End)
-	generation := k.generation.Add(1)
-	k.initialized.Store(true)
-	k.clearRetryLocked()
-	k.resetPrefetchState(generation, now, 0, cfg)
-	k.touch(now)
-	return reserved.Start, generation
+// Paused reports whether allocation is currently disabled.
+//
+// A fenced instance is paused by definition, and not merely because Fence calls
+// Pause: the pause state alone is not durable enough to carry a fence. Open,
+// which is how applying a route reopens allocation, stores StateReady
+// unconditionally, so an instance that relied on Pause() would resume serving on
+// the next route it applied -- which for a fenced instance is a heartbeat away,
+// since the heartbeat reloads the cached route whenever it finds the allocator
+// paused. Reading the fence here is what makes every Paused() guard on the
+// serving path agree with the readiness report that says this instance is out of
+// service.
+func (obj *Allocator) Paused() bool {
+	return obj.state.Load() == StatePaused || obj.fenced.Load() != nil
 }
 
-func reserveRange(
-	ctx context.Context,
-	store SequenceRepo,
-	key string,
-	step int64,
-) (SequenceRange, error) {
-	ranges, err := reserveRanges(ctx, store, []ReservationRequest{{Key: key, Step: step}})
-	if err != nil {
-		return SequenceRange{}, err
-	}
-	return ranges[0], nil
+// Readiness reports whether this instance should receive traffic, and why.
+//
+// The reason is meant to be read by whoever is looking at a failing probe, so
+// it names the state rather than the counter behind it.
+type Readiness struct {
+	// Ready is true when the instance can be sent requests.
+	Ready bool
+	// Reason is the state name: serving, initializing, stopping or fenced.
+	Reason string
 }
 
-func reserveRanges(
-	ctx context.Context,
-	store SequenceRepo,
-	requests []ReservationRequest,
-) ([]SequenceRange, error) {
-	if len(requests) == 0 {
-		return nil, nil
+// Readiness implements the section D.3 readiness signal.
+//
+// Three states are unready, and each is a state a restart repairs or a human
+// must look at: an instance that has never received a route, one that has begun
+// to stop, and one whose platform contract was violated. A storage blip and
+// holding zero slots are deliberately *ready*. The protocol already fails those
+// requests closed with their own retriable reason, and a restart cannot improve
+// either condition, so reporting them unready would turn a recoverable condition
+// into a rolling restart without making anything safer.
+//
+// The fenced state is the exception among the three, and it is the reason this
+// method reads it: once the storage clock has moved past its asserted bound, the
+// bounds every earlier decision rested on are no longer known to have held, so
+// the instance must leave the service rather than keep answering from them.
+//
+// A route version of zero means no route has ever been applied. Route versions
+// come from the directory revision, which starts at one, so this cannot be
+// confused with a deployment that legitimately serves nothing.
+func (obj *Allocator) Readiness() Readiness {
+	// The fence is reported first because it is the one unready state of the three
+	// that a restart does not clear and only a human can act on, and because an
+	// instance can be both fenced and stopping: an operator who marks a fenced
+	// node LEAVING makes it drain and release, which would otherwise hide the
+	// fence behind a "stopping" that reads like an ordinary rollout.
+	if _, fenced := obj.Fenced(); fenced {
+		return Readiness{Reason: "fenced"}
 	}
-	reserved, err := store.ReserveRanges(ctx, requests)
-	if err != nil {
-		return nil, err
+	if obj.stopping.Load() {
+		return Readiness{Reason: "stopping"}
 	}
-	if len(reserved) != len(requests) {
-		return nil, fmt.Errorf(
-			"reserve sequence ranges: got %d ranges for %d requests",
-			len(reserved),
-			len(requests),
+	obj.slotsMu.RLock()
+	version := obj.version
+	obj.slotsMu.RUnlock()
+	if version == 0 {
+		return Readiness{Reason: "initializing"}
+	}
+	return Readiness{Ready: true, Reason: "serving"}
+}
+
+// Fence stops this instance from serving and records why.
+//
+// It is the instance-level counterpart of the per-slot gate, and it exists for
+// failures that no retry of one request can repair: a storage clock that moved
+// past its asserted bound invalidates the bounds every allocation was made
+// under, so no slot is safe to serve from, not merely the one that noticed.
+//
+// The state is set once and never cleared. The instance cannot reconstruct which
+// of its earlier decisions were made while the bound still held, so clearing it
+// would be asserting something it does not know; the process leaves the service
+// until a human has looked at the platform.
+func (obj *Allocator) Fence(reason string) {
+	if obj.fenced.CompareAndSwap(nil, &reason) {
+		obj.logger.Error(
+			"sequence instance fenced",
+			append(obj.ownershipLogArgs(), "reason", reason)...,
 		)
 	}
-	for index, request := range requests {
-		item := reserved[index]
-		if err := validateReservedRange(request.Key, request.Step, item); err != nil {
-			return nil, err
+	obj.Pause()
+}
+
+// Fenced reports whether this instance has been fenced, and why.
+func (obj *Allocator) Fenced() (string, bool) {
+	reason := obj.fenced.Load()
+	if reason == nil {
+		return "", false
+	}
+	return *reason, true
+}
+
+// Shutdown stops serving and gives back the slot authority this instance holds.
+//
+// It marks the instance unready first, so a probe can fail the instance before
+// the process stops accepting. Then it closes every slot and drains and
+// releases each one, following the section 6.3 order: a slot whose in-flight
+// allocations do not reach zero is deliberately left held, because releasing it
+// could let a new owner start while this instance can still hand out an id from
+// its cached range.
+//
+// A release that does not finish leaves the authority to expire through the
+// quiet window. That is slower for whoever takes over but never incorrect,
+// which is why this is allowed to return without an error: the caller has
+// nothing useful to do about it, and failing the shutdown would not release
+// anything.
+func (obj *Allocator) Shutdown() {
+	obj.stopping.Store(true)
+	obj.state.Store(StatePaused)
+	obj.slotsMu.Lock()
+	detached := obj.detachAllLocked()
+	obj.slotsMu.Unlock()
+	obj.drainAndRelease(detached)
+}
+
+// HAStats is the appendix E view of what the ownership protocol has been doing.
+//
+// It is deliberately low cardinality. The two questions an operator asks about a
+// takeover are "how many" and "how long", and neither needs a per-slot label:
+// sixteen thousand slots would turn every counter into sixteen thousand series
+// and the answer would be unreadable.
+type HAStats struct {
+	// TakeoversGranted counts slots this instance took over, each of which moved
+	// the epoch; TakeoversRefused counts attempts that were still inside the
+	// quiet window.
+	TakeoversGranted int64
+	TakeoversRefused int64
+	// EpochChanges counts the slots whose epoch this instance moved. It equals the
+	// grants above today, and is kept separately because a release that is later
+	// re-acquired is an epoch change that is not a takeover.
+	EpochChanges int64
+	// ReleasesReleased counts slots this instance gave back through the explicit
+	// CAS; ReleasesFailed counts release attempts that errored, which leave the
+	// authority in place until its lease lapses.
+	ReleasesReleased int64
+	ReleasesFailed   int64
+	// Drains counts drain-and-release passes, and LastDrainSeconds how long the
+	// most recent one took. A drain that keeps timing out is the operationally
+	// interesting case, and it is the one that leaves authority held.
+	Drains           int64
+	LastDrainSeconds float64
+	// LastPauseSeconds is the longest interval the most recent allocation spent
+	// between opening its fences and advancing its cursor. It is what P_max is a
+	// bound on, so it is the value an operator compares the bound against.
+	LastPauseSeconds float64
+}
+
+// HAStats returns the appendix E counters.
+func (obj *Allocator) HAStats() HAStats {
+	stats := HAStats{
+		TakeoversGranted: obj.takeoversGranted.Load(),
+		TakeoversRefused: obj.takeoversRefused.Load(),
+		EpochChanges:     obj.epochChanges.Load(),
+		ReleasesReleased: obj.releasesReleased.Load(),
+		ReleasesFailed:   obj.releasesFailed.Load(),
+		Drains:           obj.drains.Load(),
+		LastDrainSeconds: microsToSeconds(obj.lastDrainMicros.Load()),
+		LastPauseSeconds: microsToSeconds(obj.lastPauseMicros.Load()),
+	}
+	return stats
+}
+
+// SlotStateCounts reports how many slots this instance holds and how many it has
+// closed. The totals are what the slot_state series is for: a fleet whose owned
+// count falls without a matching handover is losing coverage, and that is visible
+// without a per-slot label.
+func (obj *Allocator) SlotStateCounts() (owned int64, fenced int64) {
+	obj.slotsMu.RLock()
+	defer obj.slotsMu.RUnlock()
+	for _, slot := range obj.slots {
+		if slot.draining.Load() {
+			fenced++
+			continue
 		}
+		owned++
 	}
-	return reserved, nil
+	return owned, fenced
 }
 
-func validateReservedRange(key string, step int64, reserved SequenceRange) error {
-	if reserved.Start <= 0 || reserved.End < reserved.Start ||
-		reserved.End-reserved.Start+1 != step {
-		return fmt.Errorf(
-			"reserve sequence range for %q: invalid range [%d,%d]",
-			key,
-			reserved.Start,
-			reserved.End,
-		)
-	}
-	return nil
+func microsToSeconds(micros int64) float64 {
+	return float64(micros) / float64(time.Second/time.Microsecond)
 }
 
-func (k *keyState) inActiveRange(id int64) bool {
-	start := k.start.Load()
-	end := k.end.Load()
-	return id >= start && id <= end && start == k.start.Load()
+func secondsToMicros(duration time.Duration) int64 {
+	return duration.Microseconds()
 }
 
-func (k *keyState) touch(now time.Time) {
-	k.lastUsed.Store(now.UnixNano())
-}
-
-func (k *keyState) recordReturned(id int64) {
-	for current := k.returned.Load(); id > current; current = k.returned.Load() {
-		if k.returned.CompareAndSwap(current, id) {
-			return
-		}
-	}
-}
-
-type cleanupCandidate struct {
-	slotID uint32
-	slot   *allocationSlot
-	key    string
-	state  *keyState
-}
-
+// allocationSlot holds the key states of one routing slot plus the local
+// allocation gate for it.
 type allocationSlot struct {
 	missMu sync.Mutex
 	states sync.Map
 	count  atomic.Int64
+	// epoch is the ownership generation this instance holds for the slot. It is
+	// the value releases and renewals CAS against, so it must never be reused.
+	epoch atomic.Uint64
+	// inflight counts allocations that are inside the gate. A drain publishes
+	// draining and then waits for this to reach zero, which is what makes
+	// "the old owner stopped first" a decidable fact rather than an assumption
+	// (section 6.3).
+	inflight atomic.Int64
+	// draining closes the slot: no new allocation may linearise once it is set.
+	draining atomic.Bool
+	// localDeadline is the monotonic instant at which the storage lease stops
+	// being trusted locally, or zero when the slot carries no local lease. It is
+	// only consulted on the local-lease execution path.
+	localDeadline atomic.Int64
+	// renewedAt is the monotonic instant of the last successful renewal, used to
+	// pace the next one. A failed renewal leaves it untouched, so the lease may
+	// expire early but never late.
+	renewedAt atomic.Int64
+	// renewing keeps at most one renewal in flight per slot.
+	renewing atomic.Bool
+}
+
+// enter registers an in-flight allocation and reports whether the slot is still
+// open. The counter is incremented before the drain flag is read, so a drain
+// either observes this allocation or rejects it; there is no window in which
+// both are false.
+func (s *allocationSlot) enter() bool {
+	s.inflight.Add(1)
+	if s.draining.Load() {
+		s.inflight.Add(-1)
+		return false
+	}
+	return true
+}
+
+func (s *allocationSlot) leave() { s.inflight.Add(-1) }
+
+// drain closes the slot and waits for in-flight allocations to reach zero.
+// It reports whether the slot reached a quiesced state.
+func (s *allocationSlot) drain(timeout time.Duration) bool {
+	s.draining.Store(true)
+	deadline := time.Now().Add(timeout)
+	for {
+		if s.inflight.Load() == 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (s *allocationSlot) Load(key string) (*keyState, bool) {
@@ -565,154 +588,18 @@ func (s *allocationSlot) Delete(key string) { s.states.Delete(key) }
 
 func (s *allocationSlot) Range(f func(key, value any) bool) { s.states.Range(f) }
 
-// AllocatorStats is a low-cardinality snapshot for allocator telemetry.
-type AllocatorStats struct {
-	CachedKeys        int64
-	AdmissionRejected int64
-	CleanupScanned    int64
-	CleanupEvicted    int64
-	PrefetchStarted   int64
-	PrefetchSucceeded int64
-	PrefetchFailed    int64
-	PrefetchRetries   int64
-	PrefetchFallback  int64
-	ReserveLatencyP99 time.Duration
+type cleanupCandidate struct {
+	slotID uint32
+	slot   *allocationSlot
+	key    string
+	state  *keyState
 }
-
 type cleanupStats struct {
 	scanned          int
 	evicted          int
 	inflight         int
 	discardedActive  int64
 	discardedStandby int64
-}
-
-// PrepareApply describes a route update scheduled for a future tick.
-type PrepareApply struct {
-	Version   int64
-	ApplyTick int64
-	Slots     []uint32
-}
-
-// Allocator allocates monotonically increasing IDs from reserved ranges.
-type Allocator struct {
-	state atomic.Uint32
-
-	slotsMu       sync.RWMutex
-	slots         map[uint32]*allocationSlot
-	version       int64
-	versionCh     chan struct{}
-	cleanupSlots  []uint32
-	cleanupCursor int
-
-	store          SequenceRepo
-	cfg            AllocatorConfig
-	now            func() time.Time
-	memorySampler  MemorySampler
-	reserveLatency *reserveLatencyTracker
-	afterFunc      func(time.Duration, func()) retryTimer
-	randomFloat64  func() float64
-
-	prepareApply      *PrepareApply
-	lastCleanup       atomic.Int64
-	cachedKeys        atomic.Int64
-	admissionRejected atomic.Int64
-	cleanupScanned    atomic.Int64
-	cleanupEvicted    atomic.Int64
-	prefetchStarted   atomic.Int64
-	prefetchSucceeded atomic.Int64
-	prefetchFailed    atomic.Int64
-	prefetchRetries   atomic.Int64
-	prefetchFallback  atomic.Int64
-
-	logger *slog.Logger
-}
-
-// NewAllocator constructs a paused allocator with no locally owned slots.
-func NewAllocator(
-	cfg *AllocatorConfig,
-	store SequenceRepo,
-	memorySampler MemorySampler,
-	logger *slog.Logger,
-) *Allocator {
-	if logger == nil {
-		logger = slog.Default()
-	}
-	if memorySampler == nil {
-		panic("sequence allocator memory sampler is required")
-	}
-	allocatorConfig := *cfg
-	allocatorConfig.setDefaults()
-	obj := &Allocator{
-		slots:         make(map[uint32]*allocationSlot),
-		versionCh:     make(chan struct{}),
-		store:         store,
-		cfg:           allocatorConfig,
-		now:           time.Now,
-		memorySampler: memorySampler,
-		reserveLatency: newReserveLatencyTracker(
-			allocatorConfig.PrefetchLatencyWindow,
-			allocatorConfig.PrefetchLatencyMinSamples,
-			time.Now,
-		),
-		afterFunc:     defaultRetryAfter,
-		randomFloat64: defaultRandomFloat64,
-		logger:        logger,
-	}
-	obj.state.Store(StatePaused)
-	return obj
-}
-
-// FetchNext returns the next ID for a locally owned key.
-func (obj *Allocator) FetchNext(ctx context.Context, key string) (int64, error) {
-	obj.slotsMu.RLock()
-	defer obj.slotsMu.RUnlock()
-	if obj.Paused() {
-		return 0, xerror.NewWithReason(
-			reason.Reason_SEQUENCE_ALLOCATOR_PAUSED,
-			"allocator is already paused",
-			nil,
-		)
-	}
-
-	slot, ok := obj.slots[SlotForKey(key)]
-	if !ok {
-		return 0, xerror.NewWithReason(reason.Reason_SEQUENCE_SLOT_NOT_OWNER, "slot not found", nil)
-	}
-	state, ok := slot.Load(key)
-	if !ok {
-		var err error
-		state, err = obj.loadOrCreateState(key, slot)
-		if err != nil {
-			return 0, err
-		}
-	}
-	id, err := state.allocate(ctx, obj.store, key, obj.cfg, obj.now)
-	if err != nil {
-		return 0, err
-	}
-	return id, nil
-}
-
-func (obj *Allocator) loadOrCreateState(key string, slot *allocationSlot) (*keyState, error) {
-	slot.missMu.Lock()
-	defer slot.missMu.Unlock()
-	if state, ok := slot.Load(key); ok {
-		return state, nil
-	}
-	if obj.memoryHighWatermarkReached() {
-		obj.admissionRejected.Add(1)
-		return nil, xerror.NewWithReason(
-			reason.Reason_SEQUENCE_CAPACITY_EXHAUSTED,
-			"sequence allocator memory capacity is exhausted",
-			nil,
-		)
-	}
-	state := &keyState{allocator: obj}
-	slot.Store(key, state)
-	slot.count.Add(1)
-	obj.cachedKeys.Add(1)
-	return state, nil
 }
 
 func (obj *Allocator) memoryHighWatermarkReached() bool {
@@ -854,153 +741,6 @@ func (obj *Allocator) evictIdleCandidates(
 		obj.slotsMu.Unlock()
 	}
 	return stats
-}
-
-// CurrentVersion returns the version of the active route.
-func (obj *Allocator) CurrentVersion() int64 {
-	obj.slotsMu.RLock()
-	defer obj.slotsMu.RUnlock()
-	return obj.version
-}
-
-// WaitForVersion waits until the allocator has applied at least version.
-func (obj *Allocator) WaitForVersion(ctx context.Context, version int64) error {
-	for {
-		obj.slotsMu.RLock()
-		current := obj.version
-		changed := obj.versionCh
-		obj.slotsMu.RUnlock()
-		if current >= version {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-changed:
-		}
-	}
-}
-
-// Stats returns allocator telemetry.
-func (obj *Allocator) Stats() AllocatorStats {
-	return AllocatorStats{
-		CachedKeys:        obj.cachedKeys.Load(),
-		AdmissionRejected: obj.admissionRejected.Load(),
-		CleanupScanned:    obj.cleanupScanned.Load(),
-		CleanupEvicted:    obj.cleanupEvicted.Load(),
-		PrefetchStarted:   obj.prefetchStarted.Load(),
-		PrefetchSucceeded: obj.prefetchSucceeded.Load(),
-		PrefetchFailed:    obj.prefetchFailed.Load(),
-		PrefetchRetries:   obj.prefetchRetries.Load(),
-		PrefetchFallback:  obj.prefetchFallback.Load(),
-		ReserveLatencyP99: obj.observedReserveP99(),
-	}
-}
-
-// Pause disables allocation while retaining already reserved local ranges.
-func (obj *Allocator) Pause() {
-	obj.state.Store(StatePaused)
-}
-
-// Paused reports whether allocation is currently disabled.
-func (obj *Allocator) Paused() bool { return obj.state.Load() == StatePaused }
-
-// Open schedules a route for activation while reopening allocation.
-func (obj *Allocator) Open(version int64, applyTick int64, slots []uint32) {
-	obj.slotsMu.Lock()
-	defer obj.slotsMu.Unlock()
-	if version > obj.version {
-		for slot := range obj.slots {
-			obj.cachedKeys.Add(-obj.slots[slot].count.Load())
-			obj.cancelSlotRetries(obj.slots[slot])
-			delete(obj.slots, slot)
-		}
-		obj.rebuildCleanupSlotsLocked()
-	}
-	obj.commitRoute(version, applyTick, slots)
-	obj.state.Store(StateReady)
-}
-
-// CommitRoute schedules a route for activation on the next allocation tick.
-func (obj *Allocator) CommitRoute(version int64, applyTick int64, slots []uint32) {
-	obj.slotsMu.Lock()
-	defer obj.slotsMu.Unlock()
-	obj.commitRoute(version, applyTick, slots)
-}
-
-func (obj *Allocator) commitRoute(version int64, applyTick int64, slots []uint32) {
-	needDel := make([]uint32, 0, len(obj.slots))
-	for slot := range obj.slots {
-		if slices.Index(slots, slot) == -1 {
-			needDel = append(needDel, slot)
-		}
-	}
-	for _, slot := range needDel {
-		obj.cachedKeys.Add(-obj.slots[slot].count.Load())
-		obj.cancelSlotRetries(obj.slots[slot])
-		delete(obj.slots, slot)
-	}
-	obj.rebuildCleanupSlotsLocked()
-
-	prepareApply := &PrepareApply{
-		Version:   version,
-		ApplyTick: applyTick,
-		Slots:     []uint32{},
-	}
-	for _, slot := range slots {
-		if _, ok := obj.slots[slot]; !ok {
-			prepareApply.Slots = append(prepareApply.Slots, slot)
-		}
-	}
-
-	// A route version must be applied even when this node's slot set is
-	// unchanged (or empty). Consumers use the allocator version as the
-	// handoff barrier, so leaving prepareApply unset would make them wait
-	// forever after skipping an intermediate route snapshot.
-	if version > obj.version {
-		obj.prepareApply = prepareApply
-		obj.logger.Info(
-			"slot change",
-			slog.Int64("version", version),
-			slog.Int("new_slot_count", len(prepareApply.Slots)),
-		)
-	}
-}
-
-// ApplyRoute atomically replaces the active route and clears drain markers.
-func (obj *Allocator) ApplyRoute(tick int64) {
-	obj.slotsMu.RLock()
-	if obj.prepareApply == nil || obj.prepareApply.ApplyTick > tick {
-		obj.slotsMu.RUnlock()
-		return
-	}
-	obj.slotsMu.RUnlock()
-	obj.slotsMu.Lock()
-	defer obj.slotsMu.Unlock()
-	if obj.prepareApply == nil || obj.prepareApply.ApplyTick > tick {
-		return
-	}
-	for _, slot := range obj.prepareApply.Slots {
-		obj.slots[slot] = &allocationSlot{}
-	}
-	obj.version = obj.prepareApply.Version
-	obj.rebuildCleanupSlotsLocked()
-	close(obj.versionCh)
-	obj.versionCh = make(chan struct{})
-	obj.logger.Info("apply route change", slog.Int64("version", obj.prepareApply.Version))
-	obj.prepareApply = nil
-}
-
-func (obj *Allocator) cancelSlotRetries(slot *allocationSlot) {
-	if slot == nil {
-		return
-	}
-	slot.Range(func(_, value any) bool {
-		if state, ok := value.(*keyState); ok {
-			state.cancelRetry()
-		}
-		return true
-	})
 }
 
 func (obj *Allocator) rebuildCleanupSlotsLocked() {

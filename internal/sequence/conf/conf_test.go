@@ -30,15 +30,44 @@ func validValues(driver string) map[string]any {
 	return map[string]any{
 		"app": map[string]any{
 			"sequence": map[string]any{
+				// The startup shape is required: a process that does not state
+				// one cannot be checked against the components it did start.
+				"mode": "both",
 				"database": map[string]any{
 					"driver": driver, "dsn": "database-dsn",
 					"expected_database": sequenceOwner,
 					"expected_account":  sequenceOwner,
 				},
-				"node": map[string]any{"id": "node-a"},
+				"dataplane": map[string]any{
+					"node": map[string]any{"id": "node-a"},
+					// The platform assertions the ordering argument rests on are
+					// mandatory, so a configuration that is valid at all carries
+					// them.
+					"ha": map[string]any{
+						"pause_verified":    true,
+						"clock_disciplined": true,
+					},
+				},
 			},
 		},
 	}
+}
+
+// sequenceValues returns the app.sequence map a test mutates.
+func sequenceValues(values map[string]any) map[string]any {
+	return values["app"].(map[string]any)["sequence"].(map[string]any)
+}
+
+// dataPlaneValues returns the app.sequence.dataplane map, creating it when the
+// test started from a configuration that has none.
+func dataPlaneValues(values map[string]any) map[string]any {
+	sequence := sequenceValues(values)
+	plane, ok := sequence["dataplane"].(map[string]any)
+	if !ok {
+		plane = map[string]any{}
+		sequence["dataplane"] = plane
+	}
+	return plane
 }
 
 func TestLoadRejectsMissingRuntimeAndSection(t *testing.T) {
@@ -50,7 +79,7 @@ func TestLoadRejectsMissingRuntimeAndSection(t *testing.T) {
 
 func TestLoadRejectsDecodeError(t *testing.T) {
 	values := validValues(xgorm.DriverPostgres)
-	values["app"].(map[string]any)["sequence"].(map[string]any)["allocator"] = map[string]any{
+	dataPlaneValues(values)["allocator"] = map[string]any{
 		"default_step": map[string]any{"invalid": true},
 	}
 	_, err := Load(testkit.NewRuntime(t, values))
@@ -63,76 +92,45 @@ func TestLoadAppliesDefaultsForSupportedDrivers(t *testing.T) {
 			cfg, err := Load(testkit.NewRuntime(t, validValues(driver)))
 			require.NoError(t, err)
 			assert.Equal(t, driver, cfg.Database.Driver)
-			assert.Equal(t, biz.DefaultStep, cfg.Allocator.DefaultStep)
-			assert.Equal(t, biz.DefaultMaxStep, cfg.Allocator.MaxStep)
-			assert.Equal(t, biz.DefaultPrefetchRatio, cfg.Allocator.PrefetchRatio)
-			assert.Equal(
-				t,
-				biz.DefaultPrefetchLatencyMultiplier,
-				cfg.Allocator.PrefetchLatencyMultiplier,
-			)
-			assert.Equal(
-				t,
-				biz.DefaultPrefetchLatencyWindow,
-				cfg.Allocator.PrefetchLatencyWindow,
-			)
-			assert.Equal(
-				t,
-				biz.DefaultPrefetchLatencyMinSamples,
-				cfg.Allocator.PrefetchLatencyMinSamples,
-			)
-			assert.Equal(
-				t,
-				biz.DefaultPrefetchRateResetAfter,
-				cfg.Allocator.PrefetchRateResetAfter,
-			)
-			assert.Equal(
-				t,
-				biz.DefaultStepIncreaseThreshold,
-				cfg.Allocator.StepIncreaseThreshold,
-			)
-			assert.Equal(
-				t,
-				biz.DefaultStepDecreaseThreshold,
-				cfg.Allocator.StepDecreaseThreshold,
-			)
-			assert.Equal(t, biz.DefaultReserveTimeout, cfg.Allocator.ReserveTimeout)
-			assert.Equal(t, biz.DefaultIdleTimeout, cfg.Allocator.IdleTimeout)
-			assert.Equal(t, biz.DefaultCleanupInterval, cfg.Allocator.CleanupInterval)
-			assert.Equal(
-				t,
-				biz.DefaultCleanupSlotsPerRun,
-				cfg.Allocator.CleanupSlotsPerRun,
-			)
-			assert.Equal(
-				t,
-				biz.DefaultMemoryHighWatermarkRatio,
-				cfg.Allocator.MemoryHighWatermarkRatio,
-			)
-			assert.Equal(t, int64(3), cfg.Node.HeartbeatTimeoutTicks)
-			assert.Equal(t, time.Second, cfg.Node.RouteQueryTimeout)
+			assert.Equal(t, int64(100), cfg.DataPlane.Allocator.DefaultStep)
+			assert.Equal(t, int64(10000), cfg.DataPlane.Allocator.MaxStep)
+			assert.Equal(t, 0.5, cfg.DataPlane.Allocator.PrefetchRatio)
+			assert.Equal(t, 5*time.Minute, cfg.DataPlane.Allocator.PrefetchLatencyWindow)
+			assert.Equal(t, 100, cfg.DataPlane.Allocator.PrefetchLatencyMinSamples)
+			assert.Equal(t, time.Minute, cfg.DataPlane.Allocator.PrefetchRateResetAfter)
+			assert.Equal(t, 15*time.Minute, cfg.DataPlane.Allocator.StepIncreaseThreshold)
+			assert.Equal(t, 30*time.Minute, cfg.DataPlane.Allocator.StepDecreaseThreshold)
+			assert.Equal(t, time.Second, cfg.DataPlane.Allocator.ReserveTimeout)
+			assert.Equal(t, 24*time.Hour, cfg.DataPlane.Allocator.IdleTimeout)
+			assert.Equal(t, time.Second, cfg.DataPlane.Allocator.CleanupInterval)
+			assert.Equal(t, 64, cfg.DataPlane.Allocator.CleanupSlotsPerRun)
+			assert.Equal(t, 0.9, cfg.DataPlane.Allocator.MemoryHighWatermarkRatio)
+			assert.Equal(t, 5*time.Second, cfg.DataPlane.HA.QuietWindow)
+			assert.Equal(t, 3*time.Second, cfg.DataPlane.HA.LeaseDuration)
+			assert.Equal(t, time.Second, cfg.DataPlane.HA.RenewInterval)
+			assert.Equal(t, int64(3), cfg.DataPlane.Node.HeartbeatTimeoutTicks)
+			assert.Equal(t, time.Second, cfg.DataPlane.Node.RouteQueryTimeout)
 			assert.Equal(t, time.Second, cfg.Ticker.BaseTickInterval)
 			assert.Equal(t, int64(1), cfg.Ticker.HeartbeatTicks)
 			assert.Equal(t, 20, cfg.Database.MaxOpenConns)
-			assert.Equal(t, DefaultMemoryLimit, cfg.Runtime.MemoryLimit)
+			require.NotNil(t, cfg.Runtime.MemoryLimit)
+			assert.Equal(t, DefaultMemoryLimit, *cfg.Runtime.MemoryLimit)
 			assert.Equal(t, DefaultAutoMemoryLimitRatio, cfg.Runtime.AutoMemoryLimitRatio)
-			assert.False(t, cfg.Runtime.MemoryLimitExplicit())
 		})
 	}
 }
 
 func TestLoadRuntimeMemoryConfiguration(t *testing.T) {
 	values := validValues(xgorm.DriverPostgres)
-	section := values["app"].(map[string]any)["sequence"].(map[string]any)
-	section["runtime"] = map[string]any{
+	sequenceValues(values)["runtime"] = map[string]any{
 		"memory_limit":            "256MiB",
-		"auto_memory_limit_ratio": 0,
+		"auto_memory_limit_ratio": 0.75,
 	}
 	cfg, err := Load(testkit.NewRuntime(t, values))
 	require.NoError(t, err)
-	assert.Equal(t, "256MiB", cfg.Runtime.MemoryLimit)
-	assert.Zero(t, cfg.Runtime.AutoMemoryLimitRatio)
-	assert.True(t, cfg.Runtime.MemoryLimitExplicit())
+	require.NotNil(t, cfg.Runtime.MemoryLimit)
+	assert.Equal(t, "256MiB", *cfg.Runtime.MemoryLimit)
+	assert.Equal(t, 0.75, cfg.Runtime.AutoMemoryLimitRatio)
 }
 
 func TestLoadRejectsInvalidRuntimeMemoryConfiguration(t *testing.T) {
@@ -141,14 +139,11 @@ func TestLoadRejectsInvalidRuntimeMemoryConfiguration(t *testing.T) {
 		{"memory_limit": "63MiB"},
 		{"memory_limit": "9223372036854775807"},
 		{"memory_limit": "1GB"},
-		{"memory_limit": "auto", "auto_memory_limit_ratio": 0},
 		{"memory_limit": "auto", "auto_memory_limit_ratio": 1},
-		{"auto_memory_limit_ratio": 0},
 	}
 	for _, runtimeValues := range tests {
 		values := validValues(xgorm.DriverPostgres)
-		section := values["app"].(map[string]any)["sequence"].(map[string]any)
-		section["runtime"] = runtimeValues
+		sequenceValues(values)["runtime"] = runtimeValues
 		_, err := Load(testkit.NewRuntime(t, values))
 		assert.Error(t, err, "runtime values: %#v", runtimeValues)
 	}
@@ -160,11 +155,170 @@ func TestLoadDefaultsEmptyDriverToPostgres(t *testing.T) {
 	assert.Equal(t, xgorm.DriverPostgres, cfg.Database.Driver)
 }
 
-func TestConfigSetDefaultsAppliesRuntimeDefaults(t *testing.T) {
-	var cfg Config
-	cfg.SetDefaults()
-	assert.Equal(t, DefaultMemoryLimit, cfg.Runtime.MemoryLimit)
+// TestLoadRequiresAStartupMode pins the strict rule the plan calls for: a
+// process that does not state which shape to run cannot be checked against the
+// components it started, and a typo must not fall back to a default.
+func TestLoadRequiresAStartupMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		mode    any
+		present bool
+	}{
+		{name: "missing"},
+		{name: "empty", mode: "", present: true},
+		{name: "unknown", mode: "publisher", present: true},
+		{name: "wrong case", mode: "Data", present: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			values := validValues(xgorm.DriverPostgres)
+			section := sequenceValues(values)
+			if test.present {
+				section["mode"] = test.mode
+			} else {
+				delete(section, "mode")
+			}
+			_, err := Load(testkit.NewRuntime(t, values))
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestParseModeAcceptsOnlyTheThreeShapes(t *testing.T) {
+	for _, mode := range []Mode{ModeData, ModeControl, ModeBoth} {
+		parsed, err := ParseMode(string(mode))
+		require.NoError(t, err)
+		assert.Equal(t, mode, parsed)
+	}
+	_, err := ParseMode("")
+	require.Error(t, err)
+}
+
+func TestModeFromArgsReadsBothSpellings(t *testing.T) {
+	tests := []struct {
+		name  string
+		args  []string
+		value string
+		found bool
+	}{
+		{name: "absent", args: []string{"--config", "sequence.yaml"}},
+		{name: "equals", args: []string{"--mode=control"}, value: "control", found: true},
+		{name: "separate", args: []string{"--mode", "data"}, value: "data", found: true},
+		{name: "single dash", args: []string{"-mode=both"}, value: "both", found: true},
+		{
+			name:  "last wins",
+			args:  []string{"--mode=data", "--mode=control"},
+			value: "control", found: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value, found, err := ModeFromArgs(test.args)
+			require.NoError(t, err)
+			assert.Equal(t, test.found, found)
+			if test.found {
+				assert.Equal(t, test.value, value)
+			}
+		})
+	}
+}
+
+// TestModeFromArgsRefusesAnEmptyValue pins the difference between "not stated"
+// and "stated with nothing": the first falls back to configuration, the second
+// is a startup error rather than a silent default.
+func TestModeFromArgsRefusesAnEmptyValue(t *testing.T) {
+	for _, args := range [][]string{
+		{"--mode"},
+		{"--mode="},
+		{"--mode", "  "},
+	} {
+		_, found, err := ModeFromArgs(args)
+		assert.True(t, found)
+		require.ErrorIs(t, err, ErrModeValue, "args: %#v", args)
+	}
+}
+
+// TestLoadAppliesPlaneDefaults covers the sections the plan moved: the publisher
+// bounds belong to the control plane, and node_ttl sits with the HA bounds the
+// data-plane planner reads.
+func TestLoadAppliesPlaneDefaults(t *testing.T) {
+	cfg, err := Load(testkit.NewRuntime(t, validValues(xgorm.DriverPostgres)))
+	require.NoError(t, err)
+	assert.Equal(t, ModeBoth, cfg.Mode)
+	assert.Equal(t, 15*time.Second, cfg.DataPlane.HA.NodeTTL)
+	assert.Equal(t, int64(1), cfg.ControlPlane.LayoutVersion)
+	assert.Equal(t, 10*time.Second, cfg.ControlPlane.CoordinatorLease)
+	assert.Equal(t, 5*time.Second, cfg.ControlPlane.ReconcileInterval)
+	assert.Equal(t, 3*time.Second, cfg.ControlPlane.PassTimeout)
+	assert.Less(t, cfg.ControlPlane.PassTimeout, cfg.ControlPlane.CoordinatorLease)
+	assert.Less(t, cfg.ControlPlane.ReconcileInterval, cfg.ControlPlane.CoordinatorLease)
+}
+
+// TestControlModeSkipsDataPlaneValidation is the scoping rule as a test: a
+// control replica runs no allocator and no ticker, so requiring it to carry
+// data-plane settings would be requiring configuration for components it never
+// starts.
+func TestControlModeSkipsDataPlaneValidation(t *testing.T) {
+	values := validValues(xgorm.DriverPostgres)
+	sequenceValues(values)["mode"] = string(ModeControl)
+	dataPlaneValues(values)["allocator"] = map[string]any{"default_step": biz.MinStep - 1}
+	cfg, err := Load(testkit.NewRuntime(t, values))
+	require.NoError(t, err)
+	assert.Equal(t, ModeControl, cfg.Mode)
+}
+
+// TestModeEnvironmentRestatesTheConfiguredShape covers the deployment case the
+// override exists for: one config file, a StatefulSet of data nodes and one
+// publisher, differing by the environment alone.
+func TestModeEnvironmentRestatesTheConfiguredShape(t *testing.T) {
+	t.Setenv(ModeEnv, string(ModeData))
+	cfg, err := Load(testkit.NewRuntime(t, validValues(xgorm.DriverPostgres)))
+	require.NoError(t, err)
+	assert.Equal(t, ModeData, cfg.Mode)
+
+	t.Setenv(ModeEnv, "not-a-mode")
+	_, err = Load(testkit.NewRuntime(t, validValues(xgorm.DriverPostgres)))
+	require.Error(t, err, "an override that names no shape must fail the start")
+}
+
+// TestLoadTreatsStatedZerosAsDefaults pins the framework rule the tags exist
+// for: a key the deployment stated as zero is indistinguishable from one it
+// omitted, because the defaults are applied to the decoded value.
+func TestLoadTreatsStatedZerosAsDefaults(t *testing.T) {
+	values := validValues(xgorm.DriverPostgres)
+	plane := dataPlaneValues(values)
+	plane["allocator"] = map[string]any{
+		"prefetch_ratio":               0,
+		"prefetch_latency_min_samples": 0,
+		"reserve_timeout":              "0s",
+	}
+	plane["node"] = map[string]any{"id": "node-a", "route_query_timeout": "0s"}
+	plane["ha"].(map[string]any)["lease_duration"] = "0s"
+	sequenceValues(values)["controlplane"] = map[string]any{
+		"coordinator_lease": "0s",
+		"pass_timeout":      "0s",
+	}
+	sequenceValues(values)["ticker"] = map[string]any{
+		"base_tick_interval": "0s",
+		"heartbeat_ticks":    0,
+	}
+	sequenceValues(values)["runtime"] = map[string]any{
+		"memory_limit":            "auto",
+		"auto_memory_limit_ratio": 0,
+	}
+
+	cfg, err := Load(testkit.NewRuntime(t, values))
+	require.NoError(t, err)
 	assert.Equal(t, DefaultAutoMemoryLimitRatio, cfg.Runtime.AutoMemoryLimitRatio)
+	assert.Equal(t, 0.5, cfg.DataPlane.Allocator.PrefetchRatio)
+	assert.Equal(t, 100, cfg.DataPlane.Allocator.PrefetchLatencyMinSamples)
+	assert.Equal(t, time.Second, cfg.DataPlane.Allocator.ReserveTimeout)
+	assert.Equal(t, time.Second, cfg.DataPlane.Node.RouteQueryTimeout)
+	assert.Equal(t, 3*time.Second, cfg.DataPlane.HA.LeaseDuration)
+	assert.Equal(t, 10*time.Second, cfg.ControlPlane.CoordinatorLease)
+	assert.Equal(t, 3*time.Second, cfg.ControlPlane.PassTimeout)
+	assert.Equal(t, time.Second, cfg.Ticker.BaseTickInterval)
+	assert.Equal(t, int64(1), cfg.Ticker.HeartbeatTicks)
 }
 
 func TestLoadRejectsInvalidContracts(t *testing.T) {
@@ -187,7 +341,7 @@ func TestLoadRejectsInvalidContracts(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			values := validValues(xgorm.DriverPostgres)
-			section := values["app"].(map[string]any)["sequence"].(map[string]any)
+			section := sequenceValues(values)
 			test.mutate(section["database"].(map[string]any))
 			_, err := Load(testkit.NewRuntime(t, values))
 			require.Error(t, err)
@@ -221,12 +375,6 @@ func TestLoadRejectsAllocatorAndSchedulingBoundaries(t *testing.T) {
 			},
 		},
 		{
-			name: "zero prefetch ratio",
-			values: map[string]any{
-				"allocator": map[string]any{"prefetch_ratio": 0},
-			},
-		},
-		{
 			name: "negative prefetch ratio",
 			values: map[string]any{
 				"allocator": map[string]any{"prefetch_ratio": -0.1},
@@ -251,35 +399,11 @@ func TestLoadRejectsAllocatorAndSchedulingBoundaries(t *testing.T) {
 			},
 		},
 		{
-			name: "zero latency window",
-			values: map[string]any{
-				"allocator": map[string]any{"prefetch_latency_window": "0s"},
-			},
-		},
-		{
-			name: "zero latency samples",
-			values: map[string]any{
-				"allocator": map[string]any{"prefetch_latency_min_samples": 0},
-			},
-		},
-		{
 			name: "too many latency samples",
 			values: map[string]any{
 				"allocator": map[string]any{
 					"prefetch_latency_min_samples": biz.MaxReserveLatencySamples + 1,
 				},
-			},
-		},
-		{
-			name: "zero rate reset",
-			values: map[string]any{
-				"allocator": map[string]any{"prefetch_rate_reset_after": "0s"},
-			},
-		},
-		{
-			name: "increase threshold",
-			values: map[string]any{
-				"allocator": map[string]any{"step_increase_threshold": "0s"},
 			},
 		},
 		{
@@ -298,33 +422,15 @@ func TestLoadRejectsAllocatorAndSchedulingBoundaries(t *testing.T) {
 			},
 		},
 		{
-			name: "reserve timeout",
-			values: map[string]any{
-				"allocator": map[string]any{"reserve_timeout": "0s"},
-			},
-		},
-		{
 			name: "negative reserve timeout",
 			values: map[string]any{
 				"allocator": map[string]any{"reserve_timeout": "-1s"},
 			},
 		},
 		{
-			name: "zero idle timeout",
-			values: map[string]any{
-				"allocator": map[string]any{"idle_timeout": "0s"},
-			},
-		},
-		{
 			name: "negative idle timeout",
 			values: map[string]any{
 				"allocator": map[string]any{"idle_timeout": "-1s"},
-			},
-		},
-		{
-			name: "zero cleanup interval",
-			values: map[string]any{
-				"allocator": map[string]any{"cleanup_interval": "0s"},
 			},
 		},
 		{
@@ -343,21 +449,9 @@ func TestLoadRejectsAllocatorAndSchedulingBoundaries(t *testing.T) {
 			},
 		},
 		{
-			name: "zero cleanup slots",
-			values: map[string]any{
-				"allocator": map[string]any{"cleanup_slots_per_run": 0},
-			},
-		},
-		{
 			name: "too many cleanup slots",
 			values: map[string]any{
 				"allocator": map[string]any{"cleanup_slots_per_run": biz.SlotCount + 1},
-			},
-		},
-		{
-			name: "zero memory watermark",
-			values: map[string]any{
-				"allocator": map[string]any{"memory_high_watermark_ratio": 0},
 			},
 		},
 		{
@@ -392,13 +486,27 @@ func TestLoadRejectsAllocatorAndSchedulingBoundaries(t *testing.T) {
 				"ticker": map[string]any{"heartbeat_ticks": 2},
 			},
 		},
+		{
+			name: "control plane pass timeout",
+			values: map[string]any{
+				"controlplane": map[string]any{
+					"coordinator_lease": "10s",
+					"pass_timeout":      "10s",
+				},
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			values := validValues(xgorm.DriverPostgres)
-			section := values["app"].(map[string]any)["sequence"].(map[string]any)
+			section := sequenceValues(values)
 			for key, value := range test.values {
-				section[key] = value
+				switch key {
+				case "allocator", "node", "ha":
+					dataPlaneValues(values)[key] = value
+				default:
+					section[key] = value
+				}
 			}
 			_, err := Load(testkit.NewRuntime(t, values))
 			require.Error(t, err)
@@ -406,15 +514,47 @@ func TestLoadRejectsAllocatorAndSchedulingBoundaries(t *testing.T) {
 	}
 }
 
-func TestAllocatorSnapshotPreservesExplicitZero(t *testing.T) {
+// TestNodeTTLMustExceedTheHeartbeatPeriod pins the rule that crosses the data
+// plane and the ticker: a node that renews less often than its TTL would be
+// dropped from the fleet between its own renewals.
+func TestNodeTTLMustExceedTheHeartbeatPeriod(t *testing.T) {
 	values := validValues(xgorm.DriverPostgres)
-	section := values["app"].(map[string]any)["sequence"].(map[string]any)
-	section["allocator"] = map[string]any{"prefetch_ratio": 0}
-	runtime := testkit.NewRuntime(t, values)
-	allocatorValues := runtime.Config().
-		Section("app", "sequence", "allocator").
-		Map()
-	value, ok := allocatorValues["prefetch_ratio"]
-	require.True(t, ok, "allocator map = %#v", allocatorValues)
-	assert.Equal(t, 0, value)
+	dataPlaneValues(values)["ha"].(map[string]any)["node_ttl"] = "1s"
+	_, err := Load(testkit.NewRuntime(t, values))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "node_ttl")
+}
+
+// TestDeploymentRequiresTheGovernor covers the deployment-shape half of D.12:
+// the report is registered on the governor, so a process that has turned the
+// governor off has nowhere to state which bounds its ordering argument rests on.
+// A deployment that cannot be told what it is claiming is the silent downgrade
+// that section forbids.
+func TestDeploymentRequiresTheGovernor(t *testing.T) {
+	values := validValues(xgorm.DriverPostgres)
+	values["yggdrasil"] = map[string]any{
+		"admin": map[string]any{
+			"governor": map[string]any{"enabled": false},
+		},
+	}
+	_, err := Load(testkit.NewRuntime(t, values))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "yggdrasil.admin.governor")
+}
+
+// TestDeploymentAcceptsAnUnmentionedGovernor keeps the framework's tri-state
+// honest: an unset enabled flag means enabled, so a deployment that never
+// mentions the governor must not be refused for it.
+func TestDeploymentAcceptsAnUnmentionedGovernor(t *testing.T) {
+	_, err := Load(testkit.NewRuntime(t, validValues(xgorm.DriverPostgres)))
+	require.NoError(t, err)
+}
+
+// TestValidateDeploymentIsAboutTheReportSurface pins that the rule is about the
+// surface the report needs, not about which path is in force: the report is
+// registered for every deployment, so none is exempt.
+func TestValidateDeploymentIsAboutTheReportSurface(t *testing.T) {
+	cfg := Config{}
+	require.Error(t, cfg.ValidateDeployment(false))
+	require.NoError(t, cfg.ValidateDeployment(true))
 }

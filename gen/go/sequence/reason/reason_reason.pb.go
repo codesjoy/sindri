@@ -16,6 +16,12 @@ var Reason_code = map[int32]code.Code{
 	152: code.Code_FAILED_PRECONDITION,
 	153: code.Code_RESOURCE_EXHAUSTED,
 	154: code.Code_FAILED_PRECONDITION,
+	155: code.Code_FAILED_PRECONDITION,
+	156: code.Code_UNAVAILABLE,
+	157: code.Code_FAILED_PRECONDITION,
+	158: code.Code_INVALID_ARGUMENT,
+	159: code.Code_UNAVAILABLE,
+	160: code.Code_UNAVAILABLE,
 }
 
 func (r Reason) Reason() string {

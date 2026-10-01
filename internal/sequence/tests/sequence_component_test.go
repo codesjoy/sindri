@@ -17,13 +17,15 @@ package sequence_test
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"testing"
 	"time"
 
 	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
+	testkit "github.com/codesjoy/sindri/internal/pkg/tests"
 	"github.com/codesjoy/sindri/internal/sequence/biz"
-	gormdata "github.com/codesjoy/sindri/internal/sequence/data/gorm"
+	sequencedata "github.com/codesjoy/sindri/internal/sequence/data"
 	"github.com/codesjoy/sindri/internal/sequence/service"
 	"github.com/codesjoy/yggdrasil/v3/rpc/stream"
 	transportclient "github.com/codesjoy/yggdrasil/v3/transport/runtime/client"
@@ -89,16 +91,22 @@ func TestGeneratedClientDrivesServiceAllocatorAndSQLiteRepo(t *testing.T) {
 		&gorm.Config{},
 	)
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&gormdata.SequenceModel{}, &gormdata.RouteModel{}))
+	require.NoError(t, db.AutoMigrate(
+		&sequencedata.SequenceModel{},
+		&sequencedata.RouteModel{},
+		&sequencedata.OwnershipOutboxModel{},
+	))
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
 
 	key := "orders"
-	repo := gormdata.NewSequenceData(db)
-	allocator := biz.NewAllocator(
-		&biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
+	prepareSQLiteOwnership(t, db, key)
+	repo := sequencedata.NewSequenceData(db)
+	allocator := newComponentAllocator(
+		componentDataPlane(biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100}),
 		repo,
+		sequencedata.NewOwnershipData(db),
 		testMemorySampler{},
 		nil,
 	)
@@ -116,22 +124,34 @@ func TestGeneratedClientDrivesServiceAllocatorAndSQLiteRepo(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), first.Id)
 
-	restarted := biz.NewAllocator(
-		&biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
-		gormdata.NewSequenceData(db),
+	restarted := newComponentAllocator(
+		componentDataPlane(biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100}),
+		sequencedata.NewSequenceData(db),
+		sequencedata.NewOwnershipData(db),
 		testMemorySampler{},
 		nil,
 	)
 	restarted.Open(1, 0, []uint32{biz.SlotForKey(key)})
-	restarted.ApplyRoute(0)
 	restartedClient := sequencev1.NewSequenceGeneratorClient(&inProcessClient{
 		service: service.NewSequenceService(restarted, route),
 	})
-	afterRestart, err := restartedClient.FetchNext(
-		context.Background(),
-		&sequencev1.FetchNextRequest{Key: key},
-	)
-	require.NoError(t, err)
+	// The restarted process takes the slot over from the instance that stopped
+	// holding it, and the authority permits that only once the quiet window has
+	// elapsed on the storage clock. SQLite stores the grant at whole seconds, so
+	// the claim lands on the next storage second rather than on the first retry.
+	var afterRestart *sequencev1.FetchNextResponse
+	require.Eventually(t, func() bool {
+		restarted.ApplyRoute(0)
+		response, fetchErr := restartedClient.FetchNext(
+			context.Background(),
+			&sequencev1.FetchNextRequest{Key: key},
+		)
+		if fetchErr != nil {
+			return false
+		}
+		afterRestart = response
+		return true
+	}, 5*time.Second, 20*time.Millisecond, "the restarted process never took the slot over")
 	assert.Equal(t, int64(11), afterRestart.Id)
 
 	snapshot, err := restartedClient.GetRoute(context.Background(), &sequencev1.GetRouteRequest{})
@@ -145,21 +165,26 @@ func TestAllocatorPrefetchesDatabaseRangeBeforeExhaustion(t *testing.T) {
 		&gorm.Config{},
 	)
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&gormdata.SequenceModel{}))
+	require.NoError(t, db.AutoMigrate(
+		&sequencedata.SequenceModel{},
+		&sequencedata.OwnershipOutboxModel{},
+	))
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
 
 	key := "orders-prefetch"
-	allocator := biz.NewAllocator(
-		&biz.AllocatorConfig{
+	prepareSQLiteOwnership(t, db, key)
+	allocator := newComponentAllocator(
+		componentDataPlane(biz.AllocatorConfig{
 			DefaultStep:    10,
 			MaxStep:        20,
 			PrefetchRatio:  0.5,
 			ReserveTimeout: time.Second,
-		},
-		gormdata.NewSequenceData(db),
+		}),
+		sequencedata.NewSequenceData(db),
+		sequencedata.NewOwnershipData(db),
 		testMemorySampler{},
 		nil,
 	)
@@ -172,11 +197,11 @@ func TestAllocatorPrefetchesDatabaseRangeBeforeExhaustion(t *testing.T) {
 		assert.Equal(t, want, got)
 	}
 	require.Eventually(t, func() bool {
-		var model gormdata.SequenceModel
+		var model sequencedata.SequenceModel
 		if queryErr := db.Where("sequence_key = ?", key).Take(&model).Error; queryErr != nil {
 			return false
 		}
-		return model.MaxID > 10
+		return model.ReservedEnd > 10
 	}, time.Second, 10*time.Millisecond)
 
 	for want := int64(6); want <= 11; want++ {
@@ -192,19 +217,25 @@ func TestGeneratedClientDrivesBatchAllocation(t *testing.T) {
 		&gorm.Config{},
 	)
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&gormdata.SequenceModel{}, &gormdata.RouteModel{}))
+	require.NoError(t, db.AutoMigrate(
+		&sequencedata.SequenceModel{},
+		&sequencedata.RouteModel{},
+		&sequencedata.OwnershipOutboxModel{},
+	))
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
 
 	keys := sameSlotComponentKeys(t, "orders", 3)
+	prepareSQLiteOwnership(t, db, keys...)
 	slots := make([]uint32, len(keys))
 	for index, key := range keys {
 		slots[index] = biz.SlotForKey(key)
 	}
-	allocator := biz.NewAllocator(
-		&biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
-		gormdata.NewSequenceData(db),
+	allocator := newComponentAllocator(
+		componentDataPlane(biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100}),
+		sequencedata.NewSequenceData(db),
+		sequencedata.NewOwnershipData(db),
 		testMemorySampler{},
 		nil,
 	)
@@ -249,3 +280,68 @@ func sameSlotComponentKeys(t *testing.T, base string, count int) []string {
 }
 
 func uint32Pointer(value uint32) *uint32 { return &value }
+
+// componentDataPlane builds the data plane configuration these component tests
+// drive. Every in-memory linearisation is measured against the pause bound, and
+// every held slot serves from a local lease. A zero for either one would discard
+// every allocation rather than weaken the fence, so the block is supplied here.
+// Production injects it from the validated HA section; the arithmetic of the
+// bounds is pinned by the configuration tests and the F.3 model instead of here.
+//
+// The quiet window is scaled down alongside the lease: these tests assert the
+// allocation path, not the platform's real takeover bound, and SQLite measures
+// the age of a grant in whole seconds.
+func componentDataPlane(cfg biz.AllocatorConfig) biz.DataPlaneConfig {
+	plane := biz.DataPlaneConfig{
+		Allocator: cfg,
+		Node:      biz.NodeConfig{ID: "node-a"},
+	}
+	if err := testkit.DecodeDefaults(&plane); err != nil {
+		panic(err)
+	}
+	plane.HA.PauseVerified = true
+	plane.HA.ClockDisciplined = true
+	plane.HA.QuietWindow = 250 * time.Millisecond
+	return plane
+}
+
+// newComponentAllocator builds the allocator these component tests drive.
+func newComponentAllocator(
+	plane biz.DataPlaneConfig,
+	store biz.SequenceRepo,
+	ownership biz.OwnershipRepo,
+	sampler biz.MemorySampler,
+	logger *slog.Logger,
+) *biz.Allocator {
+	return biz.NewAllocator(plane, store, ownership, sampler, logger)
+}
+
+// prepareSQLiteOwnership creates the ownership authority table on the SQLite
+// component database and seeds the given keys' slots as unowned so the
+// allocator can claim them through biz.OwnershipRepo. Production creates
+// slot_ownership with the HA migration; the component database is built from
+// the GORM models, so the authority table is created here.
+func prepareSQLiteOwnership(t *testing.T, db *gorm.DB, keys ...string) {
+	t.Helper()
+	require.NoError(t, db.Exec(
+		"CREATE TABLE IF NOT EXISTS slot_ownership ("+
+			"slot_id integer PRIMARY KEY, "+
+			"owner_node_id varchar(256), "+
+			"owner_instance_id varchar(256), "+
+			"epoch integer NOT NULL DEFAULT 0, "+
+			"granted_at datetime, "+
+			"state varchar(16) NOT NULL DEFAULT 'UNOWNED', "+
+			"updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+	).Error)
+	seen := make(map[uint32]struct{}, len(keys))
+	for _, key := range keys {
+		slot := biz.SlotForKey(key)
+		if _, ok := seen[slot]; ok {
+			continue
+		}
+		seen[slot] = struct{}{}
+		require.NoError(t, db.Exec(
+			"INSERT OR IGNORE INTO slot_ownership (slot_id) VALUES (?)", slot,
+		).Error)
+	}
+}

@@ -17,6 +17,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 
 	"github.com/codesjoy/pkg/basic/xerror"
@@ -52,29 +53,35 @@ func (s *SequenceService) FetchNext(
 	if err != nil {
 		return nil, err
 	}
+	slot := biz.SlotForKey(request.Key)
+	if err = s.checkCallerView(ctx, slot); err != nil {
+		return nil, err
+	}
 	allocation, err := s.allocator.FetchNextN(ctx, request.Key, request.Count)
 	if err == nil {
-		return &sequencev1.FetchNextResponse{
-			Id:    allocation.ID,
-			Count: allocation.Count,
-		}, nil
+		return fetchNextResponse(allocation), nil
 	}
 
 	if !xerror.IsReason(err, reason.Reason_SEQUENCE_SLOT_NOT_OWNER) {
-		return nil, err
+		return nil, s.envelope(err, slot)
 	}
 	if err = s.waitForRouteVersion(ctx); err != nil {
-		return nil, err
+		return nil, s.envelope(err, slot)
 	}
 
 	allocation, err = s.allocator.FetchNextN(ctx, request.Key, request.Count)
 	if err != nil {
-		return nil, err
+		return nil, s.envelope(err, slot)
 	}
+	return fetchNextResponse(allocation), nil
+}
+
+func fetchNextResponse(allocation biz.SequenceAllocation) *sequencev1.FetchNextResponse {
 	return &sequencev1.FetchNextResponse{
-		Id:    allocation.ID,
-		Count: allocation.Count,
-	}, nil
+		Id:        allocation.ID,
+		Count:     allocation.Count,
+		SlotEpoch: allocation.SlotEpoch,
+	}
 }
 
 // FetchNextBatch allocates IDs for a route-homogeneous batch of keys.
@@ -86,23 +93,166 @@ func (s *SequenceService) FetchNextBatch(
 	if err != nil {
 		return nil, err
 	}
+	// The caller groups a batch by owner, so the first key's slot is the one the
+	// whole batch was routed by and the one every failure describes (A.6).
+	slot := biz.SlotForKey(requests[0].Key)
+	if err = s.checkCallerView(ctx, slot); err != nil {
+		return nil, err
+	}
 	allocations, err := s.allocator.FetchNextBatch(ctx, requests)
 	if err == nil {
 		return fetchNextBatchResponse(requests, allocations), nil
 	}
 
 	if !xerror.IsReason(err, reason.Reason_SEQUENCE_SLOT_NOT_OWNER) {
-		return nil, err
+		return nil, s.envelope(err, slot)
 	}
 	if err = s.waitForRouteVersion(ctx); err != nil {
-		return nil, err
+		return nil, s.envelope(err, slot)
 	}
 
 	allocations, err = s.allocator.FetchNextBatch(ctx, requests)
 	if err != nil {
-		return nil, err
+		return nil, s.envelope(err, slot)
 	}
 	return fetchNextBatchResponse(requests, allocations), nil
+}
+
+// checkCallerView compares the caller's own view of the slot with this node's,
+// which is section A.3.
+//
+// The two directions are deliberately not symmetric. A caller that is behind is
+// served: this node holds the slot, and the response carries the epoch that
+// supersedes the caller's, which is the refresh it needs (A.5). A caller that is
+// ahead knows about an ownership this node has not seen, so answering would mean
+// serving from a directory the caller has already moved past; if this node did
+// lose the slot then its own fences would refuse the request anyway, so the
+// check costs nothing and turns a confusing refusal into a refresh hint.
+//
+// A missing or unparseable hint is ignored rather than refused. These keys are
+// optional, an older caller sends neither, and a malformed one is a caller bug
+// that would otherwise be answered permanently instead of being served by a node
+// whose own fences still decide whether it may answer.
+func (s *SequenceService) checkCallerView(ctx context.Context, slot uint32) error {
+	layout, epoch, hasEpoch := callerView(ctx)
+	if layout > 0 {
+		if local := s.route.LayoutVersion(); local > 0 && layout != local {
+			return s.envelope(xerror.NewWithReason(
+				reason.Reason_SEQUENCE_ROUTE_EXPIRED,
+				fmt.Sprintf(
+					"request layout version %d does not match the layout %d in force",
+					layout,
+					local,
+				),
+				nil,
+			), slot)
+		}
+	}
+	if !hasEpoch {
+		return nil
+	}
+	local, ok := s.route.EpochOf(slot)
+	if !ok {
+		// Without an epoch view of its own, this node cannot call the caller's
+		// epoch wrong. Ownership is still enforced by its own fences.
+		return nil
+	}
+	if epoch <= local {
+		return nil
+	}
+	return s.envelope(xerror.NewWithReason(
+		reason.Reason_SEQUENCE_EPOCH_STALE,
+		fmt.Sprintf("request epoch %d is ahead of the epoch %d in force", epoch, local),
+		nil,
+	), slot)
+}
+
+// callerView reads the slot layout and epoch a caller believes are in force.
+func callerView(ctx context.Context) (int64, uint64, bool) {
+	md, ok := metadata.FromInContext(ctx)
+	if !ok {
+		return 0, 0, false
+	}
+	layout := parseMetadataInt(md.Get(sequence.LayoutVersionMetaKey))
+	epoch := parseMetadataUint(md.Get(sequence.SlotEpochMetaKey))
+	return layout, epoch, epoch != 0
+}
+
+// envelope attaches the section A.4 failure envelope to an allocation failure.
+//
+// The reason and the gRPC code already travel; what this adds is what the caller
+// cannot derive: which node to try instead, which epoch is current, whether to
+// refresh or back off, and how long to wait. Rebuilding the error preserves its
+// message and reason, so a caller that only reads those is unaffected.
+func (s *SequenceService) envelope(err error, slot uint32) error {
+	if err == nil {
+		return nil
+	}
+	name, _, _, ok := xerror.ReasonOf(err)
+	if !ok {
+		return err
+	}
+	value, ok := reason.Reason_value[name]
+	if !ok {
+		return err
+	}
+	reasonCode := reason.Reason(value)
+	envelope := map[string]string{sequence.RetryableMetaKey: retryClass(reasonCode)}
+	if owner := s.route.OwnerOf(slot); owner != "" {
+		envelope[sequence.OwnerHintMetaKey] = owner
+	}
+	if epoch, ok := s.route.EpochOf(slot); ok {
+		envelope[sequence.SlotEpochMetaKey] = strconv.FormatUint(epoch, 10)
+	}
+	if after := s.allocator.RetryAfter(reasonCode); after > 0 {
+		envelope[sequence.RetryAfterMetaKey] = after.String()
+	}
+	return xerror.NewWithReason(reasonCode, err.Error(), envelope)
+}
+
+// retryClass maps a reason to the action the appendix A.4 table prescribes for
+// it. The table is the source of these groups, not the gRPC code: two reasons
+// that share a code can need different reactions from the caller.
+func retryClass(r reason.Reason) string {
+	switch r {
+	case reason.Reason_SEQUENCE_SLOT_NOT_OWNER,
+		reason.Reason_SEQUENCE_ROUTE_EXPIRED,
+		reason.Reason_SEQUENCE_EPOCH_STALE,
+		reason.Reason_SEQUENCE_LEASE_EXPIRED:
+		return sequence.RetryAfterRefresh
+	case reason.Reason_SEQUENCE_OWNER_RECOVERING,
+		reason.Reason_SEQUENCE_ALLOCATOR_PAUSED,
+		reason.Reason_SEQUENCE_ROUTE_UNAVAILABLE,
+		reason.Reason_SEQUENCE_COMMIT_UNCERTAIN,
+		reason.Reason_SEQUENCE_STORAGE_UNAVAILABLE:
+		return sequence.RetryAfterBackoff
+	case reason.Reason_SEQUENCE_CAPACITY_EXHAUSTED:
+		return sequence.RetryAfterThrottle
+	default:
+		return sequence.RetryNever
+	}
+}
+
+func parseMetadataInt(values []string) int64 {
+	if len(values) == 0 {
+		return 0
+	}
+	parsed, err := strconv.ParseInt(values[0], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return parsed
+}
+
+func parseMetadataUint(values []string) uint64 {
+	if len(values) == 0 {
+		return 0
+	}
+	parsed, err := strconv.ParseUint(values[0], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return parsed
 }
 
 func (s *SequenceService) waitForRouteVersion(ctx context.Context) error {
@@ -192,9 +342,10 @@ func fetchNextBatchResponse(
 	}
 	for index, allocation := range allocations {
 		response.Results[index] = &sequencev1.FetchNextBatchResult{
-			Key:   requests[index].Key,
-			Id:    allocation.ID,
-			Count: allocation.Count,
+			Key:       requests[index].Key,
+			Id:        allocation.ID,
+			Count:     allocation.Count,
+			SlotEpoch: allocation.SlotEpoch,
 		}
 	}
 	return response
@@ -217,8 +368,10 @@ func (s *SequenceService) GetRoute(
 		return &sequencev1.GetRouteResponse{NotModified: true}, nil
 	}
 	out := &sequencev1.RouteSnapshot{
-		Version: route.Version,
-		Nodes:   make([]*sequencev1.RouteNode, 0, len(route.Nodes)),
+		Version:       route.Version,
+		LayoutVersion: route.LayoutVersion,
+		Nodes:         make([]*sequencev1.RouteNode, 0, len(route.Nodes)),
+		Segments:      make([]*sequencev1.RouteSegment, 0, len(route.Segments)),
 	}
 	for _, node := range route.Nodes {
 		out.Nodes = append(
@@ -228,6 +381,21 @@ func (s *SequenceService) GetRoute(
 				Slots:  append([]uint32(nil), node.Slots...),
 			},
 		)
+	}
+	// Segments carry the per-slot epoch, so they are sent only when the snapshot
+	// has them. A route published from storage ownership always does; a legacy
+	// one does not, and a caller then has no epoch to check rather than a
+	// misleading zero.
+	if len(route.Segments) > 0 {
+		for _, segment := range route.Segments {
+			out.Segments = append(out.Segments, &sequencev1.RouteSegment{
+				StartSlot:       segment.StartSlot,
+				EndSlot:         segment.EndSlot,
+				OwnerNodeId:     segment.OwnerNodeID,
+				OwnerInstanceId: segment.OwnerInstanceID,
+				SlotEpoch:       segment.Epoch,
+			})
+		}
 	}
 	return &sequencev1.GetRouteResponse{Route: out}, nil
 }

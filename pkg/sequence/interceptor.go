@@ -68,7 +68,7 @@ func interceptFetchNext(
 	}
 	slot := SlotForKey(request.GetKey())
 	version := router.Version()
-	err := invokeRouted(ctx, method, request, reply, invoker, slot, version)
+	err := invokeRouted(ctx, method, request, reply, invoker, router, slot, version)
 	if err == nil {
 		return validateFetchNextCount(request, reply)
 	}
@@ -85,6 +85,7 @@ func interceptFetchNext(
 		request,
 		reply,
 		invoker,
+		router,
 		SlotForKey(request.GetKey()),
 		router.Version(),
 	)
@@ -110,7 +111,7 @@ func interceptFetchNextBatch(
 		return err
 	}
 	version := router.Version()
-	err = invokeRouted(ctx, method, request, reply, invoker, slot, version)
+	err = invokeRouted(ctx, method, request, reply, invoker, router, slot, version)
 	if err == nil {
 		return validateFetchNextBatchCounts(request, reply)
 	}
@@ -125,7 +126,7 @@ func interceptFetchNextBatch(
 		return err
 	}
 	resetReply(reply)
-	err = invokeRouted(ctx, method, request, reply, invoker, slot, router.Version())
+	err = invokeRouted(ctx, method, request, reply, invoker, router, slot, router.Version())
 	if err != nil {
 		return err
 	}
@@ -165,6 +166,11 @@ func batchAnchorSlot(
 	if owner == "" {
 		return 0, fmt.Errorf("%w: slot %d has no owner", ErrBatchRouteChanged, anchor)
 	}
+	// A batch is sent to one owner under one anchor, so every key must share the
+	// anchor's owner *and* its epoch: a run of slots can change epoch without
+	// changing owner, and the server would otherwise validate the whole batch
+	// against the epoch of the first key (section A.6).
+	anchorEpoch, hasEpoch := router.EpochOf(anchor)
 	for _, item := range request.GetRequests()[1:] {
 		if item == nil {
 			return 0, errors.New("sequence interceptor: batch request is nil")
@@ -178,6 +184,14 @@ func batchAnchorSlot(
 				owners[slot],
 			)
 		}
+		if epoch, ok := router.EpochOf(slot); hasEpoch && (!ok || epoch != anchorEpoch) {
+			return 0, fmt.Errorf(
+				"%w: keys span epochs %d and %d",
+				ErrBatchRouteChanged,
+				anchorEpoch,
+				epoch,
+			)
+		}
 	}
 	return anchor, nil
 }
@@ -188,20 +202,31 @@ func resetReply(reply any) {
 	}
 }
 
+// invokeRouted sends one attempt with the caller's view of the slot attached.
+//
+// The epoch is read here rather than passed in, so a retry after a refresh sends
+// the epoch of the snapshot it is actually routing by. It is omitted when the
+// snapshot carries no ownership view, because a caller that invented an epoch
+// would be telling the owner something it does not know.
 func invokeRouted(
 	ctx context.Context,
 	method string,
 	request any,
 	reply any,
 	invoker interceptor.UnaryInvoker,
+	router *Router,
 	slot uint32,
 	version int64,
 ) error {
 	ctx = WithSlot(ctx, slot)
-	ctx = metadata.WithOutContext(
-		ctx,
-		metadata.Pairs(VersionMetaKey, strconv.FormatInt(version, 10)),
-	)
+	pairs := []string{VersionMetaKey, strconv.FormatInt(version, 10)}
+	if layout := router.LayoutVersion(); layout > 0 {
+		pairs = append(pairs, LayoutVersionMetaKey, strconv.FormatInt(layout, 10))
+	}
+	if epoch, ok := router.EpochOf(slot); ok {
+		pairs = append(pairs, SlotEpochMetaKey, strconv.FormatUint(epoch, 10))
+	}
+	ctx = metadata.WithOutContext(ctx, metadata.Pairs(pairs...))
 	return invoker(ctx, method, request, reply)
 }
 
@@ -251,9 +276,20 @@ func validateFetchNextBatchCounts(
 	return nil
 }
 
+// isRefreshableRouteError reports whether the error means the client's view of
+// the slot directory may be stale.
+//
+// An epoch that moved and a local lease that lapsed both mean the request was
+// routed by a directory revision the server no longer recognises, so the only
+// useful reaction is to refresh the route and try again. A malformed request
+// is deliberately not in this set: retrying it unchanged cannot help. UNAVAILABLE
+// is included wholesale because every reason that maps to it here either is
+// retriable or is already reported with its own code.
 func isRefreshableRouteError(err error) bool {
 	return xerror.IsReason(err, reason.Reason_SEQUENCE_ROUTE_EXPIRED) ||
 		xerror.IsReason(err, reason.Reason_SEQUENCE_SLOT_NOT_OWNER) ||
+		xerror.IsReason(err, reason.Reason_SEQUENCE_EPOCH_STALE) ||
+		xerror.IsReason(err, reason.Reason_SEQUENCE_LEASE_EXPIRED) ||
 		xerror.IsCode(err, code.Code_UNAVAILABLE)
 }
 

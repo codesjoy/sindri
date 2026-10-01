@@ -6,10 +6,13 @@ Sindri keeps all service processes in the root `github.com/codesjoy/sindri` Go
 module. A service adds an independent `gen/go/<service>` module only when its
 generated contracts must be versioned for consumers, and only selected packages
 under `pkg/` are independent modules. Sequence has both. It starts at
-`cmd/sequence/main.go` with
-`configs/sequence.yaml`. Its private code follows
-`service -> biz <- data` under `internal/sequence`; `app` owns Wire
-assembly, `conf` configuration, and `task` background work.
+`cmd/sequence/main.go` with `configs/sequence.yaml`. The command directory is the
+only composition root: `main.go` is the process entry point and `wire.go` owns
+Wire assembly, lifecycle registration, and bundle construction. Its private code
+follows `service -> biz <- data` under `internal/sequence`; each implementation
+package owns the configuration section it reads -- the type, its `mapstructure`
+and `default` tags, and its `Validate` -- `conf` composes those sections and
+validates the invariants that cross them, and `task` owns background work.
 
 Protocol sources, including service-owned reasons, live under
 `api/sindri/<service>`. Never import another service's `internal` packages.

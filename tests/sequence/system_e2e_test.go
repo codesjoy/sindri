@@ -42,16 +42,21 @@ func TestSequenceSystemMySQL(t *testing.T) {
 func (s *SequenceSystemSuite) TestEndToEndAllocationAndRestart() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
+	// Client routing needs a published directory. The data plane does not: the
+	// authority a node plans from is the ownership row it shares with the rest of
+	// the fleet, so a live node claims the slots its own plan hands it and serves
+	// them before any revision exists. What is missing pre-publication is only
+	// the client-visible route.
 	_, err := s.directClient("node-a").GetRoute(ctx, &sequencev1.GetRouteRequest{})
 	s.Require().Error(err)
 	s.True(xerror.IsReason(err, reason.Reason_SEQUENCE_ROUTE_UNAVAILABLE))
-	_, err = s.fetchDirect(ctx, "node-a", "orders", 1)
-	s.Require().Error(err)
-	s.True(xerror.IsReason(err, reason.Reason_SEQUENCE_ALLOCATOR_PAUSED))
+	bootstrapKey := "bootstrap-orders"
+	s.Greater(s.waitForBootstrapAllocation(bootstrapKey), int64(0))
+
 	var rangeCount int64
 	db := openGORM(s.T(), s.h)
 	s.Require().NoError(db.Table("sequence_ranges").Count(&rangeCount).Error)
-	s.Zero(rangeCount, "a node without a route must not reserve a range")
+	s.Positive(rangeCount, "a bootstrap claim reserves the range it serves from")
 
 	route := splitSlots()
 	version := s.publishRoute(route)
@@ -93,15 +98,23 @@ func (s *SequenceSystemSuite) TestEndToEndAllocationAndRestart() {
 			defer wg.Done()
 			callCtx, callCancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer callCancel()
+			started := time.Now()
 			response, fetchErr := routed.FetchNext(
 				callCtx,
 				&sequencev1.FetchNextRequest{Key: key},
 			)
+			received := time.Now()
 			var id int64
 			if response != nil {
 				id = response.GetId()
 			}
-			if recordErr := recorder.record(key, id, fetchErr); recordErr != nil {
+			if recordErr := recorder.record(allocationObservation{
+				Key:      key,
+				ID:       id,
+				Err:      fetchErr,
+				Started:  started,
+				Received: received,
+			}); recordErr != nil {
 				errCh <- recordErr
 			}
 		}()
@@ -111,6 +124,7 @@ func (s *SequenceSystemSuite) TestEndToEndAllocationAndRestart() {
 	for recordErr := range errCh {
 		s.Require().NoError(recordErr)
 	}
+	recorder.assertNoViolations(s.T())
 	beforeRestart := recorder.maxID(key)
 	s.Greater(beforeRestart, previous)
 

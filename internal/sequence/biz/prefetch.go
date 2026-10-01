@@ -19,6 +19,7 @@ import (
 	"math"
 	rand "math/rand/v2"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -529,7 +530,7 @@ func (k *keyState) observeAllocationReserve(start time.Time, err error) {
 }
 
 func (k *keyState) launchBackgroundPrefetch(
-	store SequenceRepo,
+	scope reservationScope,
 	key string,
 	fetch *rangeFetch,
 	step int64,
@@ -539,7 +540,7 @@ func (k *keyState) launchBackgroundPrefetch(
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.ReserveTimeout)
 		defer cancel()
 		started := time.Now()
-		reserved, err := reserveRange(ctx, store, key, step)
+		reserved, err := reserveRange(ctx, k.withEpoch(scope, key), key, step)
 		k.observeAllocationReserve(started, err)
 		now := time.Now
 		if k.allocator != nil {
@@ -657,6 +658,139 @@ func (obj *Allocator) retryPrefetch(
 	obj.prefetchStarted.Add(1)
 	state.mu.Unlock()
 
-	state.launchBackgroundPrefetch(obj.store, key, fetch, step, obj.cfg)
+	state.launchBackgroundPrefetch(obj.scope(), key, fetch, step, obj.cfg)
 	obj.slotsMu.RUnlock()
+}
+
+// LinearizationObservation is one allocation as it was handed out.
+//
+// It carries what appendix F.2 asks a test to record, because the property the
+// protocol promises is about this sequence and cannot be checked from a single
+// process's state: an allocation that hands out a lower id than one a caller
+// already received is the violation, and only the sequence shows it.
+type LinearizationObservation struct {
+	Key              string
+	ID               int64
+	OwnerInstanceID  string
+	Epoch            uint64
+	Generation       uint64
+	LinearizationSeq uint64
+	RequestStart     time.Time
+	ResponseReceived time.Time
+}
+
+// LinearizationCounters are the three that must stay at zero (appendix F.1).
+//
+// They are separate counters rather than one because they mean different things
+// to whoever has to read them: an ordering violation says the protocol's own
+// promise was broken, a duplicate says the same id reached two callers, and a
+// stale delivery says an id arrived after a larger one. The third is the mildest
+// to read and the most direct symptom of the failure this whole design exists to
+// prevent.
+type LinearizationCounters struct {
+	OrderViolations      int64
+	DuplicateDeliveries  int64
+	StaleDeliveries      int64
+	Recorded             int64
+	OrderViolationDetail string
+}
+
+// LinearizationRecorder keeps a bounded record of allocations and checks the
+// ordering property as they arrive.
+//
+// The check is the caller's own observable one (section 1.3): if allocation A
+// returned before request B started, then B's id must be greater. That is a
+// narrower test than a global linearisation order -- two overlapping requests are
+// not compared -- but everything it flags is a real violation, and it needs no
+// coordination between nodes, which is what makes it affordable on the hot path.
+//
+// Recording is off unless a deployment asks for it. The bound is what keeps it
+// affordable when it is on: the ring drops the oldest observation, so a long run
+// costs a fixed amount of memory, and the counters are what survive the ring.
+type LinearizationRecorder struct {
+	capacity int
+
+	mu           sync.Mutex
+	ring         []LinearizationObservation
+	next         int
+	lastComplete map[string]LinearizationObservation
+	counters     LinearizationCounters
+}
+
+// NewLinearizationRecorder constructs a recorder holding at most capacity
+// observations.
+func NewLinearizationRecorder(capacity int) *LinearizationRecorder {
+	if capacity <= 0 {
+		capacity = 1024
+	}
+	return &LinearizationRecorder{
+		capacity:     capacity,
+		ring:         make([]LinearizationObservation, 0, capacity),
+		lastComplete: make(map[string]LinearizationObservation),
+	}
+}
+
+// Record files one allocation and checks it against the last one for its key that
+// had already returned when this request started.
+func (r *LinearizationRecorder) Record(observation LinearizationObservation) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.counters.Recorded++
+
+	if previous, ok := r.lastComplete[observation.Key]; ok &&
+		previous.ResponseReceived.Before(observation.RequestStart) {
+		switch {
+		case observation.ID < previous.ID:
+			r.counters.StaleDeliveries++
+			r.counters.OrderViolations++
+			r.counters.OrderViolationDetail = detail(previous, observation)
+		case observation.ID == previous.ID:
+			r.counters.DuplicateDeliveries++
+			r.counters.OrderViolations++
+			r.counters.OrderViolationDetail = detail(previous, observation)
+		}
+	}
+	if current, ok := r.lastComplete[observation.Key]; !ok ||
+		observation.ResponseReceived.After(current.ResponseReceived) {
+		r.lastComplete[observation.Key] = observation
+	}
+
+	if len(r.ring) < r.capacity {
+		r.ring = append(r.ring, observation)
+		return
+	}
+	r.ring[r.next] = observation
+	r.next = (r.next + 1) % r.capacity
+}
+
+func detail(previous, current LinearizationObservation) string {
+	return previous.OwnerInstanceID + " handed out " +
+		strconv.FormatInt(previous.ID, 10) + " then " + current.OwnerInstanceID + " handed out " +
+		strconv.FormatInt(current.ID, 10) + " for key " + current.Key
+}
+
+// Observations returns a copy of the recorded observations, oldest first.
+func (r *LinearizationRecorder) Observations() []LinearizationObservation {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ordered := make([]LinearizationObservation, 0, len(r.ring))
+	ordered = append(ordered, r.ring[r.next:]...)
+	ordered = append(ordered, r.ring[:r.next]...)
+	return ordered
+}
+
+// Counters returns the accumulated counters.
+func (r *LinearizationRecorder) Counters() LinearizationCounters {
+	if r == nil {
+		return LinearizationCounters{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.counters
 }

@@ -38,6 +38,46 @@ func testRoute(version int64, nodeIDs ...string) *sequencev1.RouteSnapshot {
 	return &sequencev1.RouteSnapshot{Version: version, Nodes: nodes}
 }
 
+// testSegment is one run of slots in a segmented test route. Splitting the space
+// into explicit runs is what lets a test give two slots the same owner under
+// different epochs, which is the case a batch has to notice.
+type testSegment struct {
+	nodeID string
+	epoch  uint64
+	from   uint32
+	to     uint32
+}
+
+// testSegmentedRoute builds a snapshot carrying both views, as a snapshot with
+// authoritative ownership does: the node lists, which an older caller reads, and
+// the ownership segments, which carry the epochs and must agree with them.
+func testSegmentedRoute(
+	version, layout int64,
+	segments ...testSegment,
+) *sequencev1.RouteSnapshot {
+	snapshot := &sequencev1.RouteSnapshot{Version: version, LayoutVersion: layout}
+	nodeIndex := make(map[string]*sequencev1.RouteNode)
+	for _, segment := range segments {
+		snapshot.Segments = append(snapshot.Segments, &sequencev1.RouteSegment{
+			StartSlot:       segment.from,
+			EndSlot:         segment.to,
+			OwnerNodeId:     segment.nodeID,
+			OwnerInstanceId: segment.nodeID + "-instance",
+			SlotEpoch:       segment.epoch,
+		})
+		node, ok := nodeIndex[segment.nodeID]
+		if !ok {
+			node = &sequencev1.RouteNode{NodeId: segment.nodeID}
+			nodeIndex[segment.nodeID] = node
+			snapshot.Nodes = append(snapshot.Nodes, node)
+		}
+		for slot := segment.from; slot <= segment.to; slot++ {
+			node.Slots = append(node.Slots, slot)
+		}
+	}
+	return snapshot
+}
+
 type testRemoteClient struct {
 	mu        sync.Mutex
 	state     remote.State

@@ -34,6 +34,91 @@ func TestSlotForKeyMatchesIEEECRC32(t *testing.T) {
 	}
 }
 
+// newSegmentedTestRouter publishes a snapshot whose loader keeps returning it, so
+// a refreshed attempt sees the same layout and epochs as the first one.
+func newSegmentedTestRouter(t *testing.T, snapshot *sequencev1.RouteSnapshot) *Router {
+	t.Helper()
+	router, err := NewRouter(func(
+		context.Context,
+		int64,
+	) (*sequencev1.GetRouteResponse, error) {
+		return &sequencev1.GetRouteResponse{Route: snapshot}, nil
+	})
+	require.NoError(t, err)
+	require.NoError(t, router.Update(snapshot))
+	return router
+}
+
+// TestRouterCompilesTheOwnershipEpochView covers the caller half of appendix A.2:
+// the snapshot's segments become a per-slot epoch view, and the layout version is
+// retained because it is what a caller sends so an owner hashing under another
+// layout can refuse instead of answering for slot numbers that mean something
+// else.
+func TestRouterCompilesTheOwnershipEpochView(t *testing.T) {
+	router := newSegmentedTestRouter(t, testSegmentedRoute(1, 7,
+		testSegment{nodeID: "node-a", epoch: 3, from: 0, to: 99},
+		testSegment{nodeID: "node-b", epoch: 4, from: 100, to: SlotCount - 1},
+	))
+
+	assert.Equal(t, int64(7), router.LayoutVersion())
+	for slot, want := range map[uint32]uint64{0: 3, 99: 3, 100: 4, SlotCount - 1: 4} {
+		epoch, ok := router.EpochOf(slot)
+		require.True(t, ok, "slot %d must have an epoch", slot)
+		assert.Equal(t, want, epoch, "slot %d", slot)
+	}
+	// The node view still answers, so a caller that reads only it routes the same.
+	assert.Equal(t, "node-b", router.ownerTable()[100])
+}
+
+// TestRouterWithoutSegmentsHasNoEpochView pins the compatibility case: a snapshot
+// from before ownership was authoritative carries no epochs, so a caller sends
+// none and an owner compares none.
+func TestRouterWithoutSegmentsHasNoEpochView(t *testing.T) {
+	router := newSegmentedTestRouter(t, testRoute(1, "node-a"))
+
+	_, ok := router.EpochOf(0)
+	assert.False(t, ok, "a snapshot without segments has no epoch to send")
+	assert.Zero(t, router.LayoutVersion())
+}
+
+// TestRouterRejectsSegmentsThatDoNotCoverTheSpace pins the contract the epoch
+// table rests on. A snapshot whose segments leave a gap, overlap or run short
+// would leave a caller with an epoch for some slots and none for others, without
+// telling it which, so it is refused rather than partly applied.
+func TestRouterRejectsSegmentsThatDoNotCoverTheSpace(t *testing.T) {
+	for name, segments := range map[string][]testSegment{
+		"gap": {
+			{nodeID: "node-a", epoch: 1, from: 1, to: SlotCount - 1},
+		},
+		"short": {
+			{nodeID: "node-a", epoch: 1, from: 0, to: SlotCount - 2},
+		},
+		"overlap": {
+			{nodeID: "node-a", epoch: 1, from: 0, to: 99},
+			{nodeID: "node-b", epoch: 2, from: 99, to: SlotCount - 1},
+		},
+		"inverted": {
+			{nodeID: "node-a", epoch: 1, from: 5, to: 4},
+			{nodeID: "node-b", epoch: 2, from: 5, to: SlotCount - 1},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			router, err := NewRouter(func(
+				context.Context,
+				int64,
+			) (*sequencev1.GetRouteResponse, error) {
+				return nil, errors.New("unused")
+			})
+			require.NoError(t, err)
+			require.ErrorIs(
+				t,
+				router.Update(testSegmentedRoute(1, 1, segments...)),
+				ErrInvalidRoute,
+			)
+		})
+	}
+}
+
 func TestRouterUpdateValidatesCopiesAndOrdersVersions(t *testing.T) {
 	router, err := NewRouter(func(context.Context, int64) (*sequencev1.GetRouteResponse, error) {
 		return nil, errors.New("unused")

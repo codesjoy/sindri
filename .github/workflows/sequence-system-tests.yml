@@ -57,6 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       mysql: ${{ steps.filter.outputs.mysql }}
+      chaos: ${{ steps.filter.outputs.chaos }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -77,6 +78,26 @@ jobs:
               - 'go.sum'
               - 'go.work'
               - 'go.work.sum'
+            # The chaos suite kills, restarts and partitions real node containers, so
+            # it is the only place the failover and fencing paths are exercised end
+            # to end. It runs on a change to any of those paths rather than on every
+            # pull request: it is a 60-minute matrix, and a change that cannot reach
+            # the ownership, placement or control loop cannot break it.
+            chaos:
+              - 'cmd/sequence/**'
+              - 'internal/sequence/biz/**'
+              - 'internal/sequence/data/**'
+              - 'internal/sequence/task/**'
+              - 'internal/sequence/service/**'
+              - 'internal/sequence/conf/**'
+              - 'migrations/sequence/**'
+              - 'tests/sequence/**'
+              - 'go.mod'
+              - 'go.sum'
+              - 'go.work'
+              - 'go.work.sum'
+              - 'Makefile'
+              - '.github/workflows/sequence-system-tests.yml'
 
   modules:
     if: github.event_name == 'pull_request'
@@ -153,7 +174,13 @@ jobs:
           if-no-files-found: warn
 
   chaos:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # `always()` is what keeps the nightly and manual runs alive: the `changes` job
+    # only runs for pull requests, so without it a skipped dependency would skip
+    # chaos on every scheduled run too.
+    needs: changes
+    if: >-
+      always() && (github.event_name != 'pull_request' ||
+      needs.changes.outputs.chaos == 'true')
     strategy:
       fail-fast: false
       matrix:

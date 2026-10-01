@@ -87,6 +87,9 @@ func (s *SequenceSystemSuite) TestDatabaseLatencyPausesAndRecovers() {
 		toxiclient.Attributes{"latency": 350, "jitter": 0},
 	)
 	s.Require().NoError(err)
+	// Every statement the node makes now costs more than the route query's own
+	// timeout, so its heartbeats stop confirming anything and it refuses to
+	// allocate rather than spend a lease it cannot renew.
 	s.Require().Eventually(func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 		defer cancel()
@@ -95,7 +98,22 @@ func (s *SequenceSystemSuite) TestDatabaseLatencyPausesAndRecovers() {
 	}, recoveryDeadline, 50*time.Millisecond)
 
 	removeToxic(s.T(), s.proxies["db-a"], "route-query-latency")
-	after := s.waitForOwnership("node-a", key, version)
+
+	// The stall outlives the quiet window, and that is the protocol working
+	// rather than a fault. Allocation is paused only after three heartbeats have
+	// failed, and each of those heartbeats spans most of the window on its own,
+	// so by the time the refusal is observable the node has been away for
+	// several windows, has left the live set, and node-b has taken the slot
+	// over. A lapsed grant is served by whoever can claim it; the fleet never
+	// hands it back on its own.
+	//
+	// Recovering the key onto the node that was stalled therefore takes the same
+	// step the handoff tests take: authority is staged for the recovered node
+	// once it is back in the live set, and that node has to claim the slot and
+	// serve from it again.
+	s.waitForLiveNode("node-a")
+	recovered := s.publishRoute(allSlots("node-a"))
+	after := s.waitForOwnership("node-a", key, recovered)
 	s.Greater(after, before)
 	s.GreaterOrEqual(s.watermark(key), after)
 }
@@ -171,16 +189,24 @@ func (s *SequenceSystemSuite) TestDeterministicHandoffsAndRestartsUnderLoad() {
 				default:
 				}
 				callCtx, callCancel := context.WithTimeout(ctx, 400*time.Millisecond)
+				started := time.Now()
 				response, err := routed.FetchNext(
 					callCtx,
 					&sequencev1.FetchNextRequest{Key: key},
 				)
+				received := time.Now()
 				callCancel()
 				var id int64
 				if response != nil {
 					id = response.GetId()
 				}
-				if err := recorder.record(key, id, err); err != nil {
+				if err := recorder.record(allocationObservation{
+					Key:      key,
+					ID:       id,
+					Err:      err,
+					Started:  started,
+					Received: received,
+				}); err != nil {
 					select {
 					case errCh <- err:
 					default:
@@ -249,6 +275,7 @@ func (s *SequenceSystemSuite) TestDeterministicHandoffsAndRestartsUnderLoad() {
 	for err := range errCh {
 		s.Require().NoError(err)
 	}
+	recorder.assertNoViolations(s.T())
 	maxID := recorder.maxID(key)
 	s.Greater(maxID, int64(0))
 	s.GreaterOrEqual(s.watermark(key), maxID)

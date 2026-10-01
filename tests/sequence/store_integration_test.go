@@ -19,10 +19,10 @@ package sequence_test
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -48,11 +48,8 @@ import (
 
 	testkit "github.com/codesjoy/sindri/internal/pkg/tests"
 	sharedgorm "github.com/codesjoy/sindri/internal/pkg/xgorm"
-	"github.com/codesjoy/sindri/internal/sequence/app"
 	"github.com/codesjoy/sindri/internal/sequence/biz"
-	"github.com/codesjoy/sindri/internal/sequence/conf"
-	gormdata "github.com/codesjoy/sindri/internal/sequence/data/gorm"
-	"github.com/codesjoy/sindri/internal/sequence/task"
+	sequencedata "github.com/codesjoy/sindri/internal/sequence/data"
 )
 
 const (
@@ -126,6 +123,7 @@ func TestMain(m *testing.M) {
 	}
 
 	exitCode := m.Run()
+	cleanupSequenceBinary()
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer stopCancel()
 	if err := stopHarnesses(stopCtx); err != nil {
@@ -163,72 +161,161 @@ func TestSequenceStoreContractAcrossDialects(t *testing.T) {
 	}
 }
 
-func TestDatabaseIdentityAndAppInitializationAcrossDialects(t *testing.T) {
+// TestSequenceProcessLifecycleAcrossDialects runs the real cmd/sequence binary
+// against every enabled dialect. It replaces the old in-process bundle
+// assertion: what a deployment can observe is the process's readiness surface
+// and the database state its shutdown hooks leave behind, so those are what the
+// test pins rather than the internal shape of the composition.
+func TestSequenceProcessLifecycleAcrossDialects(t *testing.T) {
 	for _, item := range harnesses {
 		t.Run(item.name, func(t *testing.T) {
-			rt := testkit.NewRuntime(t, map[string]any{})
-			cfg := conf.Config{
-				Database: sharedgorm.Config{
-					Driver: item.driver, DSN: item.dsn,
-					ExpectedDatabase: databaseName, ExpectedAccount: databaseUser,
-				},
-				Allocator: biz.AllocatorConfig{
-					DefaultStep:               10,
-					MaxStep:                   100,
-					PrefetchRatio:             biz.DefaultPrefetchRatio,
-					PrefetchLatencyMultiplier: biz.DefaultPrefetchLatencyMultiplier,
-					PrefetchLatencyWindow:     biz.DefaultPrefetchLatencyWindow,
-					PrefetchLatencyMinSamples: biz.DefaultPrefetchLatencyMinSamples,
-					PrefetchRateResetAfter:    biz.DefaultPrefetchRateResetAfter,
-					StepIncreaseThreshold:     biz.DefaultStepIncreaseThreshold,
-					StepDecreaseThreshold:     biz.DefaultStepDecreaseThreshold,
-					ReserveTimeout:            biz.DefaultReserveTimeout,
-					IdleTimeout:               biz.DefaultIdleTimeout,
-					CleanupInterval:           biz.DefaultCleanupInterval,
-					CleanupSlotsPerRun:        biz.DefaultCleanupSlotsPerRun,
-					MemoryHighWatermarkRatio:  biz.DefaultMemoryHighWatermarkRatio,
-				},
-				Node: biz.NodeConfig{
-					ID: "node-a", HeartbeatTimeoutTicks: 3,
-					RouteQueryTimeout: time.Second,
-				},
-				Ticker: task.Config{BaseTickInterval: time.Second, HeartbeatTicks: 1},
-			}
-			cfg.SetDefaults()
-			require.NoError(t, cfg.Validate())
-			bundle, err := app.InitializeBundle(rt, &cfg)
-			require.NoError(t, err)
-			require.Len(t, bundle.RPCBindings, 1)
-			require.Len(t, bundle.Tasks, 1)
-			require.Len(t, bundle.Hooks, 2)
-			for _, hook := range bundle.Hooks {
-				require.NoError(t, hook.Func(context.Background()))
-			}
+			runSequenceProcessLifecycle(t, item)
 		})
 	}
 }
 
+func runSequenceProcessLifecycle(t *testing.T, database *harness) {
+	t.Helper()
+	require.NoError(t, resetSequenceDatabase(t, database))
+	// One bounded pool for the whole test: the readiness and shutdown checks
+	// poll the database, and a fresh pool per poll would exhaust the server's
+	// connection slots before the first assertion settles.
+	db := openGORM(t, database)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(4)
+
+	t.Run("data", func(t *testing.T) {
+		nodeID := "process-data"
+		process := startSequenceProcess(t, sequenceProcessOptions{
+			database:       database,
+			nodeID:         nodeID,
+			configuredMode: "data",
+		})
+
+		// A data process that has never been given a route cannot serve.
+		status, report, err := probeSequenceReadiness(process.readyURL)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusServiceUnavailable, status)
+		assert.False(t, report.Ready)
+		assert.Equal(t, "initializing", report.Reason)
+		require.NotNil(t, report.Data)
+		assert.Nil(t, report.Control, "a data process runs no publisher")
+		assert.InDelta(t, processQuietWindow.Seconds(), report.Data.QuietWindowSeconds, 1e-9)
+		assert.InDelta(t, processLeaseDuration.Seconds(), report.Data.LeaseDurationSeconds, 1e-9)
+		assert.InDelta(t, processMaxPause.Seconds(), report.Data.MaxPauseSeconds, 1e-9)
+
+		// Turning readiness green goes through the real authority: the harness
+		// stages the ownership view, the real publisher materialises the
+		// directory, and the process claims what its own heartbeat reads.
+		publishDiscoveryRoute(t, database, allSlots(nodeID))
+		require.Eventually(t, func() bool {
+			status, report, probeErr := probeSequenceReadiness(process.readyURL)
+			return probeErr == nil && status == http.StatusOK && report.Ready &&
+				report.Data != nil && report.Data.Reason == "serving"
+		}, discoveryTestTimeout, 50*time.Millisecond,
+			"readiness never turned green for node %s", nodeID)
+
+		instanceID := ownedInstanceForNode(t, db, nodeID)
+		require.NotEmpty(t, instanceID, "the process claimed no slot authority")
+		require.Equal(t, int64(1), livenessRows(t, db, nodeID))
+		outboxWatermark := ownershipEventWatermark(t, db)
+
+		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		require.NoError(t, process.stop(stopCtx), "graceful shutdown")
+
+		// The shutdown path is visible in the database, and it is asserted the
+		// way a deployment sees it: the process released the authority it held
+		// (the release events are written by the shutdown hook), it stopped
+		// renewing its liveness row so the node ages out of the fleet's live
+		// set, and the slots it held are assignable to the next process.
+		requireReleaseEventsRecorded(t, db, outboxWatermark)
+		waitForNodeToLeaveLiveSet(t, db, nodeID)
+		requireAuthorityAssignable(t, db, []uint32{0, 1, 2, 3})
+	})
+
+	t.Run("control-mode-override", func(t *testing.T) {
+		// The file says data and the command line says control. The startup mode
+		// an operator states on the command line must win, and the resulting
+		// process must run only the publisher half.
+		process := startSequenceProcess(t, sequenceProcessOptions{
+			database:       database,
+			nodeID:         "process-control",
+			configuredMode: "data",
+			modeOverride:   "control",
+		})
+		require.Eventually(t, func() bool {
+			status, report, probeErr := probeSequenceReadiness(process.readyURL)
+			return probeErr == nil && status == http.StatusOK && report.Ready &&
+				report.Control != nil && report.Data == nil
+		}, discoveryTestTimeout, 50*time.Millisecond, "control readiness never turned green")
+
+		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		require.NoError(t, process.stop(stopCtx), "graceful shutdown")
+	})
+}
+
+// ownedInstanceForNode returns the instance id a node's authority rows carry.
+func ownedInstanceForNode(t *testing.T, db *gorm.DB, nodeID string) string {
+	t.Helper()
+	var instanceID string
+	require.NoError(t, db.Raw(
+		"SELECT owner_instance_id FROM slot_ownership "+
+			"WHERE owner_node_id = ? AND owner_instance_id IS NOT NULL LIMIT 1",
+		nodeID,
+	).Scan(&instanceID).Error)
+	return instanceID
+}
+
+// livenessRows counts a node's rows in the shared liveness view.
+func livenessRows(t *testing.T, db *gorm.DB, nodeID string) int64 {
+	t.Helper()
+	count, err := queryCount(
+		db,
+		"SELECT COUNT(*) FROM sequence_node_liveness WHERE node_id = ?",
+		nodeID,
+	)
+	require.NoError(t, err)
+	return count
+}
+
+// queryCount runs a counting query. It returns the error rather than failing, so
+// it is safe to call from a polling condition.
+func queryCount(db *gorm.DB, query string, args ...any) (int64, error) {
+	var count int64
+	err := db.Raw(query, args...).Scan(&count).Error
+	return count, err
+}
+
 func runRangeContract(t *testing.T, db *gorm.DB, prefix string) {
 	t.Helper()
-	store := gormdata.NewSequenceData(db)
+	store := sequencedata.NewSequenceData(db)
 	key := prefix + "-orders"
-	first, err := reserveRange(context.Background(), store, key, 10)
+	invoicesKey := prefix + "-invoices"
+	concurrentKey := prefix + "-concurrent"
+	overflowKey := prefix + "-overflow"
+	authority := claimOwnedSlots(
+		t, db, prefix+"-range-instance", key, invoicesKey, concurrentKey, overflowKey,
+	)
+	first, err := reserveRange(context.Background(), store, authority, key, 10)
 	require.NoError(t, err)
 	assert.Equal(t, biz.SequenceRange{Start: 1, End: 10}, first)
-	second, err := reserveRange(context.Background(), store, key, 10)
+	second, err := reserveRange(context.Background(), store, authority, key, 10)
 	require.NoError(t, err)
 	assert.Equal(t, biz.SequenceRange{Start: 11, End: 20}, second)
 
-	restarted := gormdata.NewSequenceData(db)
-	third, err := reserveRange(context.Background(), restarted, key, 5)
+	restarted := sequencedata.NewSequenceData(db)
+	third, err := reserveRange(context.Background(), restarted, authority, key, 5)
 	require.NoError(t, err)
 	assert.Equal(t, biz.SequenceRange{Start: 21, End: 25}, third)
-	independent, err := reserveRange(context.Background(), store, prefix+"-invoices", 3)
+	independent, err := reserveRange(context.Background(), store, authority, invoicesKey, 3)
 	require.NoError(t, err)
 	assert.Equal(t, biz.SequenceRange{Start: 1, End: 3}, independent)
-	_, err = reserveRange(context.Background(), store, "", 1)
+	_, err = reserveRange(context.Background(), store, authority, "", 1)
 	require.Error(t, err)
-	_, err = reserveRange(context.Background(), store, key, 0)
+	_, err = reserveRange(context.Background(), store, authority, key, 0)
 	require.Error(t, err)
 
 	const workers = 32
@@ -243,7 +330,8 @@ func runRangeContract(t *testing.T, db *gorm.DB, prefix string) {
 			reserved, reserveErr := reserveRange(
 				context.Background(),
 				store,
-				prefix+"-concurrent",
+				authority,
+				concurrentKey,
 				step,
 			)
 			if reserveErr != nil {
@@ -269,24 +357,62 @@ func runRangeContract(t *testing.T, db *gorm.DB, prefix string) {
 		assert.Equal(t, biz.SequenceRange{Start: start, End: start + step - 1}, reserved)
 	}
 
-	overflowKey := prefix + "-overflow"
-	require.NoError(t, db.Create(&gormdata.SequenceModel{
+	require.NoError(t, db.Create(&sequencedata.SequenceModel{
 		SequenceKey: overflowKey,
-		MaxID:       math.MaxInt64 - 2,
+		ReservedEnd: math.MaxInt64 - 2,
 		UpdatedAt:   time.Now().UTC(),
 	}).Error)
-	_, err = reserveRange(context.Background(), store, overflowKey, 3)
+	_, err = reserveRange(context.Background(), store, authority, overflowKey, 3)
 	require.Error(t, err)
+}
+
+// claimOwnedSlots grants the slots of every key to instanceID in the ownership
+// authority and returns the reservation authority to present when reserving.
+// The store contract tests assert pure watermark tiling, so the slots they
+// touch must be genuinely owned by the instance they reserve as.
+func claimOwnedSlots(
+	t *testing.T,
+	db *gorm.DB,
+	instanceID string,
+	keys ...string,
+) biz.ReservationAuthority {
+	t.Helper()
+	ownership := sequencedata.NewOwnershipData(db)
+	slots := make([]uint32, 0, len(keys))
+	seen := make(map[uint32]struct{}, len(keys))
+	for _, key := range keys {
+		slot := biz.SlotForKey(key)
+		if _, ok := seen[slot]; ok {
+			continue
+		}
+		seen[slot] = struct{}{}
+		slots = append(slots, slot)
+	}
+	outcomes, err := ownership.ClaimSlots(context.Background(), biz.ClaimRequest{
+		Slots:       slots,
+		NodeID:      "test-node",
+		InstanceID:  instanceID,
+		QuietWindow: 0,
+	})
+	require.NoError(t, err)
+	require.Len(t, outcomes, len(slots))
+	for _, outcome := range outcomes {
+		require.True(t, outcome.Granted,
+			"slot %d must be granted to %s", outcome.Ownership.SlotID, instanceID)
+	}
+	return biz.ReservationAuthority{InstanceID: instanceID}
 }
 
 func reserveRange(
 	ctx context.Context,
 	store biz.SequenceRepo,
+	authority biz.ReservationAuthority,
 	key string,
 	step int64,
 ) (biz.SequenceRange, error) {
 	ranges, err := store.ReserveRanges(
 		ctx,
+		authority,
 		[]biz.ReservationRequest{{Key: key, Step: step}},
 	)
 	if err != nil {
@@ -298,11 +424,28 @@ func reserveRange(
 func runBatchRangeContract(t *testing.T, db *gorm.DB, prefix string) {
 	t.Helper()
 	ctx := context.Background()
-	store := gormdata.NewSequenceData(db)
+	store := sequencedata.NewSequenceData(db)
 
+	const (
+		workers   = 8
+		batchKeys = 3
+		step      = int64(5)
+	)
 	firstKey := prefix + "-batch-first"
 	secondKey := prefix + "-batch-second"
-	reserved, err := store.ReserveRanges(ctx, []biz.ReservationRequest{
+	thirdKey := prefix + "-batch-third"
+	batchPrefix := prefix + "-batch-concurrent"
+	overflowKey := prefix + "-batch-overflow"
+	normalKey := prefix + "-batch-normal"
+	claimKeys := []string{
+		firstKey, secondKey, thirdKey, overflowKey, normalKey,
+		prefix + "-batch-cancelled",
+	}
+	for index := range batchKeys {
+		claimKeys = append(claimKeys, fmt.Sprintf("%s-%d", batchPrefix, index))
+	}
+	authority := claimOwnedSlots(t, db, prefix+"-batch-instance", claimKeys...)
+	reserved, err := store.ReserveRanges(ctx, authority, []biz.ReservationRequest{
 		{Key: secondKey, Step: 4},
 		{Key: firstKey, Step: 3},
 	})
@@ -314,9 +457,9 @@ func runBatchRangeContract(t *testing.T, db *gorm.DB, prefix string) {
 	assert.Equal(t, int64(3), maxIDFor(t, db, firstKey))
 	assert.Equal(t, int64(4), maxIDFor(t, db, secondKey))
 
-	mixed, err := store.ReserveRanges(ctx, []biz.ReservationRequest{
+	mixed, err := store.ReserveRanges(ctx, authority, []biz.ReservationRequest{
 		{Key: firstKey, Step: 2},
-		{Key: prefix + "-batch-third", Step: 5},
+		{Key: thirdKey, Step: 5},
 	})
 	require.NoError(t, err)
 	require.Len(t, mixed, 2)
@@ -324,20 +467,14 @@ func runBatchRangeContract(t *testing.T, db *gorm.DB, prefix string) {
 		"existing keys continue from their watermark")
 	assert.Equal(t, biz.SequenceRange{Start: 1, End: 5}, mixed[1])
 
-	_, err = store.ReserveRanges(ctx, nil)
+	_, err = store.ReserveRanges(ctx, authority, nil)
 	require.Error(t, err, "an empty batch must be rejected")
-	_, err = store.ReserveRanges(ctx, []biz.ReservationRequest{
+	_, err = store.ReserveRanges(ctx, authority, []biz.ReservationRequest{
 		{Key: firstKey, Step: 1},
 		{Key: firstKey, Step: 1},
 	})
 	require.Error(t, err, "duplicate keys must be rejected")
 
-	const (
-		workers   = 8
-		batchKeys = 3
-		step      = int64(5)
-	)
-	batchPrefix := prefix + "-batch-concurrent"
 	results := make(chan []biz.SequenceRange, workers)
 	errs := make(chan error, workers)
 	var wait sync.WaitGroup
@@ -352,7 +489,7 @@ func runBatchRangeContract(t *testing.T, db *gorm.DB, prefix string) {
 					Step: step,
 				}
 			}
-			ranges, reserveErr := store.ReserveRanges(context.Background(), requests)
+			ranges, reserveErr := store.ReserveRanges(context.Background(), authority, requests)
 			if reserveErr != nil {
 				errs <- reserveErr
 				return
@@ -383,15 +520,13 @@ func runBatchRangeContract(t *testing.T, db *gorm.DB, prefix string) {
 		}
 	}
 
-	overflowKey := prefix + "-batch-overflow"
-	normalKey := prefix + "-batch-normal"
 	overflowMax := int64(math.MaxInt64 - 2)
-	require.NoError(t, db.Create(&gormdata.SequenceModel{
+	require.NoError(t, db.Create(&sequencedata.SequenceModel{
 		SequenceKey: overflowKey,
-		MaxID:       overflowMax,
+		ReservedEnd: overflowMax,
 		UpdatedAt:   time.Now().UTC(),
 	}).Error)
-	_, err = store.ReserveRanges(ctx, []biz.ReservationRequest{
+	_, err = store.ReserveRanges(ctx, authority, []biz.ReservationRequest{
 		{Key: normalKey, Step: 6},
 		{Key: overflowKey, Step: 3},
 	})
@@ -401,8 +536,8 @@ func runBatchRangeContract(t *testing.T, db *gorm.DB, prefix string) {
 	assert.Equal(t, overflowMax, maxIDFor(t, db, overflowKey))
 
 	require.NoError(t, db.Where("sequence_key = ?", overflowKey).
-		Delete(&gormdata.SequenceModel{}).Error)
-	reserved, err = store.ReserveRanges(ctx, []biz.ReservationRequest{
+		Delete(&sequencedata.SequenceModel{}).Error)
+	reserved, err = store.ReserveRanges(ctx, authority, []biz.ReservationRequest{
 		{Key: normalKey, Step: 6},
 		{Key: overflowKey, Step: 3},
 	})
@@ -413,7 +548,7 @@ func runBatchRangeContract(t *testing.T, db *gorm.DB, prefix string) {
 
 	cancelledCtx, cancel := context.WithCancel(ctx)
 	cancel()
-	_, err = store.ReserveRanges(cancelledCtx, []biz.ReservationRequest{{
+	_, err = store.ReserveRanges(cancelledCtx, authority, []biz.ReservationRequest{{
 		Key:  prefix + "-batch-cancelled",
 		Step: 1,
 	}})
@@ -422,24 +557,24 @@ func runBatchRangeContract(t *testing.T, db *gorm.DB, prefix string) {
 
 func maxIDFor(t *testing.T, db *gorm.DB, key string) int64 {
 	t.Helper()
-	var model gormdata.SequenceModel
+	var model sequencedata.SequenceModel
 	err := db.Where("sequence_key = ?", key).Take(&model).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return 0
 	}
 	require.NoError(t, err)
-	return model.MaxID
+	return model.ReservedEnd
 }
 
 func runRouteContract(t *testing.T, db *gorm.DB, prefix string) {
 	t.Helper()
-	store := gormdata.NewRouteModel(db)
+	store := sequencedata.NewRouteModel(db)
 	baseVersion := int64(10)
 	if prefix == "mysql" {
 		baseVersion = 20
 	}
 	for _, version := range []int64{baseVersion, baseVersion + 1} {
-		require.NoError(t, db.Create(&gormdata.RouteModel{
+		require.NoError(t, db.Create(&sequencedata.RouteModel{
 			Version: version, Payload: completeRoutePayload(t), CreatedAt: time.Now().UTC(),
 		}).Error)
 	}
@@ -458,13 +593,17 @@ func runRouteContract(t *testing.T, db *gorm.DB, prefix string) {
 
 func completeRoutePayload(t *testing.T) []byte {
 	t.Helper()
-	slots := make([]uint32, biz.SlotCount)
-	for index := range slots {
-		slots[index] = uint32(index)
+	view := make([]biz.Ownership, int(biz.SlotCount))
+	for index := range view {
+		view[index] = biz.Ownership{
+			SlotID:          uint32(index),
+			State:           biz.SlotOwned,
+			OwnerNodeID:     "node-a",
+			OwnerInstanceID: "instance-a",
+			Epoch:           1,
+		}
 	}
-	payload, err := json.Marshal(map[string]any{
-		"nodes": []any{map[string]any{"node_id": "node-a", "slots": slots}},
-	})
+	payload, err := biz.EncodeOwnershipView(view, 1)
 	require.NoError(t, err)
 	return payload
 }
@@ -629,3 +768,107 @@ func waitForDatabase(ctx context.Context, driver, dsn string) error {
 		}
 	}
 }
+
+// TestCrashFailoverAcrossDialects covers the crash-failover path against a real
+// database, which is where its correctness lives: a node that stops leaves its
+// grant behind, and the claim that follows has to be granted by the authority's
+// own clock rather than by anything the departed node did.
+//
+// The scenario is a node that stopped. Its grant ages past the quiet window, and
+// nothing rewrites its ownership row -- only an explicit release does, and a dead
+// process cannot issue one -- so the slot stays stranded until another node is
+// told to take it. The directory that tells it so is published directly, the way
+// an operator or the control plane would: sequence reads routes and claims what
+// they grant, and that is the whole path under test.
+func TestCrashFailoverAcrossDialects(t *testing.T) {
+	for _, item := range harnesses {
+		t.Run(item.name, func(t *testing.T) {
+			db := openGORM(t, item)
+			ctx := context.Background()
+			// The directory is published at version 1 below, so the table has to
+			// start empty: another test in this package may have left a route
+			// behind, and the version is the primary key.
+			require.NoError(t, resetSequenceDatabase(t, item))
+			const (
+				deadNode    = "node-failover-dead"
+				deadProcess = "instance-failover-dead"
+				survivor    = "node-failover-live"
+				quietWindow = 50 * time.Millisecond
+				// How many heartbeats the route takes to become active on, which is
+				// the node's own HeartbeatTimeoutTicks.
+				applyTicks = 3
+			)
+			slot := uint32(42)
+
+			ownership := sequencedata.NewOwnershipData(db)
+			base := resetSlot(t, ownership, slot).Epoch
+			granted, err := ownership.ClaimSlots(ctx, biz.ClaimRequest{
+				Slots:       []uint32{slot},
+				NodeID:      deadNode,
+				InstanceID:  deadProcess,
+				QuietWindow: 0,
+			})
+			require.NoError(t, err)
+			require.True(t, granted[0].Granted)
+
+			// A takeover is only legal once that much storage time has passed.
+			time.Sleep(quietWindow + 50*time.Millisecond)
+
+			plane := biz.DataPlaneConfig{
+				Allocator: biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
+				Node: biz.NodeConfig{
+					ID:                    survivor,
+					HeartbeatTimeoutTicks: applyTicks,
+					RouteQueryTimeout:     time.Second,
+				},
+				HA: biz.HAConfig{
+					QuietWindow:   quietWindow,
+					LeaseDuration: 10 * time.Second,
+					MaxPause:      time.Second,
+					NodeTTL:       time.Minute,
+				},
+			}
+			require.NoError(t, testkit.DecodeDefaults(&plane))
+			allocator := biz.NewAllocator(
+				plane,
+				sequencedata.NewSequenceData(db),
+				ownership,
+				failoverSampler{},
+				nil,
+			)
+
+			// The directory is materialised from the authority as it stands: the
+			// departed node's grant is still on the row and already past the quiet
+			// window, and it renews no liveness lease, so the surviving node's own
+			// plan hands it the stranded slot along with everything else. The claim
+			// is what makes the handover real.
+			publishSeededRoute(t, db)
+			placement := sequencedata.NewPlacementData(db)
+			manager := biz.NewNodeManager(
+				plane,
+				allocator,
+				sequencedata.NewRouteModel(db),
+				sequencedata.NewLivenessData(db),
+				placement,
+				biz.NewRouteCache(),
+				nil,
+				nil,
+			)
+			// The heartbeat installs the directory and schedules the claim for the
+			// tick the route becomes active on; driving the allocator to that tick
+			// performs the takeover, which a real fleet reaches one base tick later.
+			manager.Heartbeat()
+			allocator.ApplyRoute(applyTicks)
+
+			after := loadSlotOwnership(t, ownership, slot)
+			assert.Equal(t, biz.SlotOwned, after.State)
+			assert.Equal(t, allocator.InstanceID(), after.OwnerInstanceID,
+				"the surviving node must own the slot the departed one left behind")
+			assert.Greater(t, after.Epoch, base+1, "the takeover starts a new epoch")
+		})
+	}
+}
+
+type failoverSampler struct{}
+
+func (failoverSampler) MemoryUsage() (uint64, uint64) { return 1, math.MaxInt64 }

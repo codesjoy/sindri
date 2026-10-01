@@ -30,9 +30,30 @@ yggdrasil:
   transports:
     grpc:
       server: {address: ":19010"}
+    # No REST listener. The readiness endpoint used to need one and was the only
+    # reason to enable REST at all; it now registers on the governor's admin
+    # listener (see admin.governor above), which every process already runs.
+    # Dropping REST also drops its side effect: the framework advertises the
+    # transports a process enables, and an endpoint nothing serves needs no
+    # advertisement.
 
 app:
   sequence:
+    # The startup shape of this process. One image serves every shape:
+    #
+    #   data    -- allocator, node heartbeat, RPC, local placement;
+    #   control -- coordinator lease and directory publication only;
+    #   both    -- both halves in one process, sharing one database pool.
+    #
+    # The local stack runs both. A production StatefulSet runs its members as
+    # data and runs one or more separate replicas as control, because the
+    # publisher only decides how quickly a move becomes visible to clients, not
+    # whether the move may happen.
+    #
+    # It is required and strictly validated: a missing or misspelled value fails
+    # the start rather than silently picking a shape. SKULD_SEQUENCE_MODE and
+    # --mode override this setting.
+    mode: both
     runtime:
       memory_limit: auto
       auto_memory_limit_ratio: 0.8
@@ -44,25 +65,105 @@ app:
       max_open_conns: 20
       max_idle_conns: 5
       conn_max_lifetime: 30m
-    allocator:
-      default_step: 100
-      max_step: 10000
-      prefetch_ratio: 0.5
-      prefetch_latency_multiplier: 4
-      prefetch_latency_window: 5m
-      prefetch_latency_min_samples: 100
-      prefetch_rate_reset_after: 1m
-      step_increase_threshold: 15m
-      step_decrease_threshold: 30m
-      reserve_timeout: 1s
-      idle_timeout: 24h
-      cleanup_interval: 1s
-      cleanup_slots_per_run: 64
-      memory_high_watermark_ratio: 0.9
-    node:
-      id: "${SKULD_SEQUENCE_NODE_ID}"
-      heartbeat_timeout_ticks: 3
-      route_query_timeout: 1s
+    # The data plane: range allocation, this node's heartbeat, and the ownership
+    # bounds both read. The sections are grouped because they are read together:
+    # a claim is made under the node identity and the quiet window.
+    dataplane:
+      allocator:
+        default_step: 100
+        max_step: 10000
+        prefetch_ratio: 0.5
+        prefetch_latency_multiplier: 4
+        prefetch_latency_window: 5m
+        prefetch_latency_min_samples: 100
+        prefetch_rate_reset_after: 1m
+        step_increase_threshold: 15m
+        step_decrease_threshold: 30m
+        # Bounds ONE storage statement -- a range reservation, one lease renewal,
+        # or one claim or release batch -- not a whole operation. An operation
+        # spans many statements, so a bound shared across them would be spent
+        # serially and the last statement would starve; each one gets its own. It
+        # is also the ceiling the prefetch lead falls back to while a key's rate
+        # estimate is still warming up.
+        reserve_timeout: 1s
+        idle_timeout: 24h
+        cleanup_interval: 1s
+        cleanup_slots_per_run: 64
+        memory_high_watermark_ratio: 0.9
+      node:
+        # Unique across the fleet, and simultaneously the node's identity in two
+        # places: the ownership rows it claims, and a liveness row it renews on
+        # every heartbeat. Every node reads the second to decide which nodes a
+        # slot may be assigned to, so two nodes sharing an id look like one.
+        id: "${SKULD_SEQUENCE_NODE_ID}"
+        heartbeat_timeout_ticks: 3
+        # Bounds the heartbeat's one route read. The heartbeat runs on the tick
+        # schedule above, and a read that outlives it delays the route it was
+        # fetching; once heartbeat_timeout_ticks elapse without a successful
+        # heartbeat, allocation pauses. So this must stay well under
+        # heartbeat_timeout_ticks * base_tick_interval (3s with the values above),
+        # or a single slow read could pause a node that is otherwise fine.
+        route_query_timeout: 1s
+      # Shared strong-consistency ownership protocol. There is one hot path: a
+      # node owns a slot, pre-reserves a block of ids for it, and hands those out
+      # from memory; storage is touched only to claim, renew, release, or refill.
+      #
+      # Safety rests on the quiet window. A candidate may take a slot over only
+      # once the storage clock says the previous grant is older than quiet_window,
+      # and the previous owner stops serving on its own at
+      # lease_duration - safety_margin. quiet_window must therefore cover that
+      # whole local deadline plus every term that can widen it without the old
+      # owner observing it: clock_drift and clock_jump are terms contracted from
+      # the storage, max_pause is measured on this platform, and safety_margin is
+      # the extra room. Both pause_verified and clock_disciplined are required,
+      # because neither term can be derived from configuration or from the
+      # database.
+      #
+      # The values below assert a 3s lease against a 5s quiet window, of which
+      # 4.7s is consumed by the bound. They also shorten the takeover window: a
+      # node can keep serving through a storage outage for exactly
+      # lease_duration - safety_margin (2.5s). A deployment whose storage leader
+      # failover routinely exceeds that should trade takeover latency back for
+      # outage tolerance -- lease_duration: 10s, renew_interval: 3s,
+      # quiet_window: 12s -- which costs a 12s crash takeover instead of 5s.
+      ha:
+        lease_duration: 3s
+        quiet_window: 5s
+        max_pause: 1s
+        clock_drift: 100ms
+        clock_jump: 100ms
+        safety_margin: 500ms
+        renew_interval: 1s
+        release_drain_timeout: 2s
+        pause_verified: true
+        clock_disciplined: true
+        # The appendix F.2 allocation record is off by default: the hot path does
+        # not carry a record per allocation unless a deployment needs to check the
+        # ordering property from its own traffic. Turning it on also publishes the
+        # three counters that must stay at zero.
+        linearization_recording: false
+        # How long a node's liveness row counts as current after its last
+        # renewal. It lives with the other fleet-wide bounds because every node
+        # makes the same membership comparison against the same stored
+        # timestamps; it must exceed the heartbeat period by a wide margin.
+        node_ttl: 15s
+    # The publisher half. It decides nothing about placement: every node plans
+    # its own slots from slot_ownership and sequence_node_liveness, and this
+    # process materialises the result into the directory clients follow. Its
+    # only job is to keep the published revision in step with the authority.
+    controlplane:
+      # Identifies the slot layout a published snapshot was minted under.
+      layout_version: 1
+      # How long one replica keeps the publisher role. Only the holder writes
+      # revisions, so two replicas cannot publish the same view twice.
+      coordinator_lease: 10s
+      # The longest a publish pass may wait before it runs again. The takeover
+      # itself is done by the nodes; this only bounds how long a client's view
+      # of a move can lag behind it.
+      reconcile_interval: 5s
+      # Bounds one pass. It must stay inside coordinator_lease, because a pass
+      # publishes under the tenure it acquired at its start.
+      pass_timeout: 3s
     ticker:
       base_tick_interval: 1s
       heartbeat_ticks: 1

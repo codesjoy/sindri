@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package metrics
+package conf
 
 import (
 	"errors"
@@ -21,7 +21,6 @@ import (
 	"math"
 	"os"
 	"runtime/debug"
-	runtimemetrics "runtime/metrics"
 	"strconv"
 	"strings"
 
@@ -29,6 +28,10 @@ import (
 )
 
 const (
+	// DefaultMemoryLimit enables cgroup-aware automatic memory sizing.
+	DefaultMemoryLimit = "auto"
+	// DefaultAutoMemoryLimitRatio leaves headroom outside Go-managed memory.
+	DefaultAutoMemoryLimitRatio = 0.8
 	// MinimumMemoryLimit prevents configurations that would force near-continuous GC.
 	MinimumMemoryLimit = 64 << 20
 	goMemoryLimitEnv   = "GOMEMLIMIT"
@@ -49,35 +52,6 @@ type MemoryLimitResult struct {
 	BaseBytes  uint64
 	LimitBytes uint64
 	Ratio      float64
-}
-
-// RuntimeMemorySampler reads Go-managed memory and the configured Go memory limit.
-type RuntimeMemorySampler struct{}
-
-// NewRuntimeMemorySampler creates the process-wide runtime memory sampler.
-func NewRuntimeMemorySampler() *RuntimeMemorySampler {
-	return &RuntimeMemorySampler{}
-}
-
-// MemoryUsage returns runtime-managed bytes excluding released heap memory and GOMEMLIMIT.
-func (*RuntimeMemorySampler) MemoryUsage() (managedBytes, limitBytes uint64) {
-	samples := [3]runtimemetrics.Sample{
-		{Name: "/memory/classes/total:bytes"},
-		{Name: "/memory/classes/heap/released:bytes"},
-		{Name: "/gc/gomemlimit:bytes"},
-	}
-	runtimemetrics.Read(samples[:])
-	return managedMemory(
-		samples[0].Value.Uint64(),
-		samples[1].Value.Uint64(),
-	), samples[2].Value.Uint64()
-}
-
-func managedMemory(total, released uint64) uint64 {
-	if total <= released {
-		return 0
-	}
-	return total - released
 }
 
 // ParseMemoryLimit parses the byte syntax supported by the Go runtime's GOMEMLIMIT.
@@ -130,15 +104,18 @@ func ValidateMemoryLimit(limitBytes uint64) error {
 }
 
 // ConfigureMemoryLimit resolves and applies the sequence process memory limit.
+//
+// A nil memoryLimit means the deployment did not state one: GOMEMLIMIT wins
+// when it is present, and automatic detection is the fallback. A stated value
+// is authoritative -- including "auto", which then skips the environment --
+// because it is the deployment's own answer rather than a compatibility path.
 func ConfigureMemoryLimit(
-	configuredValue string,
-	explicit bool,
+	memoryLimit *string,
 	autoRatio float64,
 	logger *slog.Logger,
 ) (MemoryLimitResult, error) {
 	return configureMemoryLimit(
-		configuredValue,
-		explicit,
+		memoryLimit,
 		autoRatio,
 		logger,
 		memoryLimitDependencies{
@@ -151,22 +128,23 @@ func ConfigureMemoryLimit(
 }
 
 func configureMemoryLimit(
-	configuredValue string,
-	explicit bool,
+	memoryLimit *string,
 	autoRatio float64,
 	logger *slog.Logger,
 	deps memoryLimitDependencies,
 ) (MemoryLimitResult, error) {
-	value := strings.TrimSpace(configuredValue)
+	value := ""
 	source := "configuration"
-	if !explicit {
+	if memoryLimit == nil {
 		if environmentValue, ok := deps.lookupEnv(goMemoryLimitEnv); ok {
 			value = strings.TrimSpace(environmentValue)
 			source = "environment"
 		} else {
-			value = "auto"
+			value = DefaultMemoryLimit
 			source = "auto"
 		}
+	} else {
+		value = strings.TrimSpace(*memoryLimit)
 	}
 
 	var result MemoryLimitResult
@@ -234,4 +212,40 @@ func detectMemoryLimit(cgroup, system memoryLimitProvider) (uint64, string, erro
 	default:
 		return 0, "", fmt.Errorf("cgroup provider: %v; system provider: %v", cgroupErr, systemErr)
 	}
+}
+
+// RuntimeConfig controls process-wide Go runtime settings.
+type RuntimeConfig struct {
+	// MemoryLimit is a pointer so "stated as empty" stays distinguishable from
+	// "omitted": the former is refused, the latter takes the tag default and
+	// then follows the GOMEMLIMIT compatibility path.
+	MemoryLimit *string `mapstructure:"memory_limit" default:"auto"`
+	// AutoMemoryLimitRatio is the fraction of the detected limit to apply when
+	// the resolved value is auto.
+	AutoMemoryLimitRatio float64 `mapstructure:"auto_memory_limit_ratio" default:"0.8"`
+}
+
+// validateRuntime checks the process-wide Go runtime setting.
+func (c Config) validateRuntime() error {
+	if c.Runtime.MemoryLimit == nil {
+		return nil
+	}
+	memoryLimit := strings.TrimSpace(*c.Runtime.MemoryLimit)
+	if memoryLimit == "" {
+		return errors.New("sequence config: runtime.memory_limit must not be empty")
+	}
+	if memoryLimit != DefaultMemoryLimit {
+		limit, err := ParseMemoryLimit(memoryLimit)
+		if err != nil {
+			return fmt.Errorf("sequence config: runtime.memory_limit: %w", err)
+		}
+		if err := ValidateMemoryLimit(limit); err != nil {
+			return fmt.Errorf("sequence config: runtime.memory_limit: %w", err)
+		}
+	} else if c.Runtime.AutoMemoryLimitRatio <= 0 || c.Runtime.AutoMemoryLimitRatio >= 1 {
+		return errors.New(
+			"sequence config: runtime.auto_memory_limit_ratio must be within (0,1)",
+		)
+	}
+	return nil
 }

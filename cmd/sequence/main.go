@@ -16,11 +16,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
 
-	"github.com/codesjoy/sindri/internal/sequence/app"
+	"github.com/codesjoy/sindri/internal/sequence/conf"
 	"github.com/codesjoy/yggdrasil-ecosystem/modules/etcd/v3"
 	otlp "github.com/codesjoy/yggdrasil-ecosystem/modules/otlp/v3"
 	"github.com/codesjoy/yggdrasil-ecosystem/modules/polaris/v3"
@@ -43,10 +44,23 @@ func resolveAppName(lookupEnv func(string) (string, bool)) string {
 }
 
 func main() {
+	// The mode is stated through the same variable the configuration layer
+	// reads, so CLI and environment share one precedence rule: either of them
+	// overrides app.sequence.mode, and the resolved value is validated when the
+	// configuration loads.
+	if mode, ok, err := conf.ModeFromArgs(os.Args[1:]); err != nil {
+		slog.Error("run sequence", "error", err)
+		os.Exit(1)
+	} else if ok {
+		if err := os.Setenv(conf.ModeEnv, mode); err != nil {
+			slog.Error("run sequence", "error", err)
+			os.Exit(1)
+		}
+	}
 	if err := yggdrasil.Run(
 		context.Background(),
 		resolveAppName(os.LookupEnv),
-		app.Compose,
+		compose,
 		yggdrasil.WithConfigPath("configs/sequence.yaml"),
 		yggdrasil.WithModules(
 			protovalidate.Module(),
@@ -58,4 +72,20 @@ func main() {
 		slog.Error("run sequence", "error", err)
 		os.Exit(1)
 	}
+}
+
+// compose loads the sequence configuration and builds the process bundle.
+func compose(rt yggdrasil.Runtime) (*yggdrasil.BusinessBundle, error) {
+	cfg, err := conf.Load(rt)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conf.ConfigureMemoryLimit(
+		cfg.Runtime.MemoryLimit,
+		cfg.Runtime.AutoMemoryLimitRatio,
+		rt.Logger(),
+	); err != nil {
+		return nil, fmt.Errorf("configure sequence runtime: %w", err)
+	}
+	return initializeSequence(rt, cfg)
 }

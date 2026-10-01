@@ -30,4 +30,29 @@ enum Reason {
   SEQUENCE_ROUTE_EXPIRED = 152 [(codesjoy.reason.v1.code) = FAILED_PRECONDITION];
   SEQUENCE_CAPACITY_EXHAUSTED = 153 [(codesjoy.reason.v1.code) = RESOURCE_EXHAUSTED];
   SEQUENCE_ROUTE_UNAVAILABLE = 154 [(codesjoy.reason.v1.code) = FAILED_PRECONDITION];
+  // The request was made against an ownership epoch that is not the one in
+  // force, so the caller's directory view is not current: it is either behind
+  // the owner, in which case the response carries the epoch to move to, or ahead
+  // of it, in which case it must refresh before retrying.
+  SEQUENCE_EPOCH_STALE = 155 [(codesjoy.reason.v1.code) = FAILED_PRECONDITION];
+  // The slot is not being served while its ownership settles, and retrying
+  // shortly is the right response. Either an instance holds the slot but its
+  // grant is too old for its own fence to accept, or a candidate is still
+  // inside its quiet window before it may take the slot over.
+  SEQUENCE_OWNER_RECOVERING = 156 [(codesjoy.reason.v1.code) = UNAVAILABLE];
+  // The local lease that fenced the slot lapsed before the request linearised.
+  // The allocation was discarded rather than served.
+  SEQUENCE_LEASE_EXPIRED = 157 [(codesjoy.reason.v1.code) = FAILED_PRECONDITION];
+  // The request is malformed and retrying it unchanged cannot help.
+  SEQUENCE_INVALID_ARGUMENT = 158 [(codesjoy.reason.v1.code) = INVALID_ARGUMENT];
+  // A range reservation's write may or may not have committed: the statement was
+  // sent but its outcome could not be read. The range must be treated as lost
+  // rather than guessed at, so the caller retries and accepts the hole; a retry
+  // can never hand out an id that was already handed out.
+  SEQUENCE_COMMIT_UNCERTAIN = 159 [(codesjoy.reason.v1.code) = UNAVAILABLE];
+  // The authority store could not complete the reservation and the outcome is
+  // not in doubt: nothing was handed out. Unlike an uncertain commit this needs
+  // no special handling -- retrying later is correct and safe, because a retry
+  // reserves a new range and can never reissue an id.
+  SEQUENCE_STORAGE_UNAVAILABLE = 160 [(codesjoy.reason.v1.code) = UNAVAILABLE];
 }

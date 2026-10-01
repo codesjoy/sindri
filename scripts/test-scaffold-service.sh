@@ -30,7 +30,8 @@ printf 'go 1.26.4\n' >"$fixture/go.work"
 
 	./scripts/scaffold-service.sh alpha
 	test -f cmd/alpha/main.go
-	test -f internal/alpha/app/.gitkeep
+	test -f cmd/alpha/wire.go
+	test ! -e internal/alpha/app
 	test -f configs/alpha.yaml
 	test -f releases/services/alpha.yaml
 	grep -q '^service: alpha$' releases/services/alpha.yaml

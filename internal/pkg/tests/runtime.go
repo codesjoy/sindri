@@ -59,6 +59,28 @@ func (*Runtime) NewClient(context.Context, string) (transportclient.Client, erro
 // Config returns the in-memory configuration manager.
 func (r *Runtime) Config() *config.Manager { return r.manager }
 
+// Decode fills target from an in-memory value through the same snapshot path the
+// process uses at startup, defaults and decode hooks included.
+func Decode(target any, values map[string]any) error {
+	return config.NewSnapshot(values).Decode(target)
+}
+
+// DecodeDefaults fills a directly built configuration through the same path the
+// process uses at startup: decoding an empty snapshot applies the default tags
+// on the target's fields.
+//
+// A test that constructs a section by hand would otherwise have to restate every
+// default, which is the second copy the tags exist to remove.
+func DecodeDefaults(target any) error {
+	return Decode(target, map[string]any{})
+}
+
+// ApplyDefaults is DecodeDefaults for a test that already holds a testing handle.
+func ApplyDefaults(t testing.TB, target any) {
+	t.Helper()
+	require.NoError(t, DecodeDefaults(target))
+}
+
 // Logger returns a discard-backed logger for tests.
 func (*Runtime) Logger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))

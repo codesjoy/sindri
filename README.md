@@ -24,8 +24,8 @@ the same independent ownership and deployment model.
 
 ## Documentation
 
-- [Sequence quick start](docs/sequence.md): deploy the local stack, publish a
-  route, and call the Sequence RPCs.
+- [Sequence quick start](docs/sequence.md): deploy the local stack, watch the
+  directory place itself, and call the Sequence RPCs.
 - [Docker deployment guide](deploy/docker/README.md): configure databases,
   external dependencies, observability, and runtime resources.
 - [Engineering standards](docs/engineering-standards.md): repository structure,

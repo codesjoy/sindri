@@ -16,35 +16,69 @@ package biz
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"math"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/codesjoy/pkg/basic/xerror"
-	"github.com/codesjoy/sindri/gen/go/sequence/reason"
+	testkit "github.com/codesjoy/sindri/internal/pkg/tests"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/genproto/googleapis/rpc/code"
 )
 
+// testAllocatorConfig returns the allocator's own configuration with the
+// framework defaults applied, so a test states only the values it is about.
 func testAllocatorConfig() AllocatorConfig {
-	return AllocatorConfig{
-		DefaultStep:               10,
-		MaxStep:                   100,
-		PrefetchRatio:             0.5,
-		PrefetchLatencyMultiplier: DefaultPrefetchLatencyMultiplier,
-		PrefetchLatencyWindow:     DefaultPrefetchLatencyWindow,
-		PrefetchLatencyMinSamples: DefaultPrefetchLatencyMinSamples,
-		PrefetchRateResetAfter:    DefaultPrefetchRateResetAfter,
-		StepIncreaseThreshold:     15 * time.Minute,
-		StepDecreaseThreshold:     30 * time.Minute,
-		ReserveTimeout:            100 * time.Millisecond,
+	cfg := AllocatorConfig{
+		DefaultStep:    10,
+		MaxStep:        100,
+		ReserveTimeout: 100 * time.Millisecond,
 	}
+	if err := testkit.DecodeDefaults(&cfg); err != nil {
+		panic(err)
+	}
+	return cfg
+}
+
+// testDataPlaneConfig returns a complete data plane configuration with the
+// framework defaults applied.
+//
+// The platform assertions are set here because the loader is what normally
+// checks them and a test that builds an allocator directly never goes through it.
+func testDataPlaneConfig(cfg AllocatorConfig) DataPlaneConfig {
+	plane := DataPlaneConfig{Allocator: cfg, Node: NodeConfig{ID: "test-node"}}
+	if err := testkit.DecodeDefaults(&plane); err != nil {
+		panic(err)
+	}
+	plane.HA.PauseVerified = true
+	plane.HA.ClockDisciplined = true
+	return plane
+}
+
+// newHATestAllocator builds an allocator whose high-availability block is
+// complete enough for the fences to serve.
+//
+// Those parameters cannot be invented. The pause bound is what makes a stall
+// inside the in-memory linearisation detectable, and the lease is what arms the
+// local deadline a slot serves from; a zero for either one discards every
+// allocation rather than weakening the fence. Production injects all of them
+// from the validated HA section, so this exists for tests that are about
+// allocation behaviour rather than about the bounds themselves. The arithmetic
+// of the bounds is pinned by the configuration tests and the F.3 model, not
+// here.
+//
+// Fields a test set explicitly are left alone; the rest come from the defaults
+// the process itself applies, so this helper holds no second copy of them.
+func newHATestAllocator(
+	cfg *AllocatorConfig,
+	store SequenceRepo,
+	ownership OwnershipRepo,
+	memorySampler MemorySampler,
+	logger *slog.Logger,
+) *Allocator {
+	return NewAllocator(testDataPlaneConfig(*cfg), store, ownership, memorySampler, logger)
 }
 
 type rangeStore struct {
@@ -62,6 +96,7 @@ var unlimitedMemorySampler = memorySamplerFunc(func() (uint64, uint64) {
 
 func (s *rangeStore) ReserveRanges(
 	_ context.Context,
+	_ ReservationAuthority,
 	requests []ReservationRequest,
 ) ([]SequenceRange, error) {
 	s.mu.Lock()
@@ -73,434 +108,6 @@ func (s *rangeStore) ReserveRanges(
 		reserved[index] = SequenceRange{Start: start, End: s.max[request.Key]}
 	}
 	return reserved, nil
-}
-
-func TestKeyStateContinuesFromPersistedWatermark(t *testing.T) {
-	store := &rangeStore{max: map[string]int64{"orders": 100}}
-	state := &keyState{}
-
-	got, err := state.allocate(
-		context.Background(),
-		store,
-		"orders",
-		testAllocatorConfig(),
-		time.Now,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != 101 {
-		t.Fatalf("first id after handoff = %d, want 101", got)
-	}
-}
-
-func TestKeyStateAllocatesAcrossRanges(t *testing.T) {
-	store := &rangeStore{max: map[string]int64{}}
-	state := &keyState{}
-
-	for want := int64(1); want <= 25; want++ {
-		got, err := state.allocate(
-			context.Background(),
-			store,
-			"orders",
-			testAllocatorConfig(),
-			time.Now,
-		)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got != want {
-			t.Fatalf("allocated id = %d, want %d", got, want)
-		}
-	}
-}
-
-func TestKeyStateConcurrentInitializationIsUnique(t *testing.T) {
-	store := &rangeStore{max: map[string]int64{"orders": 100}}
-	state := &keyState{}
-
-	const workers = 128
-	values := make(chan int64, workers)
-	errs := make(chan error, workers)
-	var wg sync.WaitGroup
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			cfg := testAllocatorConfig()
-			cfg.DefaultStep = 8
-			value, err := state.allocate(
-				context.Background(),
-				store,
-				"orders",
-				cfg,
-				time.Now,
-			)
-			if err != nil {
-				errs <- err
-				return
-			}
-			values <- value
-		}()
-	}
-	wg.Wait()
-	close(values)
-	close(errs)
-	for err := range errs {
-		t.Fatal(err)
-	}
-
-	seen := make(map[int64]struct{}, workers)
-	for value := range values {
-		if value <= 100 {
-			t.Fatalf("allocated stale id %d", value)
-		}
-		if _, exists := seen[value]; exists {
-			t.Fatalf("allocated duplicate id %d", value)
-		}
-		seen[value] = struct{}{}
-	}
-	if len(seen) != workers {
-		t.Fatalf("allocated %d ids, want %d", len(seen), workers)
-	}
-}
-
-type invalidRangeStore struct{}
-
-func (invalidRangeStore) ReserveRanges(
-	context.Context,
-	[]ReservationRequest,
-) ([]SequenceRange, error) {
-	return []SequenceRange{{Start: 10, End: 10}}, nil
-}
-
-func TestKeyStateRejectsInvalidReservedRange(t *testing.T) {
-	state := &keyState{}
-	if _, err := state.allocate(
-		context.Background(),
-		invalidRangeStore{},
-		"orders",
-		testAllocatorConfig(),
-		time.Now,
-	); err == nil {
-		t.Fatal("expected invalid reserved range error")
-	}
-}
-
-type recordingRangeStore struct {
-	mu      sync.Mutex
-	max     int64
-	steps   []int64
-	started chan int64
-	release chan struct{}
-	err     error
-}
-
-type blockingRangeStore struct {
-	started chan struct{}
-	release chan struct{}
-}
-
-func (s *blockingRangeStore) ReserveRanges(
-	ctx context.Context,
-	requests []ReservationRequest,
-) ([]SequenceRange, error) {
-	select {
-	case <-s.started:
-	default:
-		close(s.started)
-	}
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-s.release:
-		reserved := make([]SequenceRange, len(requests))
-		var start int64 = 1
-		for index, request := range requests {
-			reserved[index] = SequenceRange{Start: start, End: start + request.Step - 1}
-			start += request.Step
-		}
-		return reserved, nil
-	}
-}
-
-func (s *recordingRangeStore) ReserveRanges(
-	ctx context.Context,
-	requests []ReservationRequest,
-) ([]SequenceRange, error) {
-	s.mu.Lock()
-	call := len(s.steps) + 1
-	for _, request := range requests {
-		s.steps = append(s.steps, request.Step)
-	}
-	if call == 1 {
-		reserved := s.reserveLocked(requests)
-		s.mu.Unlock()
-		return reserved, nil
-	}
-	s.mu.Unlock()
-	if s.started != nil {
-		for _, request := range requests {
-			select {
-			case s.started <- request.Step:
-			default:
-			}
-		}
-	}
-	if s.release != nil {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-s.release:
-		}
-	}
-	if s.err != nil {
-		return nil, s.err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.reserveLocked(requests), nil
-}
-
-func (s *recordingRangeStore) reserveLocked(
-	requests []ReservationRequest,
-) []SequenceRange {
-	reserved := make([]SequenceRange, len(requests))
-	for index, request := range requests {
-		start := s.max + 1
-		s.max += request.Step
-		reserved[index] = SequenceRange{Start: start, End: s.max}
-	}
-	return reserved
-}
-
-func (s *recordingRangeStore) recordedSteps() []int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]int64(nil), s.steps...)
-}
-
-type fakeClock struct {
-	mu  sync.Mutex
-	now time.Time
-}
-
-func (c *fakeClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-func (c *fakeClock) Advance(duration time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.now = c.now.Add(duration)
-}
-
-func TestKeyStatePrefetchesOnceAtConfiguredRatio(t *testing.T) {
-	cfg := testAllocatorConfig()
-	cfg.PrefetchRatio = 0.6
-	clock := &fakeClock{now: time.Unix(100, 0)}
-	store := &recordingRangeStore{
-		started: make(chan int64, 4),
-		release: make(chan struct{}),
-	}
-	state := &keyState{}
-
-	for want := int64(1); want <= 5; want++ {
-		got, err := state.allocate(context.Background(), store, "orders", cfg, clock.Now)
-		require.NoError(t, err)
-		assert.Equal(t, want, got)
-	}
-	select {
-	case <-store.started:
-		t.Fatal("prefetch started before configured ratio")
-	default:
-	}
-
-	got, err := state.allocate(context.Background(), store, "orders", cfg, clock.Now)
-	require.NoError(t, err)
-	assert.Equal(t, int64(6), got)
-	select {
-	case step := <-store.started:
-		assert.Equal(t, int64(10), step)
-	case <-time.After(time.Second):
-		t.Fatal("prefetch did not start at configured ratio")
-	}
-
-	for range 3 {
-		_, err = state.allocate(context.Background(), store, "orders", cfg, clock.Now)
-		require.NoError(t, err)
-	}
-	assert.Equal(t, []int64{10, 10}, store.recordedSteps())
-	close(store.release)
-}
-
-func TestKeyStateAdjustsStepFromEstimatedExhaustion(t *testing.T) {
-	tests := []struct {
-		name         string
-		elapsed      time.Duration
-		activeStep   int64
-		maxStep      int64
-		wantNextStep int64
-	}{
-		{
-			name: "increase", elapsed: 5 * time.Minute,
-			activeStep: 20, maxStep: 100, wantNextStep: 40,
-		},
-		{
-			name: "increase capped", elapsed: 5 * time.Minute,
-			activeStep: 80, maxStep: 100, wantNextStep: 100,
-		},
-		{
-			name: "keep", elapsed: 10 * time.Minute,
-			activeStep: 20, maxStep: 100, wantNextStep: 20,
-		},
-		{
-			name: "decrease", elapsed: 20 * time.Minute,
-			activeStep: 40, maxStep: 100, wantNextStep: 20,
-		},
-		{
-			name: "decrease floored", elapsed: 20 * time.Minute,
-			activeStep: 10, maxStep: 100, wantNextStep: 10,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			cfg := testAllocatorConfig()
-			cfg.MaxStep = test.maxStep
-			state := &keyState{activeStep: test.activeStep}
-			state.rate.ready = true
-			state.rate.rate = 5 / test.elapsed.Seconds()
-			got := state.nextStepLocked(10, cfg)
-			assert.Equal(t, test.wantNextStep, got)
-		})
-	}
-}
-
-func TestKeyStateWaitsForInflightPrefetchAtExhaustion(t *testing.T) {
-	cfg := testAllocatorConfig()
-	store := &recordingRangeStore{
-		started: make(chan int64, 2),
-		release: make(chan struct{}),
-	}
-	state := &keyState{}
-	for range cfg.DefaultStep {
-		_, err := state.allocate(context.Background(), store, "orders", cfg, time.Now)
-		require.NoError(t, err)
-	}
-	select {
-	case <-store.started:
-	case <-time.After(time.Second):
-		t.Fatal("prefetch did not start")
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err := state.allocate(ctx, store, "orders", cfg, time.Now)
-	assert.ErrorIs(t, err, context.Canceled)
-	assert.Equal(t, []int64{10, 10}, store.recordedSteps())
-	close(store.release)
-
-	got, err := state.allocate(context.Background(), store, "orders", cfg, time.Now)
-	require.NoError(t, err)
-	assert.Equal(t, int64(11), got)
-}
-
-func TestKeyStateFallsBackAfterPrefetchFailure(t *testing.T) {
-	cfg := testAllocatorConfig()
-	prefetchErr := errors.New("prefetch failed")
-	store := &recordingRangeStore{err: prefetchErr, started: make(chan int64, 2)}
-	state := &keyState{}
-
-	for range cfg.DefaultStep {
-		_, err := state.allocate(context.Background(), store, "orders", cfg, time.Now)
-		require.NoError(t, err)
-	}
-	select {
-	case <-store.started:
-	case <-time.After(time.Second):
-		t.Fatal("prefetch did not start")
-	}
-	require.Eventually(t, func() bool {
-		state.mu.Lock()
-		defer state.mu.Unlock()
-		return state.fetch == nil
-	}, time.Second, time.Millisecond)
-
-	_, err := state.allocate(context.Background(), store, "orders", cfg, time.Now)
-	assert.ErrorIs(t, err, prefetchErr)
-	assert.Len(t, store.recordedSteps(), 3)
-}
-
-func TestAllocatorAppliesRouteVersionWithoutNewSlots(t *testing.T) {
-	tests := []struct {
-		name   string
-		routes []struct {
-			version int64
-			slots   []uint32
-			apply   bool
-		}
-		wantVersion int64
-	}{
-		{
-			name: "unchanged slots",
-			routes: []struct {
-				version int64
-				slots   []uint32
-				apply   bool
-			}{
-				{version: 1, slots: []uint32{1}, apply: true},
-				{version: 2, slots: []uint32{1}, apply: true},
-			},
-			wantVersion: 2,
-		},
-		{
-			name: "empty slots",
-			routes: []struct {
-				version int64
-				slots   []uint32
-				apply   bool
-			}{
-				{version: 1, slots: []uint32{1}, apply: true},
-				{version: 2, apply: true},
-			},
-			wantVersion: 2,
-		},
-		{
-			name: "skipped intermediate snapshot",
-			routes: []struct {
-				version int64
-				slots   []uint32
-				apply   bool
-			}{
-				{version: 1, slots: []uint32{1}, apply: true},
-				{version: 2, slots: []uint32{1}},
-				{version: 3, slots: []uint32{1}, apply: true},
-			},
-			wantVersion: 3,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			allocator := NewAllocator(
-				&AllocatorConfig{DefaultStep: 10, MaxStep: 100},
-				&rangeStore{max: make(map[string]int64)},
-				unlimitedMemorySampler,
-				slog.Default(),
-			)
-			for _, route := range test.routes {
-				allocator.CommitRoute(route.version, 0, route.slots)
-				if route.apply {
-					allocator.ApplyRoute(0)
-				}
-			}
-			if got := allocator.CurrentVersion(); got != test.wantVersion {
-				t.Fatalf("route version = %d, want %d", got, test.wantVersion)
-			}
-		})
-	}
 }
 
 func readyAllocatorForKeys(t testing.TB, keys ...string) *Allocator {
@@ -515,115 +122,16 @@ func readyAllocatorForKeys(t testing.TB, keys ...string) *Allocator {
 		seen[slot] = struct{}{}
 		slots = append(slots, slot)
 	}
-	allocator := NewAllocator(
+	allocator := newHATestAllocator(
 		&AllocatorConfig{DefaultStep: 10, MaxStep: 100},
 		&rangeStore{max: make(map[string]int64)},
+		nil,
 		unlimitedMemorySampler,
 		slog.Default(),
 	)
 	allocator.Open(1, 0, slots)
 	allocator.ApplyRoute(0)
 	return allocator
-}
-
-func TestAllocatorMemoryAdmissionOnlyRejectsNewKeys(t *testing.T) {
-	allocator := readyAllocatorForKeys(t, "orders", "invoices")
-	var pressured atomic.Bool
-	allocator.memorySampler = memorySamplerFunc(func() (uint64, uint64) {
-		if pressured.Load() {
-			return 90, 100
-		}
-		return 89, 100
-	})
-
-	_, err := allocator.FetchNext(context.Background(), "orders")
-	require.NoError(t, err)
-	pressured.Store(true)
-	_, err = allocator.FetchNext(context.Background(), "orders")
-	require.NoError(t, err, "existing keys remain available above the watermark")
-	_, err = allocator.FetchNext(context.Background(), "invoices")
-	assert.True(t, xerror.IsReason(err, reason.Reason_SEQUENCE_CAPACITY_EXHAUSTED))
-	assert.True(t, xerror.IsCode(err, code.Code_RESOURCE_EXHAUSTED))
-	assert.Equal(t, int64(1), allocator.Stats().CachedKeys)
-	assert.Equal(t, int64(1), allocator.Stats().AdmissionRejected)
-}
-
-func TestAllocatorConcurrentMissCreatesOneState(t *testing.T) {
-	const workers = 64
-	allocator := readyAllocatorForKeys(t, "orders")
-	allocator.memorySampler = memorySamplerFunc(func() (uint64, uint64) { return 1, 100 })
-	var wg sync.WaitGroup
-	errs := make(chan error, workers)
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_, err := allocator.FetchNext(context.Background(), "orders")
-			errs <- err
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		require.NoError(t, err)
-	}
-	assert.Equal(t, int64(1), allocator.Stats().CachedKeys)
-	slot := allocator.slots[SlotForKey("orders")]
-	assert.Equal(t, int64(1), slot.count.Load())
-}
-
-func TestAllocatorRouteRemovalUpdatesCachedKeyCount(t *testing.T) {
-	keyA, keyB := "orders", "invoices"
-	for SlotForKey(keyA) == SlotForKey(keyB) {
-		keyB += "x"
-	}
-	allocator := readyAllocatorForKeys(t, keyA, keyB)
-	_, err := allocator.FetchNext(context.Background(), keyA)
-	require.NoError(t, err)
-	_, err = allocator.FetchNext(context.Background(), keyB)
-	require.NoError(t, err)
-	require.Equal(t, int64(2), allocator.Stats().CachedKeys)
-
-	allocator.CommitRoute(2, 0, []uint32{SlotForKey(keyA)})
-	assert.Equal(t, int64(1), allocator.Stats().CachedKeys)
-	allocator.ApplyRoute(0)
-	assert.Equal(t, int64(1), allocator.Stats().CachedKeys)
-}
-
-func TestAllocatorWaitForVersion(t *testing.T) {
-	allocator := readyAllocatorForKeys(t, "orders")
-	done := make(chan error, 1)
-	go func() { done <- allocator.WaitForVersion(context.Background(), 3) }()
-	select {
-	case err := <-done:
-		t.Fatalf("WaitForVersion returned before route application: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
-
-	allocator.CommitRoute(3, 0, []uint32{SlotForKey("orders")})
-	allocator.ApplyRoute(0)
-	require.NoError(t, <-done)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	assert.ErrorIs(t, allocator.WaitForVersion(ctx, 4), context.Canceled)
-}
-
-func TestAllocatorCleanupScansConfiguredSlotsPerRun(t *testing.T) {
-	keys := distinctSlotKeys(4)
-	allocator := readyAllocatorForKeys(t, keys...)
-	allocator.cfg.CleanupSlotsPerRun = 2
-	for _, key := range keys {
-		_, err := allocator.FetchNext(context.Background(), key)
-		require.NoError(t, err)
-	}
-	cutoff := time.Now().Add(time.Hour).UnixNano()
-	first, scanned := allocator.collectIdleCandidates(cutoff)
-	assert.Len(t, first, 2)
-	assert.Equal(t, 2, scanned)
-	second, scanned := allocator.collectIdleCandidates(cutoff)
-	assert.Len(t, second, 2)
-	assert.Equal(t, 2, scanned)
 }
 
 func distinctSlotKeys(count int) []string {
@@ -689,9 +197,10 @@ func BenchmarkAllocatorNewKeys(b *testing.B) {
 	for i := range slots {
 		slots[i] = uint32(i)
 	}
-	allocator := NewAllocator(
+	allocator := newHATestAllocator(
 		&AllocatorConfig{DefaultStep: 100, MaxStep: 100},
 		&rangeStore{max: make(map[string]int64)},
+		nil,
 		unlimitedMemorySampler,
 		slog.Default(),
 	)
@@ -744,6 +253,144 @@ func BenchmarkAllocatorIncrementalCleanup(b *testing.B) {
 	}
 }
 
+// TestReadinessIsInitializingBeforeAnyRoute pins that an instance which has
+// never been given a route is not sent traffic: it has no slot to allocate
+// from, so every request would fail anyway.
+func TestReadinessIsInitializingBeforeAnyRoute(t *testing.T) {
+	allocator := newHATestAllocator(
+		&AllocatorConfig{DefaultStep: 10, MaxStep: 100, IdleTimeout: time.Hour},
+		&rangeStore{max: make(map[string]int64)},
+		nil,
+		unlimitedMemorySampler,
+		slog.Default(),
+	)
+
+	readiness := allocator.Readiness()
+	assert.False(t, readiness.Ready)
+	assert.Equal(t, "initializing", readiness.Reason)
+}
+
+func TestReadinessIsServingOnceARouteIsApplied(t *testing.T) {
+	key := "readiness-serving"
+	allocator, _ := leaseAllocator(t, key, func() int64 { return 0 })
+
+	readiness := allocator.Readiness()
+	assert.True(t, readiness.Ready)
+	assert.Equal(t, "serving", readiness.Reason)
+}
+
+// TestReadinessSurvivesStorageLossAndEmptySlots is the D.17 rule. Neither a
+// storage blip nor holding no slots is repaired by restarting, and the protocol
+// already fails those requests closed with their own retriable reason, so
+// reporting them unready would only turn a recoverable condition into a rolling
+// restart.
+func TestReadinessSurvivesStorageLossAndEmptySlots(t *testing.T) {
+	allocator := newHATestAllocator(
+		&AllocatorConfig{DefaultStep: 10, MaxStep: 100, IdleTimeout: time.Hour},
+		&rangeStore{max: make(map[string]int64)},
+		nil,
+		unlimitedMemorySampler,
+		slog.Default(),
+	)
+	// A route that assigns this instance nothing. The version only advances
+	// once the (empty) claim has committed, which is what makes the instance
+	// serving rather than initializing.
+	allocator.Open(7, 0, nil)
+	allocator.ApplyRoute(0)
+	assert.True(t, allocator.Readiness().Ready, "an empty assignment is still serving")
+
+	// A storage blip pauses allocation but must not take the instance out of
+	// service, because the pause is what it recovers from on its own.
+	allocator.Pause()
+	readiness := allocator.Readiness()
+	assert.True(t, readiness.Ready)
+	assert.Equal(t, "serving", readiness.Reason)
+}
+
+// TestShutdownReleasesTheSlotAuthority covers the section 6.3 order on the
+// shutdown path: the instance stops serving, then gives back the authority it
+// holds, so a successor does not have to wait out the quiet window (D7/D16).
+func TestShutdownReleasesTheSlotAuthority(t *testing.T) {
+	key := "readiness-shutdown"
+	allocator, ownership := leaseAllocator(t, key, func() int64 { return 0 })
+	require.EqualValues(t, 1, allocator.slots[SlotForKey(key)].epoch.Load())
+
+	allocator.Shutdown()
+
+	assert.Equal(t, int64(1), ownership.released)
+	readiness := allocator.Readiness()
+	assert.False(t, readiness.Ready)
+	assert.Equal(t, "stopping", readiness.Reason)
+}
+
+// TestShutdownKeepsAuthorityThatDidNotDrain pins the safe direction: a slot
+// with an allocation still in flight is not released, because a new owner
+// starting now could serve an id this instance is about to hand out.
+func TestShutdownKeepsAuthorityThatDidNotDrain(t *testing.T) {
+	key := "readiness-shutdown-drain"
+	allocator, ownership := leaseAllocator(t, key, func() int64 { return 0 })
+	allocator.ha.ReleaseDrainTimeout = 20 * time.Millisecond
+
+	slot := allocator.slots[SlotForKey(key)]
+	require.True(t, slot.enter(), "the slot must be open for the allocation to be in flight")
+	// leave() is deliberately not called: this stands in for a request that is
+	// still inside the gate when the process stops.
+
+	allocator.Shutdown()
+
+	assert.Zero(t, ownership.released, "a slot that did not drain must stay held")
+	assert.False(t, allocator.Readiness().Ready)
+}
+
+// TestHAStatsCountsTakeoversAndReleases pins the appendix E counters at the two
+// places they are produced: a claim that moves an epoch, and a release that gives
+// one back.
+func TestHAStatsCountsTakeoversAndReleases(t *testing.T) {
+	const key = "ha-stats"
+	ownership := newLeaseOwnershipFake()
+	allocator, _ := leaseAllocatorWith(t, key, ownership, nil)
+
+	// Claiming through the route path is what a takeover is, and each granted slot
+	// moves its epoch.
+	allocator.Open(1, 0, []uint32{SlotForKey(key)})
+	allocator.ApplyRoute(0)
+
+	stats := allocator.HAStats()
+	assert.Positive(t, stats.TakeoversGranted)
+	assert.Equal(t, stats.TakeoversGranted, stats.EpochChanges)
+	assert.Zero(t, stats.TakeoversRefused)
+	owned, fenced := allocator.SlotStateCounts()
+	assert.Equal(t, int64(1), owned)
+	assert.Zero(t, fenced)
+
+	// A shutdown is one drain, and it gives back what it held.
+	allocator.Shutdown()
+	stats = allocator.HAStats()
+	assert.Equal(t, int64(1), stats.Drains)
+	assert.Positive(t, stats.ReleasesReleased)
+	assert.Zero(t, stats.ReleasesFailed)
+	assert.GreaterOrEqual(t, stats.LastDrainSeconds, 0.0)
+	owned, fenced = allocator.SlotStateCounts()
+	assert.Zero(t, owned+fenced, "a shutdown holds nothing afterwards")
+}
+
+func TestAllocatorCleanupScansConfiguredSlotsPerRun(t *testing.T) {
+	keys := distinctSlotKeys(4)
+	allocator := readyAllocatorForKeys(t, keys...)
+	allocator.cfg.CleanupSlotsPerRun = 2
+	for _, key := range keys {
+		_, err := allocator.FetchNext(context.Background(), key)
+		require.NoError(t, err)
+	}
+	cutoff := time.Now().Add(time.Hour).UnixNano()
+	first, scanned := allocator.collectIdleCandidates(cutoff)
+	assert.Len(t, first, 2)
+	assert.Equal(t, 2, scanned)
+	second, scanned := allocator.collectIdleCandidates(cutoff)
+	assert.Len(t, second, 2)
+	assert.Equal(t, 2, scanned)
+}
+
 func readyAllocatorForCleanup(
 	t *testing.T,
 	store SequenceRepo,
@@ -751,12 +398,12 @@ func readyAllocatorForCleanup(
 	key string,
 ) *Allocator {
 	t.Helper()
-	allocator := NewAllocator(&AllocatorConfig{
+	allocator := newHATestAllocator(&AllocatorConfig{
 		DefaultStep:     10,
 		MaxStep:         100,
 		IdleTimeout:     10 * time.Minute,
 		CleanupInterval: time.Minute,
-	}, store, unlimitedMemorySampler, slog.Default())
+	}, store, nil, unlimitedMemorySampler, slog.Default())
 	allocator.now = clock.Now
 	allocator.Open(1, 0, []uint32{SlotForKey(key)})
 	allocator.ApplyRoute(0)

@@ -19,10 +19,11 @@ require (
 	github.com/codesjoy/yggdrasil-ecosystem/modules/otlp/v3 v3.0.0-20260429033927-d1bc68f367b9
 	github.com/codesjoy/yggdrasil-ecosystem/modules/polaris/v3 v3.0.0-20260429033927-d1bc68f367b9
 	github.com/codesjoy/yggdrasil-ecosystem/modules/protovalidate/v3 v3.0.0-20260429033927-d1bc68f367b9
-	github.com/codesjoy/yggdrasil/v3 v3.0.0-rc.4
+	github.com/codesjoy/yggdrasil/v3 v3.0.0-rc.5
 	github.com/docker/docker v28.5.1+incompatible
 	github.com/docker/go-connections v0.7.0
 	github.com/go-sql-driver/mysql v1.10.0
+	github.com/google/uuid v1.6.0
 	github.com/google/wire v0.7.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/pressly/goose/v3 v3.27.3
@@ -33,6 +34,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.40.0
 	github.com/testcontainers/testcontainers-go/modules/toxiproxy v0.40.0
 	go.etcd.io/etcd/client/v3 v3.6.8
+	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/metric v1.44.0
 	go.opentelemetry.io/otel/sdk/metric v1.44.0
 	go.opentelemetry.io/otel/trace v1.44.0
@@ -84,7 +86,6 @@ require (
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/cel-go v0.27.0 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
 	github.com/hashicorp/errwrap v1.0.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
@@ -136,7 +137,6 @@ require (
 	go.etcd.io/etcd/client/pkg/v3 v3.6.8 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.69.0 // indirect
-	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.34.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.34.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.40.0 // indirect

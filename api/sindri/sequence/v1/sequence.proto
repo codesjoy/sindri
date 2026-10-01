@@ -53,6 +53,11 @@ message FetchNextResponse {
   // The first allocated id. The response covers [id, id + count - 1].
   int64 id = 1;
   uint32 count = 2;
+  // The ownership epoch the block was allocated under. A caller that observes
+  // this epoch decrease between two responses for the same key has proof of an
+  // ordering violation, so the value is the client-visible half of the
+  // linearization record.
+  uint64 slot_epoch = 3;
 }
 
 message FetchNextBatchRequest {
@@ -71,6 +76,9 @@ message FetchNextBatchResult {
   string key = 1;
   int64 id = 2;
   uint32 count = 3;
+  // The ownership epoch this key's block was allocated under. A batch may span
+  // several slots, so the epoch belongs to the result rather than the response.
+  uint64 slot_epoch = 4;
 }
 
 message GetRouteRequest {
@@ -83,11 +91,41 @@ message GetRouteResponse {
 }
 
 message RouteSnapshot {
+  // The directory revision this snapshot was materialised at. The field number
+  // and name are unchanged for older callers, but the value is now derived from
+  // storage ownership rather than entered by an operator, so it is renamed in
+  // prose: it identifies the ownership directory, not a hand-published route.
+  // It stays monotonically increasing, which is what the client's not-modified
+  // check and stale-route retry both depend on.
   int64 version = 1;
+  // Kept for callers that only understand node-level routing. Each node lists
+  // the slots it owns at this revision, so an older caller still selects the
+  // right node; it just cannot check a per-slot epoch. Owners are derived from
+  // segments below and never disagree with them.
   repeated RouteNode nodes = 2;
+  // Identifies the slot layout the epochs were minted under: slot count and the
+  // key-to-slot function. A caller must discard a cached snapshot whose layout
+  // version differs, because the same slot number then means a different key.
+  int64 layout_version = 3;
+  // The authoritative ownership view, one entry per contiguous run of slots
+  // sharing an owner instance and epoch. Slots owned by nobody are present with
+  // an empty owner, so every slot is covered exactly once.
+  repeated RouteSegment segments = 4;
 }
 
 message RouteNode {
   string node_id = 1;
   repeated uint32 slots = 2;
+}
+
+message RouteSegment {
+  uint32 start_slot = 1;
+  uint32 end_slot = 2;
+  // Empty when the slot is unowned; a caller must treat such a slot as paused
+  // rather than as routed to the empty node.
+  string owner_node_id = 3;
+  string owner_instance_id = 4;
+  // The ownership epoch of this segment. A caller compares it with the epoch on
+  // responses and with its own cached snapshot to detect a takeover.
+  uint64 slot_epoch = 5;
 }

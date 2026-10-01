@@ -37,5 +37,9 @@ WORKDIR /app
 COPY --from=build "/out/${SERVICE}" "/app/server"
 COPY --from=build "/src/configs/${SERVICE}.yaml" "/app/configs/${SERVICE}.yaml"
 
-EXPOSE 8080
+# 8080 is the governor admin listener, which carries the high-availability report
+# next to the diagnostics route. The gRPC port is per service and set in
+# configs/<service>.yaml, so the list below is documentation only: the ports a
+# deployment actually opens come from its configuration and compose file.
+EXPOSE 8080 19010
 ENTRYPOINT ["/app/server"]

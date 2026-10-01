@@ -23,10 +23,21 @@ import (
 	"time"
 )
 
-// Config contains ticker timing configuration.
+// Config contains ticker timing configuration. The defaults are declared on the
+// fields, so the configuration snapshot applies them while decoding.
 type Config struct {
-	BaseTickInterval time.Duration `mapstructure:"base_tick_interval"`
-	HeartbeatTicks   int64         `mapstructure:"heartbeat_ticks"`
+	BaseTickInterval time.Duration `mapstructure:"base_tick_interval" default:"1s"`
+	HeartbeatTicks   int64         `mapstructure:"heartbeat_ticks"    default:"1"`
+}
+
+// Validate checks the ticker's timing settings.
+func (c Config) Validate() error {
+	if c.BaseTickInterval <= 0 || c.HeartbeatTicks <= 0 {
+		return errors.New(
+			"ticker.base_tick_interval and ticker.heartbeat_ticks must be positive",
+		)
+	}
+	return nil
 }
 
 // TickType identifies a scheduled node task.
