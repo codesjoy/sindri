@@ -105,7 +105,7 @@ checked-in Protocol Buffer sources with the repository-pinned Buf binary:
   --output /tmp/sindri-sequence.protoset
 ```
 
-If the pinned tools are missing, install them first with `make tools.install`.
+If the pinned tools are missing, install them first with `task tools:install`.
 
 ## 4. Verify the route
 

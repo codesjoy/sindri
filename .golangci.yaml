@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Default profile excludes generated Go files.
-# Use INCLUDE_GENERATED=1 in make targets to include generated files.
+# Use INCLUDE_GENERATED=1 in task targets to include generated files.
 version: "2"
 
 linters:

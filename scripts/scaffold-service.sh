@@ -35,6 +35,12 @@ esac
 repo_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
 
+go_directive=$(sed -n 's/^go[[:space:]]*//p' go.mod | head -n 1)
+if [ -z "$go_directive" ]; then
+	echo "go.mod has no go directive" >&2
+	exit 1
+fi
+
 targets="cmd/$service internal/$service configs/$service.yaml migrations/$service tests/$service releases/services/$service.yaml .github/workflows/$service.yml"
 if [ "$profile" != service ]; then
 	targets="api/sindri/$service gen/go/$service $targets"
@@ -66,7 +72,8 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 render() {
-	sed -e "s/{{SERVICE}}/$service/g" -e "s/{{YEAR}}/$year/g" "$1" >"$2"
+	sed -e "s/{{SERVICE}}/$service/g" -e "s/{{YEAR}}/$year/g" \
+		-e "s/{{GO_DIRECTIVE}}/$go_directive/g" "$1" >"$2"
 }
 
 stage="$tmp_dir/tree"

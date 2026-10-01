@@ -20,9 +20,10 @@ set -eu
 
 temporary_file="$(mktemp)"
 trap 'rm -f "$temporary_file"' EXIT
+# Wire re-emits its own unpinned //go:generate directive into wire_gen.go; strip
+# it so the pinned binary behind `task wire` stays the only regeneration path.
 awk '
   $0 != "//go:generate go run -mod=mod github.com/google/wire/cmd/wire" { print }
 ' wire_gen.go >"$temporary_file"
 mv "$temporary_file" wire_gen.go
 trap - EXIT
-gofmt -w wire_gen.go

@@ -34,6 +34,27 @@ the same independent ownership and deployment model.
   and deployable service releases.
 - [Changelog](CHANGELOG.md): repository-level changes grouped by month.
 
+## Development
+
+Development commands run through [Task](https://taskfile.dev/) v3. Install the
+pinned tools and Git hooks, then list every repository command:
+
+```sh
+task setup
+task --list
+```
+
+`task verify` runs the complete merge gate: formatting, static analysis,
+Protocol Buffer lint, license headers, unit and race-enabled tests, module
+builds, and publishable-module isolation; CI owns this gate. During local
+iteration, run the smallest checks that cover the change with
+`task test:package PACKAGE=...`, `task test:package:race PACKAGE=...`, or
+`task test:service SERVICE=...` instead of the full gate.
+`Taskfile.yml` is the source of truth for build, test, lint, contract, and
+release commands; generated files are never edited by hand. Pinned tool
+installation supports macOS and Linux; on Git Bash the tasks work, but the
+pinned tools must be provided separately.
+
 ## License
 
 Sindri is licensed under the [Apache License 2.0](LICENSE).

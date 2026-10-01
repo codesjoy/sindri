@@ -109,7 +109,7 @@ func (s *SequenceSystemSuite) SetupSuite() {
 	s.Require().NotNil(s.h)
 	s.Require().NotEmpty(
 		os.Getenv("SKULD_SEQUENCE_TEST_IMAGE"),
-		"set SKULD_SEQUENCE_TEST_IMAGE or run make test-sequence-integration",
+		"set SKULD_SEQUENCE_TEST_IMAGE or run task test:sequence:integration",
 	)
 }
 

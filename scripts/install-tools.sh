@@ -18,13 +18,49 @@ set -eu
 TOOL_DIR=${TOOL_DIR:?}
 TOOL_STAMP_DIR=${TOOL_STAMP_DIR:?}
 GO_BIN=${GO_BIN:-go}
-PYTHON_BIN=${PYTHON_BIN:-python3}
 ADDLICENSE_VERSION=${ADDLICENSE_VERSION:?}
 BUF_VERSION=${BUF_VERSION:?}
 WIRE_VERSION=${WIRE_VERSION:?}
 GOLANGCI_LINT_VERSION=${GOLANGCI_LINT_VERSION:?}
-PRE_COMMIT_VERSION=${PRE_COMMIT_VERSION:?}
+PREK_VERSION=${PREK_VERSION:?}
 GIT_CLIFF_VERSION=${GIT_CLIFF_VERSION:?}
+
+mode=${1:-install}
+case "$mode" in
+	install|check) ;;
+	*)
+		echo "usage: $0 [install|check]" >&2
+		exit 2
+		;;
+esac
+
+# check_tools mirrors the install calls at the end of this file so the tool
+# names and version stamps have a single owner.
+check_tools() {
+	missing=0
+	for entry in \
+		"addlicense|$TOOL_DIR/addlicense|$ADDLICENSE_VERSION" \
+		"buf|$TOOL_DIR/buf|$BUF_VERSION" \
+		"wire|$TOOL_DIR/wire|$WIRE_VERSION" \
+		"golangci-lint|$TOOL_DIR/golangci-lint|$GOLANGCI_LINT_VERSION" \
+		"git-cliff|$TOOL_DIR/git-cliff|$GIT_CLIFF_VERSION" \
+		"prek|$TOOL_DIR/prek|$PREK_VERSION"; do
+		name=${entry%%|*}
+		rest=${entry#*|}
+		binary=${rest%%|*}
+		version=${rest#*|}
+		if [ ! -x "$binary" ] || [ ! -f "$TOOL_STAMP_DIR/$name-$version" ]; then
+			echo "missing tool or version stamp: $name $version (run task tools:install)" >&2
+			missing=1
+		fi
+	done
+	[ "$missing" -eq 0 ]
+}
+
+if [ "$mode" = check ]; then
+	check_tools
+	exit 0
+fi
 
 mkdir -p "$TOOL_DIR" "$TOOL_STAMP_DIR"
 
@@ -53,9 +89,13 @@ sha256_check() {
 	[ "$actual" = "$expected" ] || { echo "checksum mismatch for $file" >&2; exit 1; }
 }
 
-install_git_cliff() {
-	name=git-cliff
-	version=$GIT_CLIFF_VERSION
+install_github_tarball_tool() {
+	name=$1
+	version=$2
+	target=$3
+	checksum=$4
+	url=$5
+	extracted_binary=$6
 	stamp="$TOOL_STAMP_DIR/$name-$version"
 	binary="$TOOL_DIR/$name"
 	tmp="$TOOL_DIR/.install-$name"
@@ -63,6 +103,22 @@ install_git_cliff() {
 		return
 	fi
 
+	archive=${url##*/}
+	echo "==> install $name $version ($target)"
+	rm -rf "$tmp"
+	mkdir -p "$tmp"
+	curl -fsSL "$url" -o "$tmp/$archive"
+	sha256_check "$tmp/$archive" "$checksum"
+	tar -xzf "$tmp/$archive" -C "$tmp"
+	cp "$tmp/$extracted_binary" "$binary"
+	chmod +x "$binary"
+	rm -rf "$tmp"
+	find "$TOOL_STAMP_DIR" -maxdepth 1 -type f -name "$name-*" -delete
+	: >"$stamp"
+}
+
+install_git_cliff() {
+	version=$GIT_CLIFF_VERSION
 	os=$(uname -s)
 	arch=$(uname -m)
 	case "$os/$arch" in
@@ -88,34 +144,46 @@ install_git_cliff() {
 			;;
 	esac
 
-	archive="git-cliff-$version-$target.tar.gz"
-	url="https://github.com/orhun/git-cliff/releases/download/v$version/$archive"
-	echo "==> install $name $version ($target)"
-	rm -rf "$tmp"
-	mkdir -p "$tmp"
-	curl -fsSL "$url" -o "$tmp/$archive"
-	sha256_check "$tmp/$archive" "$checksum"
-	tar -xzf "$tmp/$archive" -C "$tmp"
-	cp "$tmp/git-cliff-$version/$name" "$binary"
-	chmod +x "$binary"
-	rm -rf "$tmp"
-	find "$TOOL_STAMP_DIR" -maxdepth 1 -type f -name "$name-*" -delete
-	: >"$stamp"
+	install_github_tarball_tool git-cliff "$version" "$target" "$checksum" \
+		"https://github.com/orhun/git-cliff/releases/download/v$version/git-cliff-$version-$target.tar.gz" \
+		"git-cliff-$version/git-cliff"
 }
 
-install_pre_commit() {
-	name=pre-commit
-	stamp="$TOOL_STAMP_DIR/$name-$PRE_COMMIT_VERSION"
-	binary="$TOOL_DIR/pre-commit-venv/bin/pre-commit"
-	if [ -x "$binary" ] && [ -f "$stamp" ]; then
-		return
-	fi
+install_prek() {
+	version=$PREK_VERSION
+	os=$(uname -s)
+	arch=$(uname -m)
+	case "$os/$arch" in
+		Darwin/arm64)
+			target=aarch64-apple-darwin
+			checksum=88eec06dd10fd61a9b345223fafc9bedb6746ee4cc47377551239d89d752b365
+			;;
+		Darwin/x86_64)
+			target=x86_64-apple-darwin
+			checksum=bc3ddd3a5686fa97120ec2d09db9e7353df4311a85e7b00944342ddd9c4a2035
+			;;
+		Linux/aarch64|Linux/arm64)
+			target=aarch64-unknown-linux-musl
+			checksum=5ba9d0dc3d4add8cc2c569f4fa27b56d6a042a59f6ee008ec9d7790cece5a200
+			;;
+		Linux/x86_64)
+			target=x86_64-unknown-linux-musl
+			checksum=805632185f4539ca2eb0fd1b3b52ea842cecbc4ba1e749be430df948621353b0
+			;;
+		*)
+			echo "unsupported prek platform: $os/$arch" >&2
+			exit 1
+			;;
+	esac
 
-	echo "==> install $name $PRE_COMMIT_VERSION"
-	"$PYTHON_BIN" -m venv "$TOOL_DIR/pre-commit-venv"
-	"$TOOL_DIR/pre-commit-venv/bin/pip" install --disable-pip-version-check "pre-commit==$PRE_COMMIT_VERSION"
-	find "$TOOL_STAMP_DIR" -maxdepth 1 -type f -name "$name-*" -delete
-	: >"$stamp"
+	install_github_tarball_tool prek "$version" "$target" "$checksum" \
+		"https://github.com/j178/prek/releases/download/v$version/prek-$target.tar.gz" \
+		"prek-$target/prek"
+
+	# prek replaced the Python-venv pre-commit runner; drop its leftovers so
+	# bin/ and its version stamps keep a single owner.
+	rm -rf "$TOOL_DIR/pre-commit-venv"
+	find "$TOOL_STAMP_DIR" -maxdepth 1 -type f -name 'pre-commit-*' -delete
 }
 
 install_go_tool addlicense "$ADDLICENSE_VERSION" "github.com/google/addlicense@$ADDLICENSE_VERSION"
@@ -123,4 +191,4 @@ install_go_tool buf "$BUF_VERSION" "github.com/bufbuild/buf/cmd/buf@$BUF_VERSION
 install_go_tool wire "$WIRE_VERSION" "github.com/google/wire/cmd/wire@$WIRE_VERSION"
 install_go_tool golangci-lint "$GOLANGCI_LINT_VERSION" "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$GOLANGCI_LINT_VERSION"
 install_git_cliff
-install_pre_commit
+install_prek

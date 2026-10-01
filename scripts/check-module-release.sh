@@ -114,12 +114,17 @@ for module_dir in $modules; do
 done
 
 if [ -f "$pkg_dir/go.mod" ]; then
+	go_directive=$(sed -n 's/^go[[:space:]]*//p' go.mod | head -n 1)
+	if [ -z "$go_directive" ]; then
+		echo "go.mod has no go directive to mirror in the consumer fixture" >&2
+		exit 1
+	fi
 	consumer_dir="$tmp_dir/consumer"
 	mkdir -p "$consumer_dir"
 	cat >"$consumer_dir/go.mod" <<EOF
 module example.com/sindri-consumer
 
-go 1.26.4
+go $go_directive
 
 require github.com/codesjoy/sindri/pkg/$service $version
 EOF

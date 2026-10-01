@@ -25,8 +25,14 @@ replace its nested gen and SDK dependencies with local paths.
 The committed `go.work` and `go.work.sum` make the root module and nested modules
 available together during repository development. They do not affect external
 users and are not release evidence. Run
-`make modules-check SERVICE=<service>` to test the service's independent modules
+`task modules:check SERVICE=<service>` to test the service's independent modules
 with `GOWORK=off` and to compile an external SDK consumer when an SDK exists.
+That check owns module publishability while you develop: no `replace`
+directives, no bootstrap versions, and a real consumer build. `task
+service-release:check SERVICE=<service> VERSION=<version>` instead consumes a
+release manifest and its existing tags, and rebuilds the service against the
+published modules. Run the former continuously and the latter immediately
+before creating a tag.
 
 ## Service release manifests
 
@@ -51,7 +57,7 @@ contract. The contract assigned to a service version is immutable; additional
 exact client versions may be appended after the service is released, but an
 existing tested client must not be removed.
 
-Run `make service-release-check SERVICE=<service> VERSION=<version>` before
+Run `task service-release:check SERVICE=<service> VERSION=<version>` before
 creating a service tag. The check validates referenced tags and module
 dependencies, rejects unpublished module source drift, and tests the service
 with `GOWORK=off` after removing root-module local replacements.
@@ -68,9 +74,9 @@ Services and `internal/pkg` are part of the root module. Do not create a service
 Go module or an `internal/pkg/...` tag. Create the service Git release marker
 after all modules referenced by its manifest have been published and verified.
 
-For Sequence v0.1.0, run `make proto SERVICE=sequence`, `make proto-lint`,
-`make modules-check SERVICE=sequence`,
-`make service-release-check SERVICE=sequence VERSION=v0.1.0`, then publish in
+For Sequence v0.1.0, run `task proto SERVICE=sequence`, `task proto:lint`,
+`task modules:check SERVICE=sequence`,
+`task service-release:check SERVICE=sequence VERSION=v0.1.0`, then publish in
 this order:
 
 ```text
@@ -82,8 +88,8 @@ service/sequence/v0.1.0
 After publishing the SDK, verify a temporary repository-external module can run
 `go get github.com/codesjoy/sindri/pkg/sequence@v0.1.0` and compile a minimal
 import. Publishing remains an explicit manual operation; repository checks do not
-push or create tags. After publishing, run `make chglog` or
-`make chglog MONTH=YYYY-MM` and commit the updated repository changelog at
+push or create tags. After publishing, run `task chglog` or
+`task chglog MONTH=YYYY-MM` and commit the updated repository changelog at
 `CHANGELOG.md`. The changelog is a monthly repository summary and is not release
 evidence for a service or module. Module tags and service tags remain the
 release evidence for consumers and deployable services.

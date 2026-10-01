@@ -27,7 +27,7 @@ on:
       - "internal/pkg/**"
       - "go.work"
       - "go.work.sum"
-      - "Makefile"
+      - "Taskfile.yml"
 
 permissions:
   contents: read
@@ -43,6 +43,9 @@ jobs:
           cache-dependency-path: |
             go.sum
             gen/go/{{SERVICE}}/go.sum
-      - run: make tools.install
-      - run: make proto-lint
-      - run: make test build modules-check SERVICE={{SERVICE}}
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.42.1
+      - run: task tools:install
+      - run: task proto:lint
+      - run: task test build modules:check SERVICE={{SERVICE}}

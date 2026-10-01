@@ -30,6 +30,11 @@ lint:
     - ENUM_VALUE_PREFIX
     - ENUM_ZERO_VALUE_SUFFIX
   ignore_only:
+    # Legacy exception: sequence predates the versioned reason package
+    # convention, so its unversioned package needs this entry. Scaffolded
+    # services use codesjoy.sindri.<service>.reason.v1 and lint without one.
+    # buf matches exact paths here, so a future unversioned package needs its own
+    # entry rather than a glob.
     PACKAGE_VERSION_SUFFIX:
       - sindri/sequence/reason/reason.proto
 

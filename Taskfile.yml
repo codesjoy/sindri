@@ -1,0 +1,350 @@
+# Copyright 2026 Codesjoy
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+version: '3'
+
+set: [ pipefail ]
+
+vars:
+  GO: '{{default "go" .GO}}'
+  SERVICE: '{{default "sequence" .SERVICE}}'
+  PROFILE: '{{default "service" .PROFILE}}'
+  MONTH: '{{default "" .MONTH}}'
+  COPYRIGHT_YEAR: '{{now | date "2006"}}'
+  TOOL_DIR: '{{.ROOT_DIR}}/bin'
+  TOOL_STAMP_DIR: '{{.TOOL_DIR}}/.versions'
+  GOCACHE: '{{if .GOCACHE}}{{.GOCACHE}}{{else}}{{.ROOT_DIR}}/.cache/go-build{{end}}'
+  GOLANGCI_LINT_CACHE: '{{if .GOLANGCI_LINT_CACHE}}{{.GOLANGCI_LINT_CACHE}}{{else}}{{.ROOT_DIR}}/.cache/golangci-lint{{end}}'
+  ADDLICENSE_VERSION: v1.2.0
+  BUF_VERSION: v1.55.1
+  WIRE_VERSION: v0.7.0
+  GOLANGCI_LINT_VERSION: v2.12.2
+  PREK_VERSION: 0.5.4
+  GIT_CLIFF_VERSION: 2.13.1
+  SEQUENCE_SYSTEM_IMAGE: '{{default "skuld-sequence-system:local" .SEQUENCE_SYSTEM_IMAGE}}'
+  SEQUENCE_TEST_DIALECTS: '{{default "postgres,mysql" .SEQUENCE_TEST_DIALECTS}}'
+  # Task cannot discover workspace modules natively, so module discovery stays a
+  # single POSIX sh expression.
+  MODULES:
+    sh: 'printf ".\n"; find gen/go pkg -name go.mod -type f -print 2>/dev/null | sed "s|/go.mod$||" | sort'
+
+env:
+  GOCACHE: '{{.GOCACHE}}'
+  GOLANGCI_LINT_CACHE: '{{.GOLANGCI_LINT_CACHE}}'
+  TOOL_DIR: '{{.TOOL_DIR}}'
+  TOOL_STAMP_DIR: '{{.TOOL_STAMP_DIR}}'
+  ADDLICENSE_VERSION: '{{.ADDLICENSE_VERSION}}'
+  BUF_VERSION: '{{.BUF_VERSION}}'
+  WIRE_VERSION: '{{.WIRE_VERSION}}'
+  GOLANGCI_LINT_VERSION: '{{.GOLANGCI_LINT_VERSION}}'
+  PREK_VERSION: '{{.PREK_VERSION}}'
+  GIT_CLIFF_VERSION: '{{.GIT_CLIFF_VERSION}}'
+
+tasks:
+  default:
+    desc: List available repository tasks
+    cmds:
+      - task --list
+
+  setup:
+    desc: Install pinned tools and repository hooks
+    cmds:
+      - task: tools:install
+      - task: tools:check
+      - task: hooks:install
+
+  tools:install:
+    desc: Install pinned development tools into ./bin
+    env:
+      GO_BIN: '{{.GO}}'
+    preconditions:
+      - sh: 'command -v "{{.GO}}"'
+        msg: 'go is required to install tools'
+      - sh: 'command -v curl'
+        msg: 'curl is required to install binary tools'
+      - sh: 'command -v tar'
+        msg: 'tar is required to install binary tools'
+    cmds:
+      - ./scripts/install-tools.sh
+
+  tools:check:
+    desc: Check pinned development tools in ./bin
+    env:
+      GO_BIN: '{{.GO}}'
+    cmds:
+      - ./scripts/install-tools.sh check
+
+  license:
+    desc: Add Apache 2.0 headers to supported source files
+    deps: [ tools:check ]
+    env:
+      ADDLICENSE_BIN: '{{.TOOL_DIR}}/addlicense'
+      COPYRIGHT_YEAR: '{{.COPYRIGHT_YEAR}}'
+    cmds:
+      - ./scripts/check-license.sh write
+
+  license:check:
+    desc: Check Apache 2.0 headers in supported source files
+    deps: [ tools:check ]
+    env:
+      ADDLICENSE_BIN: '{{.TOOL_DIR}}/addlicense'
+    cmds:
+      - ./scripts/check-license.sh check
+
+  scaffold:service:
+    desc: 'Create SERVICE with PROFILE=service|contract|client'
+    cmds:
+      - './scripts/scaffold-service.sh "{{.SERVICE}}" "{{.PROFILE}}"'
+
+  chglog:
+    desc: Update the monthly repository changelog section
+    deps: [ tools:check ]
+    env:
+      GIT_CLIFF_BIN: '{{.TOOL_DIR}}/git-cliff'
+    cmds:
+      - ./scripts/chglog.sh month "{{.MONTH}}"
+
+  chglog:init:
+    desc: Rebuild repository changelog from commit months
+    deps: [ tools:check ]
+    env:
+      GIT_CLIFF_BIN: '{{.TOOL_DIR}}/git-cliff'
+    cmds:
+      - ./scripts/chglog.sh init
+
+  proto:
+    desc: Generate contracts for SERVICE and tidy its generated module
+    deps: [ tools:check ]
+    preconditions:
+      - sh: 'test -f "gen/go/{{.SERVICE}}/go.mod"'
+        msg: 'service {{.SERVICE}} has no generated-contract module'
+    cmds:
+      - task: proto:generate
+      - task: proto:tidy
+
+  proto:generate:
+    internal: true
+    dir: api
+    cmds:
+      - '"{{.TOOL_DIR}}/buf" generate --path "sindri/{{.SERVICE}}"'
+
+  proto:tidy:
+    internal: true
+    dir: 'gen/go/{{.SERVICE}}'
+    env:
+      GOWORK: off
+    cmds:
+      - '{{.GO}} mod tidy'
+
+  proto:lint:
+    desc: Lint and build all Protocol Buffer modules
+    deps: [ tools:check ]
+    dir: api
+    cmds:
+      - '"{{.TOOL_DIR}}/buf" lint'
+      - '"{{.TOOL_DIR}}/buf" build >/dev/null'
+
+  proto:breaking-check:
+    desc: Reject breaking Proto changes against main
+    deps: [ tools:check ]
+    cmds:
+      - '"{{.TOOL_DIR}}/buf" breaking api --against ''.git#branch=main,subdir=api'''
+
+  wire:
+    desc: Regenerate Wire output for SERVICE
+    deps: [ tools:check ]
+    env:
+      WIRE_BIN: '{{.TOOL_DIR}}/wire'
+    cmds:
+      - 'test -d "cmd/{{.SERVICE}}" || { echo "unknown service: {{.SERVICE}}" >&2; exit 2; }'
+      - 'cd "cmd/{{.SERVICE}}" && sh ../../scripts/generate-wire.sh'
+
+  go:lint:
+    desc: Run golangci-lint once per module
+    deps: [ tools:check ]
+    cmds:
+      - for: { var: MODULES }
+        task: go:lint:module
+        vars: { MODULE: '{{.ITEM}}' }
+
+  go:lint:module:
+    internal: true
+    dir: '{{.MODULE}}'
+    cmds:
+      - 'echo "==> lint {{.MODULE}}"'
+      - '"{{.TOOL_DIR}}/golangci-lint" run ./...'
+
+  go:fix:
+    desc: Apply Go formatting and safe lint fixes once per module
+    deps: [ tools:check ]
+    cmds:
+      - '"{{.TOOL_DIR}}/golangci-lint" fmt'
+      - for: { var: MODULES }
+        task: go:fix:module
+        vars: { MODULE: '{{.ITEM}}' }
+
+  go:fix:module:
+    internal: true
+    dir: '{{.MODULE}}'
+    cmds:
+      - '"{{.TOOL_DIR}}/golangci-lint" run --fix ./...'
+
+  fmt:check:
+    desc: Verify Go formatting without rewriting source
+    deps: [ tools:check ]
+    cmds:
+      - '"{{.TOOL_DIR}}/golangci-lint" fmt --diff'
+
+  test:package:
+    desc: Run tests for PACKAGE in MODULE (default root module)
+    requires:
+      vars: [ PACKAGE ]
+    vars:
+      MODULE: '{{default "." .MODULE}}'
+    dir: '{{.MODULE}}'
+    cmds:
+      - '{{.GO}} test "{{.PACKAGE}}"'
+
+  test:package:race:
+    desc: Run race-enabled tests for PACKAGE in MODULE (default root module)
+    requires:
+      vars: [ PACKAGE ]
+    vars:
+      MODULE: '{{default "." .MODULE}}'
+    dir: '{{.MODULE}}'
+    cmds:
+      - '{{.GO}} test -race "{{.PACKAGE}}"'
+
+  test:service:
+    desc: Run unit and component tests for SERVICE in the root module
+    preconditions:
+      - sh: 'test -d "internal/{{.SERVICE}}"'
+        msg: 'unknown service: {{.SERVICE}}'
+      - sh: 'test -d "cmd/{{.SERVICE}}"'
+        msg: 'service command directory is missing: cmd/{{.SERVICE}}'
+    cmds:
+      - 'echo "==> test {{.SERVICE}} (root module)"'
+      - '{{.GO}} test ./internal/{{.SERVICE}}/... ./cmd/{{.SERVICE}}/...'
+
+  test:
+    desc: Run unit and component tests in every workspace module (merge gate)
+    cmds:
+      - for: { var: MODULES }
+        task: test:module
+        vars: { MODULE: '{{.ITEM}}' }
+
+  test:module:
+    internal: true
+    dir: '{{.MODULE}}'
+    cmds:
+      - 'echo "==> test {{.MODULE}}"'
+      - '{{.GO}} test ./...'
+
+  test:race:
+    desc: Run race-enabled tests in every workspace module (merge gate)
+    cmds:
+      - for: { var: MODULES }
+        task: test:race:module
+        vars: { MODULE: '{{.ITEM}}' }
+
+  test:race:module:
+    internal: true
+    dir: '{{.MODULE}}'
+    cmds:
+      - 'echo "==> race {{.MODULE}}"'
+      - '{{.GO}} test -race ./...'
+
+  build:
+    desc: Build every workspace module
+    cmds:
+      - for: { var: MODULES }
+        task: build:module
+        vars: { MODULE: '{{.ITEM}}' }
+
+  build:module:
+    internal: true
+    dir: '{{.MODULE}}'
+    cmds:
+      - 'echo "==> build {{.MODULE}}"'
+      - '{{.GO}} build ./...'
+
+  modules:check:
+    desc: Verify all publishable modules without workspace replacement
+    preconditions:
+      - sh: 'command -v zip'
+        msg: 'zip is required to package publishable modules'
+    cmds:
+      - './scripts/check-module-release.sh "{{.SERVICE}}"'
+
+  service-release:check:
+    desc: Validate SERVICE VERSION against published modules
+    requires:
+      vars: [ VERSION ]
+    cmds:
+      - '{{.GO}} run ./tools/service-release-check -service "{{.SERVICE}}" -version "{{.VERSION}}"'
+
+  release:check:
+    desc: Validate SERVICE modules before creating module tags
+    cmds:
+      - task: proto:lint
+      - task: modules:check
+
+  build:sequence-test-image:
+    desc: Build the real Sequence process image used by system tests
+    preconditions:
+      - sh: 'command -v docker'
+        msg: 'docker is required for sequence system tests'
+    env:
+      CGO_ENABLED: '0'
+      GOOS: linux
+    cmds:
+      - mkdir -p artifacts/sequence
+      - '{{.GO}} build -trimpath -o artifacts/sequence/sequence ./cmd/sequence'
+      - 'docker build --progress=plain -f tests/sequence/testdata/Dockerfile -t "{{.SEQUENCE_SYSTEM_IMAGE}}" .'
+
+  test:sequence:integration:
+    desc: Run Sequence store and E2E integration tests
+    deps: [ build:sequence-test-image ]
+    env:
+      SKULD_SEQUENCE_TEST_DIALECTS: '{{.SEQUENCE_TEST_DIALECTS}}'
+      SKULD_SEQUENCE_TEST_IMAGE: '{{.SEQUENCE_SYSTEM_IMAGE}}'
+    cmds:
+      - '{{.GO}} test -tags=integration -count=1 -timeout=20m ./tests/sequence/...'
+
+  test:sequence:chaos:
+    desc: Run deterministic Sequence system and chaos tests
+    deps: [ build:sequence-test-image ]
+    env:
+      SKULD_SEQUENCE_TEST_DIALECTS: '{{.SEQUENCE_TEST_DIALECTS}}'
+      SKULD_SEQUENCE_TEST_IMAGE: '{{.SEQUENCE_SYSTEM_IMAGE}}'
+    cmds:
+      - '{{.GO}} test -tags="integration chaos" -count=1 -timeout=40m ./tests/sequence/...'
+
+  verify:
+    desc: Run the complete merge gate
+    cmds:
+      - task: fmt:check
+      - task: go:lint
+      - task: proto:lint
+      - task: license:check
+      - task: test
+      - task: test:race
+      - task: build
+      - task: modules:check
+
+  hooks:install:
+    desc: Install the prek Git hook shims
+    deps: [ tools:check ]
+    cmds:
+      - '"{{.TOOL_DIR}}/prek" install --force --prepare-hooks'

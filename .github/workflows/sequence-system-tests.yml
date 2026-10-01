@@ -30,12 +30,8 @@ on:
       - "go.sum"
       - "go.work"
       - "go.work.sum"
-      - "Makefile"
-      - "scripts/check-module-release.sh"
-      - "scripts/test-module-release.sh"
-      - "scripts/scaffold-service.sh"
-      - "scripts/test-scaffold-service.sh"
-      - "scripts/templates/service/**"
+      - "Taskfile.yml"
+      - "scripts/**"
       - "tools/service-release-check/**"
       - "releases/services/sequence.yaml"
       - ".github/workflows/sequence-system-tests.yml"
@@ -96,7 +92,7 @@ jobs:
               - 'go.sum'
               - 'go.work'
               - 'go.work.sum'
-              - 'Makefile'
+              - 'Taskfile.yml'
               - '.github/workflows/sequence-system-tests.yml'
 
   modules:
@@ -113,10 +109,20 @@ jobs:
             go.sum
             gen/go/sequence/go.sum
             pkg/sequence/go.sum
-      - name: Verify workspace modules
-        run: >-
-          make scaffold-test release-test test build modules-check
-          service-release-check SERVICE=sequence VERSION=v0.1.0
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.42.1
+      - name: Cache pinned tools
+        uses: actions/cache@v4
+        with:
+          path: bin
+          key: ${{ runner.os }}-sindri-tools-${{ hashFiles('Taskfile.yml') }}
+      - name: Install pinned tools
+        run: task tools:install
+      - name: Run complete merge gate
+        run: task verify
+      - name: Verify the sequence release manifest
+        run: task service-release:check SERVICE=sequence VERSION=v0.1.0
 
   integration-postgres:
     if: github.event_name == 'pull_request'
@@ -131,12 +137,15 @@ jobs:
             go.sum
             gen/go/sequence/go.sum
             pkg/sequence/go.sum
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.42.1
       - name: Run PostgreSQL sequence integration tests
         shell: bash
         run: |
           mkdir -p artifacts/sequence
           set -o pipefail
-          make test-sequence-integration SEQUENCE_TEST_DIALECTS=postgres 2>&1 | tee artifacts/sequence/integration-postgres.log
+          task test:sequence:integration SEQUENCE_TEST_DIALECTS=postgres 2>&1 | tee artifacts/sequence/integration-postgres.log
       - name: Upload PostgreSQL sequence test output
         if: always()
         uses: actions/upload-artifact@v4
@@ -159,12 +168,15 @@ jobs:
             go.sum
             gen/go/sequence/go.sum
             pkg/sequence/go.sum
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.42.1
       - name: Run MySQL sequence integration tests
         shell: bash
         run: |
           mkdir -p artifacts/sequence
           set -o pipefail
-          make test-sequence-integration SEQUENCE_TEST_DIALECTS=mysql 2>&1 | tee artifacts/sequence/integration-mysql.log
+          task test:sequence:integration SEQUENCE_TEST_DIALECTS=mysql 2>&1 | tee artifacts/sequence/integration-mysql.log
       - name: Upload MySQL sequence test output
         if: always()
         uses: actions/upload-artifact@v4
@@ -196,12 +208,15 @@ jobs:
             go.sum
             gen/go/sequence/go.sum
             pkg/sequence/go.sum
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.42.1
       - name: Run deterministic sequence chaos tests
         shell: bash
         run: |
           mkdir -p artifacts/sequence
           set -o pipefail
-          make test-sequence-chaos SEQUENCE_TEST_DIALECTS=${{ matrix.dialect }} 2>&1 | tee artifacts/sequence/chaos-${{ matrix.dialect }}.log
+          task test:sequence:chaos SEQUENCE_TEST_DIALECTS=${{ matrix.dialect }} 2>&1 | tee artifacts/sequence/chaos-${{ matrix.dialect }}.log
       - name: Upload sequence test output
         if: always()
         uses: actions/upload-artifact@v4

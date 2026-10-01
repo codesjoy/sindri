@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Executed by prek; the filename and schema stay in the pre-commit format.
 default_install_hook_types:
   - pre-commit
   - commit-msg

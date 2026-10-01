@@ -24,7 +24,8 @@ import (
 
 // provideBusinessBundle is the seed of the service's composition. Providers for
 // the service's own components are added here as they appear, and
-// `make wire SERVICE={{SERVICE}}` regenerates wire_gen.go from this file.
+// `task wire SERVICE={{SERVICE}}` regenerates wire_gen.go from this file. Wiring
+// this bundle into the Yggdrasil runtime in main.go is the service's first change.
 func provideBusinessBundle() *yggdrasil.BusinessBundle {
 	return &yggdrasil.BusinessBundle{}
 }

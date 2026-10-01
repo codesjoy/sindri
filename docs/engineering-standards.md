@@ -5,6 +5,10 @@ security domains, resource ownership, service contracts, and workflows belong in
 the relevant architecture documents. Repository configuration and `go.mod` files
 are the source of truth for dependency versions.
 
+The words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are
+normative. A change that violates a MUST rule requires an explicit design
+decision recorded in the change review.
+
 ## 1. Technology and repository layout
 
 The services use Go, Yggdrasil, Protocol Buffers, GORM, Wire, PostgreSQL, and the
@@ -50,6 +54,33 @@ docs/                  Architecture and engineering documentation
 - `pkg/`, `internal/pkg`, and shared packages may contain protocols, cryptographic or event
   infrastructure, and real infrastructure adapters, but MUST NOT own product
   resources, domain state machines, or copied cross-service facts.
+
+### Repository commands
+
+Task v3 is the repository command runner, and `Taskfile.yml` is the source of
+truth for command names and pinned tool versions. `task --list` lists every
+development, verification, and release command, and `task setup` installs the
+pinned tools into `bin/` and the Git hooks. `task verify` is the complete merge
+gate and the only definition of it: formatting, static analysis, Protocol
+Buffer lint, license headers, unit and component tests, race tests, module
+builds, and the publishable-module check. Continuous integration owns this gate
+and invokes `task verify` instead of repeating that list. Local iteration uses
+the scoped test tasks in section 6 (`task test:package`,
+`task test:package:race`, and `task test:service`) so only the checks a change
+can affect run; narrowing a local run MUST NOT hide or ignore a failure. Do not
+add ad-hoc shell entry points that duplicate a task.
+
+Pinned tool versions live in `Taskfile.yml`; `scripts/install-tools.sh` installs
+and verifies them from the environment Task passes in. Tool installation
+supports macOS and Linux; on Git Bash the tasks work, but the pinned tools must
+be provided separately. Go and golangci-lint caches default to `.cache/go-build`
+and `.cache/golangci-lint`; the `GOCACHE` and `GOLANGCI_LINT_CACHE` environment
+variables override them.
+
+Tasks SHOULD prefer native Task semantics (`deps`, `for`, `env`, `dir`,
+`preconditions`) over inline POSIX shell, so the same task works on every
+supported platform. Inline shell is limited to what Task cannot express, and
+multi-step shell logic belongs in `scripts/` behind a task.
 
 ## 2. Ownership and data boundaries
 
@@ -200,10 +231,56 @@ or sharing an uncontrolled temporary database.
 - Service-local test helpers belong under that service's `internal`. Helpers
   genuinely shared across services belong in `internal/pkg/tests`.
 
-Before review, run the repository's configured build, test, lint, formatting,
-module-isolation, and protocol-generation checks (normally `make build`,
-`make test`, `make modules-check SERVICE=<service>`, `make go-lint`,
-`make go-fix`, and `make proto SERVICE=<service>` as applicable).
+Verification is tiered. Run the smallest tier that covers the change; CI owns
+the merge gate.
+
+Tier 0 is the default for every change:
+
+| Change surface | Local checks |
+| --- | --- |
+| Single Go package | `task test:package PACKAGE=./internal/<service>/<package>/...` |
+| Concurrency, locks, goroutines, or channels | `task test:package:race PACKAGE=./internal/<service>/<package>/...` |
+| Multiple packages or an interface inside one service | `task test:service SERVICE=<service>` |
+| A `pkg/<name>` module | `task test:package MODULE=./pkg/<name> PACKAGE=./...` |
+| Shared `internal/pkg` or cross-package exported interfaces | `task test:package PACKAGE=./...` (whole root module) |
+| Protocol Buffer sources | `task proto SERVICE=<service>`, `task proto:lint`, then service tests |
+| Wire or dependency-graph changes | `task wire SERVICE=<service>`, then service tests |
+| Go files touched by any change | `task fmt:check` |
+| Docs or comments only | No Go test run is required |
+
+Tier 1 is the merge gate and is owned by CI: `task verify` combines formatting,
+static analysis, Protocol Buffer lint, license headers, unit and component tests
+for every module, race tests, builds, and the publishable-module check. Run it
+locally only when the user asks, when CI is unavailable, or when the change
+touches the gate itself or module boundaries (for example `Taskfile.yml`,
+linters, `go.mod`, `go.work`, or release manifests). Narrowing local runs is not
+skipping coverage; failing or hiding a check is.
+
+Tier 2 covers integration and release surfaces:
+
+```sh
+task test:sequence:integration                  # PostgreSQL/MySQL integration tests; Docker required
+task test:sequence:chaos                        # deterministic system and chaos tests; Docker required
+task service-release:check SERVICE=<service> VERSION=<version>
+```
+
+The complete command surface remains:
+
+```sh
+task tools:install                              # when pinned tools are missing
+task fmt:check                                  # verify formatting without rewriting files
+task go:fix                                     # apply formatting and safe lint fixes
+task test                                       # unit and component tests in every workspace module (merge gate)
+task test:race                                  # race-enabled tests in every workspace module (merge gate)
+task build                                      # build every workspace module
+task modules:check SERVICE=<service>            # publishable modules with GOWORK=off
+task service-release:check SERVICE=<service> VERSION=<version>
+task verify                                     # complete merge gate, including go:lint and license:check
+```
+
+Use `task proto SERVICE=<service>` after changing Protocol Buffer sources and
+`task wire SERVICE=<service>` after changing a service dependency graph.
+Generated output MUST be reviewed together with its input change.
 
 ## 7. Module release rules
 
@@ -226,8 +303,9 @@ module-isolation, and protocol-generation checks (normally `make build`,
 ## 8. Git and change review
 
 Git history is part of the repository's engineering interface. Install the
-repository hooks with `make hooks.install`. The pre-commit and commit-msg hooks
-enforce local branch naming and commit-message policy.
+repository hooks with `task hooks:install`; [prek](https://github.com/j178/prek)
+manages the shims. The pre-commit and commit-msg hooks enforce local branch
+naming and commit-message policy.
 
 ### 8.1 Branch names
 
@@ -307,3 +385,32 @@ Each change review SHOULD answer:
 
 The module and service release rules in section 7 remain authoritative for
 tags, release manifests, and publication order.
+
+## 9. AI-assisted changes
+
+AI-generated changes follow the same ownership, layering, and review rules as
+human changes. Before editing, an agent MUST inspect the relevant package,
+tests, configuration, migrations, and generated-file boundaries, and MUST
+preserve unrelated changes in the worktree.
+
+Before handing off a change, the agent SHOULD verify:
+
+- The smallest responsible service, module, or package owns the behavior.
+- Existing interfaces, helpers, and repository tasks were reused where
+  appropriate.
+- Validation happens at the trust boundary that owns it, and business
+  invariants remain in `biz`.
+- Contexts, timeouts, error mapping, idempotency, and cleanup are handled.
+- Tests cover success, invalid input, repeated requests, and dependency
+  failures relevant to the change.
+- Generated files were regenerated with the repository tasks instead of edited
+  by hand.
+- The Tier 0 checks from section 6 that cover the change pass; run the Tier 1
+  gate locally only in the cases section 6 names.
+- The final summary names the changed files, the exact verification commands
+  run, and any Tier 1 or Tier 2 checks delegated to CI or left as a remaining
+  limitation.
+
+When repository behavior and a proposed change conflict, the implementation
+MUST follow the existing code and tests unless the change explicitly updates the
+affected contract and its regression coverage.

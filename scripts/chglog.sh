@@ -55,7 +55,7 @@ cd "$repo_root"
 changelog="CHANGELOG.md"
 
 if [ ! -x "$git_cliff" ]; then
-	echo "git-cliff is missing: $git_cliff (run make tools.install)" >&2
+	echo "git-cliff is missing: $git_cliff (run task tools:install)" >&2
 	exit 1
 fi
 if [ ! -f cliff.toml ]; then
