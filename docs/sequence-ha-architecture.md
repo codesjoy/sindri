@@ -135,6 +135,20 @@ same transaction. A node's own clock never decides who may take a slot over.
 `sequence.ha.storage_clock_forward_jump_seconds` are how a deployment observes
 the property (appendix E).
 
+Clock observations bracket each database sample with local monotonic readings.
+The monitor compares the possible elapsed-time intervals and fences only when
+every possible drift exceeds the asserted bound. Network or scheduling jitter
+that leaves the comparison ambiguous increments
+`sequence.ha.clock_uncertain_samples` instead of fencing; sampling RTT is exposed
+as `sequence.ha.clock_sample_rtt_seconds`. Sampling is anomaly detection, not a
+replacement for the platform's clock and pause guarantees.
+
+Optional allocation recording keeps both its observation ring and its per-key
+LRU at 4,096 entries by default. Key eviction increments
+`sequence.ha.recording_evicted_keys` and forgets that key's comparison baseline,
+but never resets cumulative counters. This is bounded, process-local evidence,
+not an unlimited-history or cross-node ordering audit.
+
 ### 3.2 Bounds
 
 | Symbol | Configuration | Meaning |

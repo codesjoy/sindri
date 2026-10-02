@@ -17,6 +17,7 @@ package biz
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"testing"
@@ -990,6 +991,50 @@ func TestLinearizationRecorderBoundsItsRing(t *testing.T) {
 	assert.Equal(t, int64(10), observations[3].ID)
 	// The counters survive the ring, which is what makes them the alertable part.
 	assert.Equal(t, int64(10), recorder.Counters().Recorded)
+}
+
+func TestLinearizationRecorderBoundsItsKeyHistory(t *testing.T) {
+	recorder := NewLinearizationRecorder(2)
+	start := time.Unix(0, 0)
+	for index, key := range []string{"a", "b", "a", "c", "b"} {
+		at := start.Add(time.Duration(index) * time.Second)
+		recorder.Record(observationAt(key, int64(index+1), at, at))
+		assert.LessOrEqual(t, len(recorder.lastComplete), 2)
+		assert.LessOrEqual(t, recorder.lru.Len(), 2)
+	}
+	assert.Equal(t, int64(2), recorder.Counters().EvictedKeys)
+	assert.Equal(t, int64(5), recorder.Counters().Recorded)
+	assert.NotContains(t, recorder.lastComplete, "a")
+	assert.Contains(t, recorder.lastComplete, "b")
+	assert.Contains(t, recorder.lastComplete, "c")
+	assert.Zero(t, recorder.Counters().OrderViolations)
+}
+
+func TestLinearizationRecorderDefaultCapacityAndEvictedBaseline(t *testing.T) {
+	recorder := NewLinearizationRecorder(0)
+	require.Equal(t, MaxLinearizationSamples, recorder.capacity)
+	start := time.Unix(0, 0)
+	recorder.Record(observationAt("anchor", 2, start, start))
+	recorder.Record(observationAt("anchor", 1, start.Add(time.Second), start.Add(time.Second)))
+	for index := range MaxLinearizationSamples + 32 {
+		at := start.Add(time.Duration(index+2) * time.Second)
+		recorder.Record(observationAt(fmt.Sprintf("bounded-key-%d", index), 1, at, at))
+	}
+	require.Len(t, recorder.ring, MaxLinearizationSamples)
+	require.Len(t, recorder.lastComplete, MaxLinearizationSamples)
+	require.Equal(t, MaxLinearizationSamples, recorder.lru.Len())
+	require.NotContains(t, recorder.lastComplete, "anchor")
+	at := start.Add(time.Hour)
+	recorder.Record(observationAt("anchor", 1, at, at))
+	counters := recorder.Counters()
+	assert.Equal(t, int64(34), counters.EvictedKeys)
+	assert.Equal(t, int64(MaxLinearizationSamples+35), counters.Recorded)
+	assert.Equal(
+		t,
+		int64(1),
+		counters.OrderViolations,
+		"an evicted key gets a new baseline; old counters survive",
+	)
 }
 
 // TestAllocatorRecordsHandedOutAllocations pins the integration: with the record

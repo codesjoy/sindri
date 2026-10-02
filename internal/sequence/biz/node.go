@@ -92,7 +92,13 @@ func (m *NodeManager) Heartbeat() {
 	// The clock comparison comes first: it decides whether any of the bounds the
 	// rest of this function relies on are still known to hold.
 	if m.clock != nil {
-		if err := m.clock.Observe(context.Background()); err != nil &&
+		clockCtx, clockCancel := context.WithTimeout(
+			context.Background(),
+			m.allocator.storeTimeout(),
+		)
+		err := m.clock.Observe(clockCtx)
+		clockCancel()
+		if err != nil &&
 			errors.Is(err, ErrStorageClockViolation) {
 			// An unreachable store is not a clock violation: the allocation path
 			// already fails those closed with their own retriable reason, and
@@ -281,10 +287,13 @@ type StorageClockMonitor struct {
 	mu          sync.Mutex
 	armed       bool
 	lastStorage time.Time
-	lastLocal   time.Time
+	lastStart   time.Time
+	lastEnd     time.Time
 	drift       time.Duration
 	forwardJump time.Duration
 	violated    bool
+	sampleRTT   time.Duration
+	uncertain   int64
 }
 
 // NewStorageClockMonitor constructs a monitor for the asserted bounds.
@@ -310,34 +319,41 @@ func NewStorageClockMonitor(
 // elapsed intervals. That offset is exactly what the protocol is designed not to
 // depend on.
 func (m *StorageClockMonitor) Observe(ctx context.Context) error {
+	start := m.now()
 	storage, err := m.read(ctx)
+	end := m.now()
 	if err != nil {
 		// An unreachable store is a storage failure, not a clock one. The
 		// allocation path already fails those closed with their own reason.
 		return err
 	}
-	local := m.now()
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.sampleRTT = end.Sub(start)
 	if !m.armed {
 		m.armed = true
 		m.lastStorage = storage
-		m.lastLocal = local
+		m.lastStart = start
+		m.lastEnd = end
 		return nil
 	}
 	storageDelta := storage.Sub(m.lastStorage)
-	localDelta := local.Sub(m.lastLocal)
+	// Each database timestamp was sampled somewhere inside its request interval.
+	lower := storageDelta - end.Sub(m.lastStart)
+	upper := storageDelta - start.Sub(m.lastEnd)
 	m.lastStorage = storage
-	m.lastLocal = local
+	m.lastStart = start
+	m.lastEnd = end
 
-	drift := storageDelta - localDelta
+	drift := lower + (upper-lower)/2
 	m.drift = drift
-	if drift > m.forwardJump {
-		m.forwardJump = drift
+	if lower > m.forwardJump {
+		m.forwardJump = lower
 	}
-	if !m.violated && (drift > m.jumpBound || absDuration(drift) > m.driftBound) {
+	if lower > m.jumpBound || lower > m.driftBound || upper < -m.driftBound {
 		m.violated = true
+	} else if lower < -m.driftBound || upper > m.driftBound || upper > m.jumpBound {
+		m.uncertain++
 	}
 	if m.violated {
 		return ErrStorageClockViolation
@@ -355,10 +371,12 @@ func (m *StorageClockMonitor) Violated() bool {
 
 // StorageClockStats is a low-cardinality snapshot of the clock comparison.
 type StorageClockStats struct {
-	// Drift is the signed difference between the storage clock's elapsed time and
-	// the local clock's over the last interval.
+	SampleRTT        time.Duration
+	UncertainSamples int64
+	// Drift is the midpoint of the possible signed elapsed-time differences;
+	// only the entire interval outside a bound establishes a violation.
 	Drift time.Duration
-	// ForwardJump is the largest forward difference observed.
+	// ForwardJump is the largest confirmed lower bound on a forward difference.
 	ForwardJump time.Duration
 	// Violated reports whether a bound was exceeded.
 	Violated bool
@@ -369,15 +387,10 @@ func (m *StorageClockMonitor) Stats() StorageClockStats {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return StorageClockStats{
-		Drift:       m.drift,
-		ForwardJump: m.forwardJump,
-		Violated:    m.violated,
+		SampleRTT:        m.sampleRTT,
+		UncertainSamples: m.uncertain,
+		Drift:            m.drift,
+		ForwardJump:      m.forwardJump,
+		Violated:         m.violated,
 	}
-}
-
-func absDuration(value time.Duration) time.Duration {
-	if value < 0 {
-		return -value
-	}
-	return value
 }

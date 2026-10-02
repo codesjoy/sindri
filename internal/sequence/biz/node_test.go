@@ -344,6 +344,24 @@ func TestStorageClockMonitorArmsOnTheFirstReading(t *testing.T) {
 	assert.Zero(t, monitor.Stats().Drift)
 }
 
+func TestStorageClockSamplingLatencyDoesNotFence(t *testing.T) {
+	probe := newClockProbe()
+	delay := 250 * time.Millisecond
+	monitor := NewStorageClockMonitor(100*time.Millisecond, 100*time.Millisecond, probe.Now,
+		func(context.Context) (time.Time, error) {
+			stamp := probe.storage
+			probe.advance(delay, delay)
+			return stamp, nil
+		})
+	require.NoError(t, monitor.Observe(context.Background()))
+	probe.advance(time.Second, time.Second)
+	delay = 500 * time.Millisecond
+	require.NoError(t, monitor.Observe(context.Background()))
+	assert.False(t, monitor.Violated())
+	assert.Equal(t, delay, monitor.Stats().SampleRTT)
+	assert.Positive(t, monitor.Stats().UncertainSamples)
+}
+
 func TestStorageClockMonitorAcceptsDriftWithinTheBound(t *testing.T) {
 	probe := newClockProbe()
 	monitor := NewStorageClockMonitor(time.Second, time.Second, probe.Now, probe.StorageClock)

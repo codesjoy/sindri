@@ -62,6 +62,16 @@ func registerHAMetrics(
 		"largest forward jump of the storage clock seen; this is the only "+
 			"evidence J_max leaves",
 	)
+	clockRTT := registrar.float64Gauge(
+		"sequence.ha.clock_sample_rtt_seconds",
+		"s",
+		"storage clock sampling round-trip time",
+	)
+	clockUncertain := registrar.int64Counter(
+		"sequence.ha.clock_uncertain_samples",
+		"{sample}",
+		"clock samples that cannot establish a bound violation",
+	)
 	inflight := registrar.int64Gauge(
 		"sequence.allocator.inflight", "{request}",
 		"allocations currently inside a slot gate",
@@ -142,6 +152,8 @@ func registerHAMetrics(
 		maxPause,
 		clockDrift,
 		clockJump,
+		clockRTT,
+		clockUncertain,
 		inflight,
 		leaseExpired,
 		pauseViolations,
@@ -163,6 +175,8 @@ func registerHAMetrics(
 			observer.ObserveFloat64(maxPause, ha.MaxPause.Seconds())
 			observer.ObserveInt64(inflight, allocator.InflightAllocations())
 			clockStats := clock.Stats()
+			observer.ObserveFloat64(clockRTT, clockStats.SampleRTT.Seconds())
+			observer.ObserveInt64(clockUncertain, clockStats.UncertainSamples)
 			observer.ObserveFloat64(clockDrift, clockStats.Drift.Seconds())
 			observer.ObserveFloat64(clockJump, clockStats.ForwardJump.Seconds())
 			observer.ObserveInt64(leaseExpired, stats.LeaseExpired)
@@ -236,6 +250,11 @@ func registerLinearizationCounters(
 		"sequence.ha.allocation_order_violation_total", "{event}",
 		"allocations that broke the ordering property; must stay zero",
 	)
+	evictions := registrar.int64Counter(
+		"sequence.ha.recording_evicted_keys",
+		"{key}",
+		"keys evicted from the bounded local allocation recorder",
+	)
 	if registrar.err != nil {
 		return nil, nil, registrar.err
 	}
@@ -247,10 +266,12 @@ func registerLinearizationCounters(
 		observer.ObserveInt64(staleDeliveries, current.StaleDeliveries)
 		observer.ObserveInt64(duplicateDeliveries, current.DuplicateDeliveries)
 		observer.ObserveInt64(orderViolations, current.OrderViolations)
+		observer.ObserveInt64(evictions, current.EvictedKeys)
 	}
 	return write, []metric.Observable{
 		staleDeliveries,
 		duplicateDeliveries,
 		orderViolations,
+		evictions,
 	}, nil
 }

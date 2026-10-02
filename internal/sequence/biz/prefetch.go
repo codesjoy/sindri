@@ -15,6 +15,7 @@
 package biz
 
 import (
+	"container/list"
 	"context"
 	"math"
 	rand "math/rand/v2"
@@ -688,6 +689,8 @@ type LinearizationObservation struct {
 // to read and the most direct symptom of the failure this whole design exists to
 // prevent.
 type LinearizationCounters struct {
+	// EvictedKeys counts forgotten LRU baselines, not ordering violations.
+	EvictedKeys          int64
 	OrderViolations      int64
 	DuplicateDeliveries  int64
 	StaleDeliveries      int64
@@ -702,18 +705,21 @@ type LinearizationCounters struct {
 // returned before request B started, then B's id must be greater. That is a
 // narrower test than a global linearisation order -- two overlapping requests are
 // not compared -- but everything it flags is a real violation, and it needs no
-// coordination between nodes, which is what makes it affordable on the hot path.
+// coordination between nodes. Only this process's retained observations are
+// compared: the recorder is not a complete cross-node ordering audit.
 //
 // Recording is off unless a deployment asks for it. The bound is what keeps it
-// affordable when it is on: the ring drops the oldest observation, so a long run
-// costs a fixed amount of memory, and the counters are what survive the ring.
+// affordable when it is on: both the observation ring and the per-key LRU are
+// bounded by capacity. Eviction forgets a key's baseline; cumulative counters
+// survive eviction and ring replacement.
 type LinearizationRecorder struct {
 	capacity int
 
 	mu           sync.Mutex
 	ring         []LinearizationObservation
 	next         int
-	lastComplete map[string]LinearizationObservation
+	lastComplete map[string]*list.Element
+	lru          list.List
 	counters     LinearizationCounters
 }
 
@@ -721,12 +727,12 @@ type LinearizationRecorder struct {
 // observations.
 func NewLinearizationRecorder(capacity int) *LinearizationRecorder {
 	if capacity <= 0 {
-		capacity = 1024
+		capacity = MaxLinearizationSamples
 	}
 	return &LinearizationRecorder{
 		capacity:     capacity,
 		ring:         make([]LinearizationObservation, 0, capacity),
-		lastComplete: make(map[string]LinearizationObservation),
+		lastComplete: make(map[string]*list.Element),
 	}
 }
 
@@ -740,8 +746,10 @@ func (r *LinearizationRecorder) Record(observation LinearizationObservation) {
 	defer r.mu.Unlock()
 	r.counters.Recorded++
 
-	if previous, ok := r.lastComplete[observation.Key]; ok &&
-		previous.ResponseReceived.Before(observation.RequestStart) {
+	entry := r.lastComplete[observation.Key]
+	if entry != nil &&
+		entry.Value.(LinearizationObservation).ResponseReceived.Before(observation.RequestStart) {
+		previous := entry.Value.(LinearizationObservation)
 		switch {
 		case observation.ID < previous.ID:
 			r.counters.StaleDeliveries++
@@ -753,9 +761,21 @@ func (r *LinearizationRecorder) Record(observation LinearizationObservation) {
 			r.counters.OrderViolationDetail = detail(previous, observation)
 		}
 	}
-	if current, ok := r.lastComplete[observation.Key]; !ok ||
-		observation.ResponseReceived.After(current.ResponseReceived) {
-		r.lastComplete[observation.Key] = observation
+	if entry == nil {
+		if len(r.lastComplete) == r.capacity {
+			oldest := r.lru.Back()
+			delete(r.lastComplete, oldest.Value.(LinearizationObservation).Key)
+			r.lru.Remove(oldest)
+			r.counters.EvictedKeys++
+		}
+		r.lastComplete[observation.Key] = r.lru.PushFront(observation)
+	} else {
+		if observation.ResponseReceived.After(
+			entry.Value.(LinearizationObservation).ResponseReceived,
+		) {
+			entry.Value = observation
+		}
+		r.lru.MoveToFront(entry)
 	}
 
 	if len(r.ring) < r.capacity {

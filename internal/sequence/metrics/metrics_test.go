@@ -143,6 +143,16 @@ func TestAllocatorMetricsCollectsRuntimeAndAllocatorValues(t *testing.T) {
 	assert.Equal(t, float64(0), values["sequence.ha.pause_violations"])
 	assert.Equal(t, float64(0), values["sequence.ha.gate_fenced"])
 	assert.Equal(t, float64(0), values["sequence.ha.renewal"])
+	require.Contains(t, values, "sequence.ha.clock_sample_rtt_seconds")
+	require.Contains(t, values, "sequence.ha.clock_uncertain_samples")
+	assert.Zero(t, values["sequence.ha.clock_sample_rtt_seconds"])
+	assert.Zero(t, values["sequence.ha.clock_uncertain_samples"])
+	assert.NotContains(
+		t,
+		values,
+		"sequence.ha.recording_evicted_keys",
+		"recording metrics must remain opt-in",
+	)
 }
 
 func TestAllocatorMetricsLifecycle(t *testing.T) {
