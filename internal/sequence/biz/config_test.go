@@ -71,7 +71,7 @@ func TestFrameworkDefaultsFillTheDataPlane(t *testing.T) {
 	assert.Equal(t, time.Second, plane.HA.RenewInterval)
 	assert.Equal(t, 2*time.Second, plane.HA.ReleaseDrainTimeout)
 	assert.Equal(t, 15*time.Second, plane.HA.NodeTTL)
-	assert.Equal(t, int64(3), plane.Node.HeartbeatTimeoutTicks)
+	assert.Equal(t, time.Second, plane.Node.HeartbeatInterval)
 	assert.Equal(t, time.Second, plane.Node.RouteQueryTimeout)
 }
 
@@ -83,13 +83,13 @@ func TestStatedZerosDecodeToTheDefaults(t *testing.T) {
 	require.NoError(t, testkit.Decode(&plane, map[string]any{
 		"allocator": map[string]any{"prefetch_ratio": 0},
 		"ha":        map[string]any{"lease_duration": 0, "node_ttl": 0},
-		"node":      map[string]any{"heartbeat_timeout_ticks": 0},
+		"node":      map[string]any{"heartbeat_interval": 0},
 	}))
 
 	assert.Equal(t, 0.5, plane.Allocator.PrefetchRatio)
 	assert.Equal(t, 3*time.Second, plane.HA.LeaseDuration)
 	assert.Equal(t, 15*time.Second, plane.HA.NodeTTL)
-	assert.Equal(t, int64(3), plane.Node.HeartbeatTimeoutTicks)
+	assert.Equal(t, time.Second, plane.Node.HeartbeatInterval)
 }
 
 // TestAllocatorReadsTheBoundsFromTheDataPlane pins that the allocator keeps no
@@ -100,7 +100,13 @@ func TestAllocatorReadsTheBoundsFromTheDataPlane(t *testing.T) {
 	plane.Node.ID = "node-a"
 	plane.HA.QuietWindow = 7 * time.Second
 
-	allocator := NewAllocator(plane, nil, nil, unlimitedMemorySampler, nil)
+	allocator := NewAllocator(
+		plane,
+		&rangeStore{max: map[string]int64{}},
+		newLeaseOwnershipFake(),
+		unlimitedMemorySampler,
+		nil,
+	)
 
 	assert.Equal(t, 7*time.Second, allocator.QuietWindow())
 	assert.Equal(t, "node-a", allocator.nodeID)

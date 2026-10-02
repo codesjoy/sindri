@@ -21,9 +21,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"time"
-
-	"github.com/codesjoy/pkg/basic/xerror"
-	"github.com/codesjoy/sindri/gen/go/sequence/reason"
 )
 
 // readinessReport is the readiness endpoint's body.
@@ -58,15 +55,13 @@ type controlReadiness struct {
 	Revision       int64  `json:"revision"`
 }
 
-// probeReadiness reads a node's readiness endpoint.
+// probeReadiness reads a readiness endpoint.
 //
 // It returns the error instead of failing so it can be called from a polling
 // condition, which runs on another goroutine and must not stop the test.
-func (s *SequenceSystemSuite) probeReadiness(
-	node *systemNode,
-) (int, readinessReport, error) {
+func probeReadiness(url string) (int, readinessReport, error) {
 	client := &http.Client{Timeout: 5 * time.Second}
-	response, err := client.Get(node.readyAddr)
+	response, err := client.Get(url)
 	if err != nil {
 		return 0, readinessReport{}, err
 	}
@@ -76,45 +71,6 @@ func (s *SequenceSystemSuite) probeReadiness(
 		return response.StatusCode, readinessReport{}, err
 	}
 	return response.StatusCode, report, nil
-}
-
-// TestReadinessEndpointReportsTheServingState covers section D.3 on a real
-// process: the endpoint is reachable, it refuses traffic before the instance
-// has ever been given a route, and it accepts traffic afterwards.
-func (s *SequenceSystemSuite) TestReadinessEndpointReportsTheServingState() {
-	node := s.nodes["node-a"]
-
-	// The route table is cleared between tests, so this instance has never been
-	// given a route. A probe that answered 200 here would send traffic to an
-	// instance that cannot serve it.
-	status, report, err := s.probeReadiness(node)
-	s.Require().NoError(err)
-	s.Equal(http.StatusServiceUnavailable, status)
-	s.False(report.Ready)
-	s.Equal("initializing", report.Reason)
-
-	route := splitSlots()
-	version := s.publishRoute(route)
-	s.waitForOwnership("node-a", keyForOwner("node-a", route), version)
-
-	var published readinessReport
-	s.Require().Eventually(func() bool {
-		var probeErr error
-		status, published, probeErr = s.probeReadiness(node)
-		return probeErr == nil && status == http.StatusOK && published.Ready
-	}, recoveryDeadline, 100*time.Millisecond)
-
-	s.Equal("serving", published.Reason)
-	// The container asserts a 3s quiet window, a 2s lease and a 50ms pause bound.
-	// All three were asserted in configuration rather than measured here, which is
-	// what the probe exists to make visible. A data node reports only its own
-	// half, so the control half must be absent rather than zero-valued.
-	s.Nil(published.Control)
-	s.Require().NotNil(published.Data)
-	s.True(published.Data.Ready)
-	s.InDelta(3, published.Data.QuietWindowSeconds, 1e-9)
-	s.InDelta(0.05, published.Data.MaxPauseSeconds, 1e-9)
-	s.InDelta(2, published.Data.LeaseDurationSeconds, 1e-9)
 }
 
 // TestReadinessStaysServingThroughAStorageOutage is the section D.17 rule
@@ -145,10 +101,10 @@ func (s *SequenceSystemSuite) TestReadinessStaysServingThroughAStorageOutage() {
 		callCtx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 		defer cancel()
 		_, err := s.fetchDirect(callCtx, "node-a", key, version)
-		return xerror.IsReason(err, reason.Reason_SEQUENCE_ALLOCATOR_PAUSED)
+		return refusedWhileStorageUnavailable(err)
 	}, recoveryDeadline, 50*time.Millisecond)
 
-	status, report, err := s.probeReadiness(s.nodes["node-a"])
+	status, report, err := probeReadiness(s.nodes["node-a"].readyAddr)
 	s.Require().NoError(err)
 	s.Equal(http.StatusOK, status)
 	s.True(report.Ready)

@@ -110,18 +110,6 @@ type AllocatorStats struct {
 	ReserveLatencyP99 time.Duration
 }
 
-// PrepareApply describes a route update scheduled for a future tick.
-type PrepareApply struct {
-	Version   int64
-	ApplyTick int64
-	Slots     []uint32
-	// Generation identifies this plan among the ones computed for the same
-	// version. A local replan may change the slot set without changing the
-	// published revision, so the version alone cannot tell a claim that
-	// belonged to a superseded plan from one that belongs to the current one.
-	Generation uint64
-}
-
 // Allocator allocates monotonically increasing IDs from reserved ranges.
 type Allocator struct {
 	state atomic.Uint32
@@ -133,7 +121,7 @@ type Allocator struct {
 	stopping atomic.Bool
 	// linearization records handed-out allocations when a deployment asks for it,
 	// and is nil otherwise. Its counters are the three that must stay at zero.
-	linearization    *LinearizationRecorder
+	linearization    *linearizationRecorder
 	linearizationSeq atomic.Uint64
 	// The appendix E counters. They are plain atomics because each one is
 	// incremented on a path that already holds whatever lock it needs, and the
@@ -155,8 +143,6 @@ type Allocator struct {
 
 	slotsMu       sync.RWMutex
 	slots         map[uint32]*allocationSlot
-	version       int64
-	versionCh     chan struct{}
 	cleanupSlots  []uint32
 	cleanupCursor int
 
@@ -172,14 +158,16 @@ type Allocator struct {
 	afterFunc      func(time.Duration, func()) retryTimer
 	randomFloat64  func() float64
 
-	prepareApply *PrepareApply
-	// planGeneration counts the local plans computed for this instance. It is
-	// what tells a claim that belongs to the plan in force from one that
-	// belonged to a plan a later heartbeat already replaced; both may carry the
-	// same published version, so the version cannot answer that question.
-	planGeneration    uint64
-	claimRetryAfter   atomic.Int64
-	applying          atomic.Bool
+	authorityMu       sync.Mutex
+	initialized       atomic.Bool
+	routeApplied      atomic.Bool
+	ownershipRevision atomic.Uint64
+	localDeadline     atomic.Int64
+	pendingActive     []*allocationSlot
+	drainingSlots     map[uint32]*allocationSlot
+	renewing          atomic.Bool
+	handoffs          HandoffRepo
+	migration         MigrationConfig
 	lastCleanup       atomic.Int64
 	cachedKeys        atomic.Int64
 	admissionRejected atomic.Int64
@@ -233,9 +221,12 @@ func NewAllocator(
 	if memorySampler == nil {
 		panic("sequence allocator memory sampler is required")
 	}
+	if ownership == nil || store == nil {
+		panic("sequence allocator authority and range store are required")
+	}
 	obj := &Allocator{
 		slots:         make(map[uint32]*allocationSlot),
-		versionCh:     make(chan struct{}),
+		drainingSlots: make(map[uint32]*allocationSlot),
 		store:         store,
 		ownership:     ownership,
 		instanceID:    uuid.NewString(),
@@ -259,7 +250,7 @@ func NewAllocator(
 		// Off by default: a record per allocation is not something the hot path
 		// carries unless a deployment has asked to prove the ordering property
 		// from its own traffic rather than from a test (appendix F.2).
-		obj.linearization = NewLinearizationRecorder(MaxLinearizationSamples)
+		obj.linearization = newLinearizationRecorder(MaxLinearizationSamples)
 	}
 	return obj
 }
@@ -271,7 +262,7 @@ func (obj *Allocator) LinearizationCounters() (LinearizationCounters, bool) {
 	if obj.linearization == nil {
 		return LinearizationCounters{}, false
 	}
-	return obj.linearization.Counters(), true
+	return obj.linearization.snapshot(), true
 }
 
 // recordLinearization files a handed-out allocation when recording is on.
@@ -289,7 +280,7 @@ func (obj *Allocator) recordLinearization(
 	if obj.linearization == nil {
 		return
 	}
-	observation := LinearizationObservation{
+	observation := linearizationObservation{
 		Key:              key,
 		ID:               allocation.ID,
 		OwnerInstanceID:  obj.instanceID,
@@ -301,7 +292,7 @@ func (obj *Allocator) recordLinearization(
 	if state != nil {
 		observation.Generation = state.generation.Load()
 	}
-	obj.linearization.Record(observation)
+	obj.linearization.record(observation)
 }
 
 // InstanceID returns the process-start identity presented as owner_instance_id.
@@ -340,7 +331,7 @@ func (obj *Allocator) Pause() {
 // serving path agree with the readiness report that says this instance is out of
 // service.
 func (obj *Allocator) Paused() bool {
-	return obj.state.Load() == StatePaused || obj.fenced.Load() != nil
+	return obj.state.Load() == StatePaused || obj.fenced.Load() != nil || obj.stopping.Load()
 }
 
 // Readiness reports whether this instance should receive traffic, and why.
@@ -369,9 +360,12 @@ type Readiness struct {
 // bounds every earlier decision rested on are no longer known to have held, so
 // the instance must leave the service rather than keep answering from them.
 //
-// A route version of zero means no route has ever been applied. Route versions
-// come from the directory revision, which starts at one, so this cannot be
-// confused with a deployment that legitimately serves nothing.
+// Registration alone is not enough to serve. MarkRouteApplied records that a
+// directory route has been applied, and until that happens the instance has no
+// route to answer from, so it stays initializing even though its lease is live.
+// A registered instance whose assignment is legitimately empty still reaches
+// serving: the empty assignment arrives through an applied route, not through
+// the absence of one.
 func (obj *Allocator) Readiness() Readiness {
 	// The fence is reported first because it is the one unready state of the three
 	// that a restart does not clear and only a human can act on, and because an
@@ -383,14 +377,19 @@ func (obj *Allocator) Readiness() Readiness {
 	if obj.stopping.Load() {
 		return Readiness{Reason: "stopping"}
 	}
-	obj.slotsMu.RLock()
-	version := obj.version
-	obj.slotsMu.RUnlock()
-	if version == 0 {
+	if !obj.initialized.Load() || !obj.routeApplied.Load() {
 		return Readiness{Reason: "initializing"}
 	}
 	return Readiness{Ready: true, Reason: "serving"}
 }
+
+// MarkRouteApplied records that a directory route has been applied.
+//
+// The directory is read outside the allocator, so the allocator cannot observe
+// the route on its own; whoever applies one calls this once. It only ever moves
+// the instance forward, because a route that was applied is not un-applied by a
+// refresh that finds no newer snapshot.
+func (obj *Allocator) MarkRouteApplied() { obj.routeApplied.Store(true) }
 
 // Fence stops this instance from serving and records why.
 //
@@ -431,18 +430,46 @@ func (obj *Allocator) Fenced() (string, bool) {
 // could let a new owner start while this instance can still hand out an id from
 // its cached range.
 //
+// The set it releases is what the instance holds in storage, not merely what is
+// still cached: a handoff can grant this instance a slot between two local
+// syncs, and that grant is still this instance's to give back. The cache is
+// consulted for the gates that decide whether a slot has drained, and the stored
+// snapshot supplies the slots the cache never installed.
+//
 // A release that does not finish leaves the authority to expire through the
 // quiet window. That is slower for whoever takes over but never incorrect,
 // which is why this is allowed to return without an error: the caller has
 // nothing useful to do about it, and failing the shutdown would not release
 // anything.
 func (obj *Allocator) Shutdown() {
-	obj.stopping.Store(true)
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		obj.ha.ReleaseDrainTimeout+obj.storeTimeout(),
+	)
+	defer cancel()
+	obj.ShutdownContext(ctx)
+}
+
+// ShutdownContext stops serving and uses ctx as the total graceful-release budget.
+func (obj *Allocator) ShutdownContext(ctx context.Context) {
+	if !obj.stopping.CompareAndSwap(false, true) {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	obj.state.Store(StatePaused)
 	obj.slotsMu.Lock()
 	detached := obj.detachAllLocked()
 	obj.slotsMu.Unlock()
-	obj.drainAndRelease(detached)
+	detached = obj.includeHeldAuthority(ctx, detached)
+	obj.logger.Info("sequence shutdown releasing slot authority", "slots", len(detached))
+	obj.drainAndRelease(ctx, detached)
+	retireCtx, cancel := context.WithTimeout(context.Background(), obj.storeTimeout())
+	defer cancel()
+	if err := obj.ownership.RetireInstance(retireCtx, obj.instanceID); err != nil {
+		obj.logger.Error("retire sequence instance", "error", err)
+	}
 }
 
 // HAStats is the appendix E view of what the ownership protocol has been doing.
@@ -533,16 +560,6 @@ type allocationSlot struct {
 	inflight atomic.Int64
 	// draining closes the slot: no new allocation may linearise once it is set.
 	draining atomic.Bool
-	// localDeadline is the monotonic instant at which the storage lease stops
-	// being trusted locally, or zero when the slot carries no local lease. It is
-	// only consulted on the local-lease execution path.
-	localDeadline atomic.Int64
-	// renewedAt is the monotonic instant of the last successful renewal, used to
-	// pace the next one. A failed renewal leaves it untouched, so the lease may
-	// expire early but never late.
-	renewedAt atomic.Int64
-	// renewing keeps at most one renewal in flight per slot.
-	renewing atomic.Bool
 }
 
 // enter registers an in-flight allocation and reports whether the slot is still
@@ -714,12 +731,13 @@ func (obj *Allocator) evictIdleCandidates(
 			obj.slotsMu.Unlock()
 			continue
 		}
-		if candidate.state.fetch != nil {
+		if candidate.state.fetch != nil || !candidate.state.references.CompareAndSwap(0, -1) {
 			stats.inflight++
 			candidate.state.mu.Unlock()
 			obj.slotsMu.Unlock()
 			continue
 		}
+		candidate.state.retired.Store(true)
 		candidate.state.clearRetryLocked()
 
 		if candidate.state.initialized.Load() {

@@ -18,7 +18,6 @@ package sequence_test
 
 import (
 	"context"
-	"sync"
 	"testing"
 	"time"
 
@@ -39,7 +38,12 @@ func TestSequenceSystemMySQL(t *testing.T) {
 	suite.Run(t, &SequenceSystemSuite{dialect: "mysql"})
 }
 
-func (s *SequenceSystemSuite) TestEndToEndAllocationAndRestart() {
+// TestEndToEndBootstrapValidationAndRestart covers the client-visible
+// lifecycle: a node serves before a route exists, the directory and request
+// validation are still enforced once it does, and a restarted owner keeps the
+// allocation stream continuous. Concurrent load and strict ordering live in the
+// chaos suite's dedicated stress test.
+func (s *SequenceSystemSuite) TestEndToEndBootstrapValidationAndRestart() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	// Client routing needs a published directory. The data plane does not: the
@@ -77,56 +81,10 @@ func (s *SequenceSystemSuite) TestEndToEndAllocationAndRestart() {
 	s.Require().Error(err)
 	s.True(xerror.IsCode(err, code.Code_INVALID_ARGUMENT))
 
-	var previous int64
-	for range 20 {
-		response, fetchErr := routed.FetchNext(
-			context.Background(),
-			&sequencev1.FetchNextRequest{Key: key},
-		)
-		s.Require().NoError(fetchErr)
-		s.Greater(response.GetId(), previous)
-		previous = response.GetId()
-	}
-
-	recorder := newAllocationRecorder()
-	const workers = 64
-	var wg sync.WaitGroup
-	errCh := make(chan error, workers)
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			callCtx, callCancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer callCancel()
-			started := time.Now()
-			response, fetchErr := routed.FetchNext(
-				callCtx,
-				&sequencev1.FetchNextRequest{Key: key},
-			)
-			received := time.Now()
-			var id int64
-			if response != nil {
-				id = response.GetId()
-			}
-			if recordErr := recorder.record(allocationObservation{
-				Key:      key,
-				ID:       id,
-				Err:      fetchErr,
-				Started:  started,
-				Received: received,
-			}); recordErr != nil {
-				errCh <- recordErr
-			}
-		}()
-	}
-	wg.Wait()
-	close(errCh)
-	for recordErr := range errCh {
-		s.Require().NoError(recordErr)
-	}
-	recorder.assertNoViolations(s.T())
-	beforeRestart := recorder.maxID(key)
-	s.Greater(beforeRestart, previous)
+	first, err := routed.FetchNext(context.Background(), &sequencev1.FetchNextRequest{Key: key})
+	s.Require().NoError(err)
+	beforeRestart := first.GetId()
+	s.Greater(beforeRestart, int64(0))
 
 	s.stopNode("node-a")
 	s.restartNode("node-a")
@@ -148,18 +106,6 @@ func (s *SequenceSystemSuite) TestEndToEndAllocationAndRestart() {
 	s.GreaterOrEqual(s.watermark(key), afterRestart)
 }
 
-func (s *SequenceSystemSuite) TestLiveRouteHandoff() {
-	key := "handoff-orders"
-	versionA := s.publishRoute(allSlots("node-a"))
-	before := s.waitForOwnership("node-a", key, versionA)
-
-	versionB := s.publishRoute(allSlots("node-b"))
-	s.waitForRejection("node-a", key, versionB)
-	after := s.waitForOwnership("node-b", key, versionB)
-	s.Greater(after, before)
-	s.GreaterOrEqual(s.watermark(key), after)
-}
-
 func (s *SequenceSystemSuite) TestBatchAllocationAcrossOwnersAndRouteHandoff() {
 	route := splitSlots()
 	version := s.publishRoute(route)
@@ -169,7 +115,7 @@ func (s *SequenceSystemSuite) TestBatchAllocationAcrossOwnersAndRouteHandoff() {
 	s.waitForOwnership("node-b", nodeBKeys[0], version)
 
 	routed := s.routedClient()
-	batch, err := sequencepkg.NewBatchClient(s.router, routed)
+	batch, err := sequencepkg.NewClient(s.router, routed)
 	s.Require().NoError(err)
 
 	requests := []sequencepkg.KeyRequest{
@@ -180,7 +126,7 @@ func (s *SequenceSystemSuite) TestBatchAllocationAcrossOwnersAndRouteHandoff() {
 		{Key: nodeAKeys[2], Count: 2},
 		{Key: nodeBKeys[2], Count: 4},
 	}
-	results, err := batch.FetchNext(context.Background(), requests)
+	results, err := batch.FetchNextBatch(context.Background(), requests)
 	s.Require().NoError(err)
 	s.Require().Len(results, len(requests))
 	last := make(map[string]int64, len(requests))
@@ -197,14 +143,14 @@ func (s *SequenceSystemSuite) TestBatchAllocationAcrossOwnersAndRouteHandoff() {
 		last[result.Key] = lastID
 	}
 
-	_, err = batch.FetchNext(context.Background(), []sequencepkg.KeyRequest{
+	_, err = batch.FetchNextBatch(context.Background(), []sequencepkg.KeyRequest{
 		{Key: nodeAKeys[0]},
 		{Key: nodeAKeys[0]},
 	})
 	s.Require().Error(err, "duplicate keys must be rejected")
 
 	s.Require().NoError(s.proxies["grpc-b"].Disable())
-	partial, batchErr := batch.FetchNext(context.Background(), requests)
+	partial, batchErr := batch.FetchNextBatch(context.Background(), requests)
 	s.Require().NoError(s.proxies["grpc-b"].Enable())
 	s.Require().Error(batchErr, "an unreachable owner must fail the whole batch")
 	s.Nil(partial, "a failed batch must not return partial results")
@@ -215,7 +161,7 @@ func (s *SequenceSystemSuite) TestBatchAllocationAcrossOwnersAndRouteHandoff() {
 	s.Require().Eventually(func() bool {
 		callCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		allocations, fetchErr := batch.FetchNext(callCtx, requests)
+		allocations, fetchErr := batch.FetchNextBatch(callCtx, requests)
 		if fetchErr != nil {
 			if !allowedTransient(fetchErr) {
 				s.T().Logf("unexpected batch handoff error: %v", fetchErr)
@@ -245,15 +191,23 @@ func (s *SequenceSystemSuite) TestNodeCrashFailoverAndRecovery() {
 	)
 	s.Require().NoError(err)
 	maxID := response.GetId()
+	generation := s.slotEpoch(key)
 
 	s.stopNode("node-a")
 	versionB := s.publishRoute(allSlots("node-b"))
 	s.waitForOwnership("node-b", key, versionB)
+	// The slot left behind by a dead node carries the same authority row, so the
+	// takeover has to start a new generation: the epoch moves by exactly one and
+	// never rewinds.
+	s.Equal(generation+1, s.slotEpoch(key),
+		"the takeover must start exactly one new epoch")
 	maxID = s.waitRoutedAbove(routed, key, maxID)
 
 	s.restartNode("node-a")
 	versionA2 := s.publishRoute(allSlots("node-a"))
 	s.waitForOwnership("node-a", key, versionA2)
+	s.Equal(generation+2, s.slotEpoch(key),
+		"the re-claim must start exactly one new epoch")
 	s.waitForRejection("node-b", key, versionA2)
 	maxID = s.waitRoutedAbove(routed, key, maxID)
 	s.GreaterOrEqual(s.watermark(key), maxID)
@@ -274,7 +228,7 @@ func (s *SequenceSystemSuite) TestDatabaseDisconnectFailsClosedAndRecovers() {
 		callCtx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 		defer cancel()
 		_, err := s.fetchDirect(callCtx, "node-a", key, version)
-		return xerror.IsReason(err, reason.Reason_SEQUENCE_ALLOCATOR_PAUSED)
+		return refusedWhileStorageUnavailable(err)
 	}, recoveryDeadline, 50*time.Millisecond)
 
 	s.Require().NoError(s.proxies["db-a"].Enable())

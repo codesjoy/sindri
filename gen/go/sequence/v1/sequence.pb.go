@@ -412,18 +412,8 @@ func (x *GetRouteResponse) GetRoute() *RouteSnapshot {
 
 type RouteSnapshot struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The directory revision this snapshot was materialised at. The field number
-	// and name are unchanged for older callers, but the value is now derived from
-	// storage ownership rather than entered by an operator, so it is renamed in
-	// prose: it identifies the ownership directory, not a hand-published route.
-	// It stays monotonically increasing, which is what the client's not-modified
-	// check and stale-route retry both depend on.
+	// The monotonically increasing directory revision of this ownership snapshot.
 	Version int64 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
-	// Kept for callers that only understand node-level routing. Each node lists
-	// the slots it owns at this revision, so an older caller still selects the
-	// right node; it just cannot check a per-slot epoch. Owners are derived from
-	// segments below and never disagree with them.
-	Nodes []*RouteNode `protobuf:"bytes,2,rep,name=nodes,proto3" json:"nodes,omitempty"`
 	// Identifies the slot layout the epochs were minted under: slot count and the
 	// key-to-slot function. A caller must discard a cached snapshot whose layout
 	// version differs, because the same slot number then means a different key.
@@ -473,13 +463,6 @@ func (x *RouteSnapshot) GetVersion() int64 {
 	return 0
 }
 
-func (x *RouteSnapshot) GetNodes() []*RouteNode {
-	if x != nil {
-		return x.Nodes
-	}
-	return nil
-}
-
 func (x *RouteSnapshot) GetLayoutVersion() int64 {
 	if x != nil {
 		return x.LayoutVersion
@@ -490,58 +473,6 @@ func (x *RouteSnapshot) GetLayoutVersion() int64 {
 func (x *RouteSnapshot) GetSegments() []*RouteSegment {
 	if x != nil {
 		return x.Segments
-	}
-	return nil
-}
-
-type RouteNode struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	Slots         []uint32               `protobuf:"varint,2,rep,packed,name=slots,proto3" json:"slots,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *RouteNode) Reset() {
-	*x = RouteNode{}
-	mi := &file_sequence_v1_sequence_proto_msgTypes[8]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *RouteNode) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*RouteNode) ProtoMessage() {}
-
-func (x *RouteNode) ProtoReflect() protoreflect.Message {
-	mi := &file_sequence_v1_sequence_proto_msgTypes[8]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use RouteNode.ProtoReflect.Descriptor instead.
-func (*RouteNode) Descriptor() ([]byte, []int) {
-	return file_sequence_v1_sequence_proto_rawDescGZIP(), []int{8}
-}
-
-func (x *RouteNode) GetNodeId() string {
-	if x != nil {
-		return x.NodeId
-	}
-	return ""
-}
-
-func (x *RouteNode) GetSlots() []uint32 {
-	if x != nil {
-		return x.Slots
 	}
 	return nil
 }
@@ -563,7 +494,7 @@ type RouteSegment struct {
 
 func (x *RouteSegment) Reset() {
 	*x = RouteSegment{}
-	mi := &file_sequence_v1_sequence_proto_msgTypes[9]
+	mi := &file_sequence_v1_sequence_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -575,7 +506,7 @@ func (x *RouteSegment) String() string {
 func (*RouteSegment) ProtoMessage() {}
 
 func (x *RouteSegment) ProtoReflect() protoreflect.Message {
-	mi := &file_sequence_v1_sequence_proto_msgTypes[9]
+	mi := &file_sequence_v1_sequence_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -588,7 +519,7 @@ func (x *RouteSegment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteSegment.ProtoReflect.Descriptor instead.
 func (*RouteSegment) Descriptor() ([]byte, []int) {
-	return file_sequence_v1_sequence_proto_rawDescGZIP(), []int{9}
+	return file_sequence_v1_sequence_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *RouteSegment) GetStartSlot() uint32 {
@@ -656,15 +587,11 @@ const file_sequence_v1_sequence_proto_rawDesc = "" +
 	"\rknown_version\x18\x01 \x01(\x03R\fknownVersion\"w\n" +
 	"\x10GetRouteResponse\x12!\n" +
 	"\fnot_modified\x18\x01 \x01(\bR\vnotModified\x12@\n" +
-	"\x05route\x18\x02 \x01(\v2*.codesjoy.sindri.sequence.v1.RouteSnapshotR\x05route\"\xd5\x01\n" +
+	"\x05route\x18\x02 \x01(\v2*.codesjoy.sindri.sequence.v1.RouteSnapshotR\x05route\"\xa4\x01\n" +
 	"\rRouteSnapshot\x12\x18\n" +
-	"\aversion\x18\x01 \x01(\x03R\aversion\x12<\n" +
-	"\x05nodes\x18\x02 \x03(\v2&.codesjoy.sindri.sequence.v1.RouteNodeR\x05nodes\x12%\n" +
+	"\aversion\x18\x01 \x01(\x03R\aversion\x12%\n" +
 	"\x0elayout_version\x18\x03 \x01(\x03R\rlayoutVersion\x12E\n" +
-	"\bsegments\x18\x04 \x03(\v2).codesjoy.sindri.sequence.v1.RouteSegmentR\bsegments\":\n" +
-	"\tRouteNode\x12\x17\n" +
-	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x14\n" +
-	"\x05slots\x18\x02 \x03(\rR\x05slots\"\xb7\x01\n" +
+	"\bsegments\x18\x04 \x03(\v2).codesjoy.sindri.sequence.v1.RouteSegmentR\bsegmentsJ\x04\b\x02\x10\x03R\x05nodes\"\xb7\x01\n" +
 	"\fRouteSegment\x12\x1d\n" +
 	"\n" +
 	"start_slot\x18\x01 \x01(\rR\tstartSlot\x12\x19\n" +
@@ -691,7 +618,7 @@ func file_sequence_v1_sequence_proto_rawDescGZIP() []byte {
 	return file_sequence_v1_sequence_proto_rawDescData
 }
 
-var file_sequence_v1_sequence_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_sequence_v1_sequence_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_sequence_v1_sequence_proto_goTypes = []any{
 	(*FetchNextRequest)(nil),       // 0: codesjoy.sindri.sequence.v1.FetchNextRequest
 	(*FetchNextResponse)(nil),      // 1: codesjoy.sindri.sequence.v1.FetchNextResponse
@@ -701,26 +628,24 @@ var file_sequence_v1_sequence_proto_goTypes = []any{
 	(*GetRouteRequest)(nil),        // 5: codesjoy.sindri.sequence.v1.GetRouteRequest
 	(*GetRouteResponse)(nil),       // 6: codesjoy.sindri.sequence.v1.GetRouteResponse
 	(*RouteSnapshot)(nil),          // 7: codesjoy.sindri.sequence.v1.RouteSnapshot
-	(*RouteNode)(nil),              // 8: codesjoy.sindri.sequence.v1.RouteNode
-	(*RouteSegment)(nil),           // 9: codesjoy.sindri.sequence.v1.RouteSegment
+	(*RouteSegment)(nil),           // 8: codesjoy.sindri.sequence.v1.RouteSegment
 }
 var file_sequence_v1_sequence_proto_depIdxs = []int32{
 	0, // 0: codesjoy.sindri.sequence.v1.FetchNextBatchRequest.requests:type_name -> codesjoy.sindri.sequence.v1.FetchNextRequest
 	4, // 1: codesjoy.sindri.sequence.v1.FetchNextBatchResponse.results:type_name -> codesjoy.sindri.sequence.v1.FetchNextBatchResult
 	7, // 2: codesjoy.sindri.sequence.v1.GetRouteResponse.route:type_name -> codesjoy.sindri.sequence.v1.RouteSnapshot
-	8, // 3: codesjoy.sindri.sequence.v1.RouteSnapshot.nodes:type_name -> codesjoy.sindri.sequence.v1.RouteNode
-	9, // 4: codesjoy.sindri.sequence.v1.RouteSnapshot.segments:type_name -> codesjoy.sindri.sequence.v1.RouteSegment
-	0, // 5: codesjoy.sindri.sequence.v1.SequenceGenerator.FetchNext:input_type -> codesjoy.sindri.sequence.v1.FetchNextRequest
-	2, // 6: codesjoy.sindri.sequence.v1.SequenceGenerator.FetchNextBatch:input_type -> codesjoy.sindri.sequence.v1.FetchNextBatchRequest
-	5, // 7: codesjoy.sindri.sequence.v1.SequenceGenerator.GetRoute:input_type -> codesjoy.sindri.sequence.v1.GetRouteRequest
-	1, // 8: codesjoy.sindri.sequence.v1.SequenceGenerator.FetchNext:output_type -> codesjoy.sindri.sequence.v1.FetchNextResponse
-	3, // 9: codesjoy.sindri.sequence.v1.SequenceGenerator.FetchNextBatch:output_type -> codesjoy.sindri.sequence.v1.FetchNextBatchResponse
-	6, // 10: codesjoy.sindri.sequence.v1.SequenceGenerator.GetRoute:output_type -> codesjoy.sindri.sequence.v1.GetRouteResponse
-	8, // [8:11] is the sub-list for method output_type
-	5, // [5:8] is the sub-list for method input_type
-	5, // [5:5] is the sub-list for extension type_name
-	5, // [5:5] is the sub-list for extension extendee
-	0, // [0:5] is the sub-list for field type_name
+	8, // 3: codesjoy.sindri.sequence.v1.RouteSnapshot.segments:type_name -> codesjoy.sindri.sequence.v1.RouteSegment
+	0, // 4: codesjoy.sindri.sequence.v1.SequenceGenerator.FetchNext:input_type -> codesjoy.sindri.sequence.v1.FetchNextRequest
+	2, // 5: codesjoy.sindri.sequence.v1.SequenceGenerator.FetchNextBatch:input_type -> codesjoy.sindri.sequence.v1.FetchNextBatchRequest
+	5, // 6: codesjoy.sindri.sequence.v1.SequenceGenerator.GetRoute:input_type -> codesjoy.sindri.sequence.v1.GetRouteRequest
+	1, // 7: codesjoy.sindri.sequence.v1.SequenceGenerator.FetchNext:output_type -> codesjoy.sindri.sequence.v1.FetchNextResponse
+	3, // 8: codesjoy.sindri.sequence.v1.SequenceGenerator.FetchNextBatch:output_type -> codesjoy.sindri.sequence.v1.FetchNextBatchResponse
+	6, // 9: codesjoy.sindri.sequence.v1.SequenceGenerator.GetRoute:output_type -> codesjoy.sindri.sequence.v1.GetRouteResponse
+	7, // [7:10] is the sub-list for method output_type
+	4, // [4:7] is the sub-list for method input_type
+	4, // [4:4] is the sub-list for extension type_name
+	4, // [4:4] is the sub-list for extension extendee
+	0, // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_sequence_v1_sequence_proto_init() }
@@ -735,7 +660,7 @@ func file_sequence_v1_sequence_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_sequence_v1_sequence_proto_rawDesc), len(file_sequence_v1_sequence_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   10,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

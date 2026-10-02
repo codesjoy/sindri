@@ -631,7 +631,7 @@ func TestFetchNextNReturnsContiguousBlocks(t *testing.T) {
 
 	first, err := allocator.FetchNextN(context.Background(), "orders", 5)
 	require.NoError(t, err)
-	assert.Equal(t, SequenceAllocation{ID: 1, Count: 5}, first)
+	assert.Equal(t, SequenceAllocation{ID: 1, Count: 5, SlotEpoch: 1}, first)
 
 	next, err := allocator.FetchNext(context.Background(), "orders")
 	require.NoError(t, err)
@@ -639,7 +639,7 @@ func TestFetchNextNReturnsContiguousBlocks(t *testing.T) {
 
 	second, err := allocator.FetchNextN(context.Background(), "orders", 3)
 	require.NoError(t, err)
-	assert.Equal(t, SequenceAllocation{ID: 7, Count: 3}, second)
+	assert.Equal(t, SequenceAllocation{ID: 7, Count: 3, SlotEpoch: 1}, second)
 }
 
 // TestBatchReportsTheOwnershipEpoch pins the value a caller compares between two
@@ -671,16 +671,15 @@ func TestFetchNextNReservesFreshContiguousRange(t *testing.T) {
 		unlimitedMemorySampler,
 		nil,
 	)
-	allocator.Open(1, 0, []uint32{SlotForKey("orders")})
-	allocator.ApplyRoute(0)
+	allocator.testAssignSlots([]uint32{SlotForKey("orders")})
 
 	first, err := allocator.FetchNextN(context.Background(), "orders", 6)
 	require.NoError(t, err)
-	assert.Equal(t, SequenceAllocation{ID: 1, Count: 6}, first)
+	assert.Equal(t, SequenceAllocation{ID: 1, Count: 6, SlotEpoch: 1}, first)
 
 	second, err := allocator.FetchNextN(context.Background(), "orders", 6)
 	require.NoError(t, err)
-	assert.Equal(t, SequenceAllocation{ID: 11, Count: 6}, second)
+	assert.Equal(t, SequenceAllocation{ID: 11, Count: 6, SlotEpoch: 1}, second)
 }
 
 func TestFetchNextBatchMergesColdReservations(t *testing.T) {
@@ -697,8 +696,7 @@ func TestFetchNextBatchMergesColdReservations(t *testing.T) {
 	for index, key := range keys {
 		slots[index] = SlotForKey(key)
 	}
-	allocator.Open(1, 0, slots)
-	allocator.ApplyRoute(0)
+	allocator.testAssignSlots(slots)
 
 	requests := []SequenceRequest{
 		{Key: keys[0], Count: 2},
@@ -708,18 +706,18 @@ func TestFetchNextBatchMergesColdReservations(t *testing.T) {
 	results, err := allocator.FetchNextBatch(context.Background(), requests)
 	require.NoError(t, err)
 	assert.Equal(t, []SequenceAllocation{
-		{ID: 1, Count: 2},
-		{ID: 1, Count: 1},
-		{ID: 1, Count: 3},
+		{ID: 1, Count: 2, SlotEpoch: 1},
+		{ID: 1, Count: 1, SlotEpoch: 1},
+		{ID: 1, Count: 3, SlotEpoch: 1},
 	}, results)
 	assert.Equal(t, 1, store.calls())
 
 	results, err = allocator.FetchNextBatch(context.Background(), requests)
 	require.NoError(t, err)
 	assert.Equal(t, []SequenceAllocation{
-		{ID: 3, Count: 2},
-		{ID: 2, Count: 1},
-		{ID: 4, Count: 3},
+		{ID: 3, Count: 2, SlotEpoch: 1},
+		{ID: 2, Count: 1, SlotEpoch: 1},
+		{ID: 4, Count: 3, SlotEpoch: 1},
 	}, results)
 	assert.Equal(t, 1, store.calls())
 }
@@ -787,8 +785,7 @@ func TestFetchNextNPropagatesReservationOverflow(t *testing.T) {
 		unlimitedMemorySampler,
 		nil,
 	)
-	allocator.Open(1, 0, []uint32{SlotForKey("orders")})
-	allocator.ApplyRoute(0)
+	allocator.testAssignSlots([]uint32{SlotForKey("orders")})
 
 	_, err := allocator.FetchNextN(context.Background(), "orders", 3)
 	require.ErrorIs(t, err, errRangeOverflow)
@@ -972,4 +969,206 @@ func TestFetchNextBatchHonorsContextCancellationWhileWaiting(t *testing.T) {
 	<-store.started
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func observationAt(key string, id int64, from, to time.Time) linearizationObservation {
+	return linearizationObservation{
+		Key:              key,
+		ID:               id,
+		OwnerInstanceID:  "instance-a",
+		Epoch:            1,
+		LinearizationSeq: uint64(id),
+		RequestStart:     from,
+		ResponseReceived: to,
+	}
+}
+
+// TestLinearizationRecorderAcceptsASequentialKey pins the property itself: a key
+// whose allocations each complete before the next begins is in order, and the
+// counters that must stay at zero do.
+func TestLinearizationRecorderAcceptsASequentialKey(t *testing.T) {
+	recorder := newLinearizationRecorder(16)
+	start := time.Unix(0, 0)
+	for index, id := range []int64{1, 2, 3} {
+		requestStart := start.Add(time.Duration(index) * time.Second)
+		recorder.record(
+			observationAt("orders", id, requestStart, requestStart.Add(time.Millisecond)),
+		)
+	}
+
+	counters := recorder.snapshot()
+	assert.Equal(t, int64(3), counters.Recorded)
+	assert.Zero(t, counters.OrderViolations)
+	assert.Zero(t, counters.StaleDeliveries)
+	assert.Zero(t, counters.DuplicateDeliveries)
+}
+
+// TestLinearizationRecorderFlagsAStaleDelivery is the failure this whole design
+// exists to prevent: a caller that had already received a larger id receives a
+// smaller one afterwards.
+func TestLinearizationRecorderFlagsAStaleDelivery(t *testing.T) {
+	recorder := newLinearizationRecorder(16)
+	start := time.Unix(0, 0)
+	recorder.record(observationAt("orders", 101, start, start.Add(time.Millisecond)))
+	recorder.record(observationAt(
+		"orders", 1,
+		start.Add(time.Second), start.Add(time.Second+time.Millisecond),
+	))
+
+	counters := recorder.snapshot()
+	assert.Equal(t, int64(1), counters.StaleDeliveries)
+	assert.Equal(t, int64(1), counters.OrderViolations)
+	assert.Zero(t, counters.DuplicateDeliveries)
+	assert.Contains(t, counters.OrderViolationDetail, "handed out 101 then")
+}
+
+// TestLinearizationRecorderFlagsARepeatWithinAKey pins the second of the three
+// counters, which a stale check alone would also catch but which means something
+// different to whoever reads the alert.
+func TestLinearizationRecorderFlagsARepeatWithinAKey(t *testing.T) {
+	recorder := newLinearizationRecorder(16)
+	start := time.Unix(0, 0)
+	recorder.record(observationAt("orders", 7, start, start.Add(time.Millisecond)))
+	recorder.record(observationAt(
+		"orders", 7,
+		start.Add(time.Second), start.Add(time.Second+time.Millisecond),
+	))
+
+	counters := recorder.snapshot()
+	assert.Equal(t, int64(1), counters.DuplicateDeliveries)
+	assert.Equal(t, int64(1), counters.OrderViolations)
+	assert.Zero(t, counters.StaleDeliveries)
+}
+
+// TestLinearizationRecorderIgnoresOverlappingRequests pins section 1.4: two
+// requests in flight at once is not a violation, whatever order their responses
+// arrive in, because neither had returned when the other started.
+func TestLinearizationRecorderIgnoresOverlappingRequests(t *testing.T) {
+	recorder := newLinearizationRecorder(16)
+	start := time.Unix(0, 0)
+	// The second request starts before the first one finishes, and its id is
+	// lower. That is legal: only the caller's own completed-before-started
+	// relation makes an order claim.
+	recorder.record(observationAt("orders", 9, start, start.Add(time.Second)))
+	recorder.record(observationAt(
+		"orders", 8,
+		start.Add(500*time.Millisecond), start.Add(1500*time.Millisecond),
+	))
+
+	assert.Zero(t, recorder.snapshot().OrderViolations)
+}
+
+// TestLinearizationRecorderBoundsItsRing keeps the memory cost fixed: a long run
+// keeps the newest observations and the counters, and drops the oldest records.
+func TestLinearizationRecorderBoundsItsRing(t *testing.T) {
+	recorder := newLinearizationRecorder(4)
+	start := time.Unix(0, 0)
+	for index := int64(0); index < 10; index++ {
+		requestStart := start.Add(time.Duration(index) * time.Second)
+		recorder.record(observationAt("orders", index+1, requestStart, requestStart))
+	}
+
+	observations := recorder.observations()
+	require.Len(t, observations, 4)
+	assert.Equal(t, int64(7), observations[0].ID, "the ring keeps the newest records")
+	assert.Equal(t, int64(10), observations[3].ID)
+	// The counters survive the ring, which is what makes them the alertable part.
+	assert.Equal(t, int64(10), recorder.snapshot().Recorded)
+}
+
+func TestLinearizationRecorderBoundsItsKeyHistory(t *testing.T) {
+	recorder := newLinearizationRecorder(2)
+	start := time.Unix(0, 0)
+	for index, key := range []string{"a", "b", "a", "c", "b"} {
+		at := start.Add(time.Duration(index) * time.Second)
+		recorder.record(observationAt(key, int64(index+1), at, at))
+		assert.LessOrEqual(t, len(recorder.lastComplete), 2)
+		assert.LessOrEqual(t, recorder.lru.Len(), 2)
+	}
+	assert.Equal(t, int64(2), recorder.snapshot().EvictedKeys)
+	assert.Equal(t, int64(5), recorder.snapshot().Recorded)
+	assert.NotContains(t, recorder.lastComplete, "a")
+	assert.Contains(t, recorder.lastComplete, "b")
+	assert.Contains(t, recorder.lastComplete, "c")
+	assert.Zero(t, recorder.snapshot().OrderViolations)
+}
+
+func TestLinearizationRecorderDefaultCapacityAndEvictedBaseline(t *testing.T) {
+	recorder := newLinearizationRecorder(0)
+	require.Equal(t, MaxLinearizationSamples, recorder.capacity)
+	start := time.Unix(0, 0)
+	recorder.record(observationAt("anchor", 2, start, start))
+	recorder.record(observationAt("anchor", 1, start.Add(time.Second), start.Add(time.Second)))
+	for index := range MaxLinearizationSamples + 32 {
+		at := start.Add(time.Duration(index+2) * time.Second)
+		recorder.record(observationAt(fmt.Sprintf("bounded-key-%d", index), 1, at, at))
+	}
+	require.Len(t, recorder.ring, MaxLinearizationSamples)
+	require.Len(t, recorder.lastComplete, MaxLinearizationSamples)
+	require.Equal(t, MaxLinearizationSamples, recorder.lru.Len())
+	require.NotContains(t, recorder.lastComplete, "anchor")
+	at := start.Add(time.Hour)
+	recorder.record(observationAt("anchor", 1, at, at))
+	counters := recorder.snapshot()
+	assert.Equal(t, int64(34), counters.EvictedKeys)
+	assert.Equal(t, int64(MaxLinearizationSamples+35), counters.Recorded)
+	assert.Equal(
+		t,
+		int64(1),
+		counters.OrderViolations,
+		"an evicted key gets a new baseline; old counters survive",
+	)
+}
+
+// TestAllocatorRecordsHandedOutAllocations pins the integration: with the record
+// switched on, every allocation the process hands out is filed with the owner
+// identity, the epoch it was fenced by, and its place in the process's own
+// sequence.
+func TestAllocatorRecordsHandedOutAllocations(t *testing.T) {
+	ownership := newLeaseOwnershipFake()
+	plane := testDataPlaneConfig(AllocatorConfig{
+		DefaultStep:     10,
+		MaxStep:         100,
+		IdleTimeout:     time.Hour,
+		CleanupInterval: time.Minute,
+	})
+	plane.HA.LeaseDuration = time.Hour
+	plane.HA.LinearizationRecording = true
+	allocator := NewAllocator(
+		plane,
+		&rangeStore{max: make(map[string]int64)},
+		ownership,
+		unlimitedMemorySampler,
+		nil,
+	)
+	allocator.linearization = newLinearizationRecorder(16)
+	allocator.testAssignSlots([]uint32{SlotForKey("orders")})
+
+	for index := 0; index < 2; index++ {
+		_, err := allocator.FetchNext(context.Background(), "orders")
+		require.NoError(t, err)
+	}
+
+	counters, recording := allocator.LinearizationCounters()
+	require.True(t, recording)
+	assert.Equal(t, int64(2), counters.Recorded)
+	assert.Zero(t, counters.OrderViolations)
+	observations := allocator.linearization.observations()
+	require.Len(t, observations, 2)
+	assert.Equal(t, allocator.InstanceID(), observations[0].OwnerInstanceID)
+	assert.Equal(t, "orders", observations[0].Key)
+	assert.Less(t, observations[0].ID, observations[1].ID)
+	assert.Equal(t, uint64(1), observations[0].LinearizationSeq)
+	assert.Equal(t, uint64(2), observations[1].LinearizationSeq)
+}
+
+// TestAllocatorWithoutRecordingReportsNoCounters pins the other half of the
+// reporting rule: without a record there is nothing to read, and the metrics
+// layer must be able to tell that apart from a clean zero.
+func TestAllocatorWithoutRecordingReportsNoCounters(t *testing.T) {
+	ownership := newLeaseOwnershipFake()
+	allocator, _ := leaseAllocatorWith(t, "unrecorded", ownership, nil)
+
+	_, recording := allocator.LinearizationCounters()
+	assert.False(t, recording)
 }

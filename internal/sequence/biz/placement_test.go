@@ -16,528 +16,227 @@ package biz
 
 import (
 	"context"
-	"reflect"
+	"encoding/json"
 	"testing"
 	"time"
 
+	testkit "github.com/codesjoy/sindri/internal/pkg/tests"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestSplitOwnerDividesTheSpaceAndGivesTheRemainderToTheLowestIDs(t *testing.T) {
-	// The remainder goes to the lowest node ids, so the split is a pure function
-	// of the sorted node set. Three nodes cannot divide 16384 evenly, and the
-	// difference must be visible here rather than in a fleet's slot counts.
-	nodes := []string{"node-a", "node-b", "node-c"}
-	counts := map[string]uint32{}
-	ownerOf := map[uint32]string{}
-	for slot := uint32(0); slot < SlotCount; slot++ {
-		owner := SplitOwner(slot, nodes)
-		counts[owner]++
-		ownerOf[slot] = owner
-		// The split must be contiguous: a slot's owner changes only at a
-		// boundary, which is what lets one assignment be read as a table.
-		if slot > 0 {
-			previous := ownerOf[slot-1]
-			require.LessOrEqual(t, indexOf(nodes, previous), indexOf(nodes, owner),
-				"slot %d moved backwards", slot)
-		}
+func defaultMigrationConfig() MigrationConfig {
+	var c MigrationConfig
+	if err := testkit.DecodeDefaults(&c); err != nil {
+		panic(err)
 	}
-	require.Equal(t, uint32(SlotCount), counts["node-a"]+counts["node-b"]+counts["node-c"])
-	// 16384 divides into three with a remainder of one, and the remainder goes to
-	// the lowest node id, so only node-a carries the extra slot.
-	assert.Equal(t, uint32(SlotCount)/3+1, counts["node-a"])
-	assert.Equal(t, uint32(SlotCount)/3, counts["node-b"])
-	assert.Equal(t, uint32(SlotCount)/3, counts["node-c"])
-	// With no live node there is nowhere to put a slot, and saying so is what
-	// keeps an empty fleet from assigning slots to the empty string.
-	assert.Empty(t, SplitOwner(0, nil))
+	return c
 }
 
-func indexOf(values []string, want string) int {
-	for index, value := range values {
-		if value == want {
-			return index
-		}
-	}
-	return -1
+type placementFake struct {
+	segments  []OwnershipSegment
+	nodes     []NodeInfo
+	err       error
+	published []byte
+	version   int64
+	tenure    CoordinatorLease
 }
 
-func active(id, instance string) NodeInfo {
-	return NodeInfo{ID: id, InstanceID: instance}
-}
-
-// TestPlanTargetsNeverMovesAHealthySlot is decision D18 in the planner: a node
-// joining the fleet takes only slots nobody owns. Every serving slot stays where
-// it is, because moving one costs a takeover and a takeover is the expensive,
-// risky operation the whole protocol is built around.
-func TestPlanTargetsNeverMovesAHealthySlot(t *testing.T) {
-	view := []Ownership{
-		{
-			SlotID: 0, State: SlotOwned, OwnerNodeID: "node-a",
-			OwnerInstanceID: "instance-a", Epoch: 1,
-		},
-		{
-			SlotID: 1, State: SlotOwned, OwnerNodeID: "node-b",
-			OwnerInstanceID: "instance-b", Epoch: 1,
-		},
-		{SlotID: 2, State: SlotUnowned},
-	}
-	live := []NodeInfo{
-		active("node-a", "instance-a"),
-		active("node-b", "instance-b"),
-		active("node-c", "instance-c"),
-	}
-	targets := PlanTargets(view, live, time.Second)
-
-	assert.Equal(t, "node-a", targets[0].TargetNodeID)
-	assert.Equal(t, "node-b", targets[1].TargetNodeID)
-	// Slot 2 is unowned, so it is assigned by the split, which with three nodes
-	// puts the first third with node-a.
-	assert.Equal(t, "node-a", targets[2].TargetNodeID)
-}
-
-// TestPlanTargetsReassignsASlotWhoseOwnerIsGone is the failover path. A lapsed
-// lease does not rewrite the ownership row: only an explicit release does, and a
-// crashed instance cannot issue one. So leaving such a slot without a target
-// strands it forever, and no other node can take it over.
-func TestPlanTargetsReassignsASlotWhoseOwnerIsGone(t *testing.T) {
-	view := []Ownership{
-		{
-			SlotID: 0, State: SlotOwned, OwnerNodeID: "node-gone",
-			OwnerInstanceID: "instance-gone", Epoch: 4,
-		},
-	}
-	targets := PlanTargets(view, []NodeInfo{
-		active("node-a", "instance-a"),
-		active("node-b", "instance-b"),
-	}, time.Second)
-
-	require.Len(t, targets, 1)
-	assert.NotEmpty(t, targets[0].TargetNodeID,
-		"a slot whose owner vanished must be assignable again")
-	assert.NotEqual(t, "node-gone", targets[0].TargetNodeID)
-}
-
-// TestPlanTargetsKeepsASlotOnItsRestartedNodeID is the rolling-restart rule:
-// the node id names a position in the fleet, so a new process under the same id
-// reclaims the position's slots instead of having them scattered across the
-// fleet. The claim it makes still waits out the quiet window, so the old
-// process's lease is covered.
-func TestPlanTargetsKeepsASlotOnItsRestartedNodeID(t *testing.T) {
-	view := []Ownership{{
-		SlotID: 0, State: SlotOwned, OwnerNodeID: "node-a",
-		OwnerInstanceID: "instance-old", Epoch: 7, GrantedAgo: time.Hour,
-		GrantAgeKnown: true,
-	}}
-	targets := PlanTargets(view, []NodeInfo{
-		active("node-a", "instance-new"),
-		active("node-b", "instance-b"),
-	}, time.Second)
-
-	require.Len(t, targets, 1)
-	assert.Equal(t, "node-a", targets[0].TargetNodeID,
-		"a restart reclaims its node id's slots; the claim covers the window")
-}
-
-// TestPlanTargetsMovesASlotWhoseGrantLapsed covers an owner that is still the
-// same live process but is no longer serving: its grant has passed the quiet
-// window, and its own read stops strictly inside that window, so the slot is
-// already unavailable from it. A fresh grant, or one whose age is unknown, keeps
-// it -- moving a serving slot on a guess is what D18 forbids.
-func TestPlanTargetsMovesASlotWhoseGrantLapsed(t *testing.T) {
-	const owner = "node-a"
-	const other = "node-b"
-	lapsed := func(ago time.Duration, known bool) []Ownership {
-		return []Ownership{{
-			SlotID: 0, State: SlotOwned, OwnerNodeID: owner,
-			OwnerInstanceID: "instance-a", Epoch: 3,
-			GrantedAgo: ago, GrantAgeKnown: known,
-		}}
-	}
-	live := []NodeInfo{active(owner, "instance-a"), active(other, "instance-b")}
-	window := time.Second
-
-	assert.Equal(
-		t,
-		other,
-		PlanTargets(lapsed(2*time.Second, true), live, window)[0].TargetNodeID,
-		"a grant past the window cannot be served by its owner",
-	)
-	assert.Equal(
-		t,
-		owner,
-		PlanTargets(lapsed(window-time.Millisecond, true), live, window)[0].TargetNodeID,
-		"a grant inside the window keeps its owner",
-	)
-	assert.Equal(
-		t,
-		owner,
-		PlanTargets(lapsed(time.Hour, false), live, window)[0].TargetNodeID,
-		"an unknown age is treated as fresh",
-	)
-}
-
-// TestPlanTargetsAssignsNothingWithoutAUsableNode keeps the empty answers
-// explicit: with no live node, or with only the node that cannot be its own
-// reassignment target, the answer is "nobody claims this" rather than handing
-// slots back to a node that cannot serve them.
-func TestPlanTargetsAssignsNothingWithoutAUsableNode(t *testing.T) {
-	targets := PlanTargets([]Ownership{{SlotID: 0, State: SlotUnowned}}, nil, time.Second)
-	require.Len(t, targets, 1)
-	assert.Empty(t, targets[0].TargetNodeID)
-
-	only := PlanTargets([]Ownership{{
-		SlotID: 0, State: SlotOwned, OwnerNodeID: "node-a",
-		OwnerInstanceID: "instance-a", Epoch: 1,
-	}}, nil, time.Second)
-	require.Len(t, only, 1)
-	assert.Empty(t, only[0].TargetNodeID)
-
-	// A lapsed owner is not in the live set, and its own node is not a valid
-	// destination for its slots, so with nobody else in the fleet the slot is
-	// held back.
-	lapsed := PlanTargets([]Ownership{{
-		SlotID: 0, State: SlotOwned, OwnerNodeID: "node-a",
-		OwnerInstanceID: "instance-a", Epoch: 1,
-	}}, nil, time.Second)
-	require.Len(t, lapsed, 1)
-	assert.Empty(t, lapsed[0].TargetNodeID)
-}
-
-func TestActiveNodeIDsOrdersTheLiveSet(t *testing.T) {
-	nodes := []NodeInfo{
-		{ID: "node-b"},
-		{ID: "node-a"},
-		{ID: "node-c"},
-	}
-	assert.Equal(t, []string{"node-a", "node-b", "node-c"}, ActiveNodeIDs(nodes))
-}
-
-// It has no method that could write placement at all. That is deliberate: the
-// publisher must materialise authority and nothing else, and a test double that
-// could accept intent would let a regression back in without failing here.
-type fakePublisherRepo struct {
-	segments   []OwnershipSegment
-	viewErr    error
-	publishErr error
-	// published records the view handed to the last write, so a test can pin
-	// that it is exactly the authority that was read.
-	published []OwnershipSegment
-	// leases records, in order, the tenure every write was made under.
-	leases   []CoordinatorLease
-	revision int64
-	writes   int
-}
-
-func (f *fakePublisherRepo) OwnershipSegments(
+func (f *placementFake) OwnershipSegments(
 	context.Context,
 	time.Duration,
 ) ([]OwnershipSegment, error) {
-	if f.viewErr != nil {
-		return nil, f.viewErr
-	}
-	return f.segments, nil
+	return f.segments, f.err
 }
 
-func (f *fakePublisherRepo) MaterialiseRoute(
+func (f *placementFake) LiveNodes(context.Context, time.Duration) ([]NodeInfo, error) {
+	return f.nodes, f.err
+}
+
+func (f *placementFake) AcquireCoordinator(
+	context.Context,
+	string,
+	time.Duration,
+) (CoordinatorLease, error) {
+	return f.tenure, f.err
+}
+
+func (f *placementFake) MaterialiseRoute(
 	_ context.Context,
 	segments []OwnershipSegment,
-	layoutVersion int64,
-	retention int,
-	lease CoordinatorLease,
+	layout int64,
+	_ CoordinatorLease,
 ) (PublishResult, error) {
-	if f.publishErr != nil {
-		return PublishResult{}, f.publishErr
+	payload, err := EncodeOwnershipSegments(segments, layout)
+	if err != nil {
+		return PublishResult{}, err
 	}
-	f.leases = append(f.leases, lease)
-	if f.writes > 0 && reflect.DeepEqual(f.published, segments) {
-		return PublishResult{Revision: f.revision, PayloadBytes: len(segments)}, nil
+	if !SameRoutePayload(payload, f.published) {
+		f.version++
+		f.published = payload
 	}
-	f.writes++
-	f.published = segments
-	f.revision++
-	return PublishResult{Revision: f.revision, PayloadBytes: len(segments)}, nil
+	return PublishResult{Revision: f.version, PayloadBytes: len(payload)}, nil
 }
 
-// blockingPublisherRepo holds a pass inside its first read until the pass's own
-// context ends, which is how a test observes the bound the pass runs under.
-type blockingPublisherRepo struct {
-	*fakePublisherRepo
-}
-
-func (b *blockingPublisherRepo) OwnershipSegments(
-	ctx context.Context,
-	_ time.Duration,
-) ([]OwnershipSegment, error) {
-	<-ctx.Done()
-	return nil, ctx.Err()
-}
-
-type fakeCoordinator struct {
-	held bool
-	// epoch is the tenure this replica is reported to hold. It is what the
-	// publish is expected to present.
-	epoch uint64
-}
-
-func (f *fakeCoordinator) AcquireCoordinator(
-	_ context.Context,
-	instanceID string,
-	_ time.Duration,
-) (CoordinatorLease, error) {
-	if !f.held {
-		return CoordinatorLease{}, nil
-	}
-	return CoordinatorLease{Held: true, InstanceID: instanceID, Epoch: f.epoch}, nil
-}
-
-// testPublisherInstanceID is the identity every publisher under test is fenced
-// with. The coordinator records it, so a test can pin which replica wrote.
-const testPublisherInstanceID = "instance-1"
-
-func testPublisherConfig() ControlPlaneConfig {
-	return ControlPlaneConfig{
-		LayoutVersion:     1,
-		CoordinatorLease:  10 * time.Second,
-		ReconcileInterval: time.Second,
-		// Bounded well inside the lease, as production validates it, so a test
-		// that hangs fails as a timeout rather than as a stuck suite.
-		PassTimeout: time.Second,
-	}
-}
-
-// oneOwnerSegments is the whole space owned by one instance. The publisher
-// refuses anything that is not a complete cover, so every pass test starts from
-// this shape.
-func oneOwnerSegments() []OwnershipSegment {
-	return []OwnershipSegment{{
-		StartSlot:       0,
-		EndSlot:         SlotCount - 1,
-		OwnerNodeID:     "node-a",
-		OwnerInstanceID: "instance-a",
-		Epoch:           1,
-		State:           SlotOwned,
-		GrantAgeKnown:   true,
-	}}
-}
-
-// TestPassPublishesOnlyWhileHoldingTheLease pins the single-writer rule: a
-// replica without the role reads nothing and writes nothing.
-func TestPassPublishesOnlyWhileHoldingTheLease(t *testing.T) {
-	repo := &fakePublisherRepo{segments: oneOwnerSegments()}
-
-	follower := NewPublisher(
-		testPublisherConfig(),
-		time.Second,
-		testPublisherInstanceID,
-		repo,
-		&fakeCoordinator{held: false},
-		nil,
-	)
-	require.NoError(t, follower.Pass(context.Background()))
-	assert.Zero(t, repo.writes, "a replica without the lease must not publish")
-
-	leader := NewPublisher(
-		testPublisherConfig(),
-		time.Second,
-		testPublisherInstanceID,
-		repo,
-		&fakeCoordinator{held: true},
-		nil,
-	)
-	require.NoError(t, leader.Pass(context.Background()))
-	assert.Equal(t, 1, repo.writes)
-}
-
-// TestPassMaterialisesTheAuthorityViewItRead is the whole of the publisher's
-// job. It decides no placement: the directory it writes is the ownership view,
-// slot for slot, and the epoch of each slot travels with it.
-func TestPassMaterialisesTheAuthorityViewItRead(t *testing.T) {
-	segments := []OwnershipSegment{
+func fullOwnedSegment(node, instance string) []OwnershipSegment {
+	return []OwnershipSegment{
 		{
-			StartSlot: 0, EndSlot: 0,
-			OwnerNodeID: "node-a", OwnerInstanceID: "instance-a",
-			Epoch: 4, State: SlotOwned, GrantAgeKnown: true,
+			StartSlot:       0,
+			EndSlot:         SlotCount - 1,
+			OwnerNodeID:     node,
+			OwnerInstanceID: instance,
+			Epoch:           1,
+			State:           SlotOwned,
+			GrantAgeKnown:   true,
 		},
-		{StartSlot: 1, EndSlot: SlotCount - 1, State: SlotUnowned},
 	}
-	repo := &fakePublisherRepo{segments: segments}
-	publisher := NewPublisher(
-		testPublisherConfig(), time.Second, testPublisherInstanceID, repo,
-		&fakeCoordinator{held: true}, nil,
-	)
-
-	require.NoError(t, publisher.Pass(context.Background()))
-
-	assert.Equal(t, segments, repo.published, "the directory is the authority view")
-	assert.Equal(t, int64(1), publisher.Stats().Revision)
-	assert.Equal(t, int64(SlotCount-1), publisher.Stats().UnownedSlots)
-	assert.Equal(t, int64(1), publisher.Stats().Passes)
 }
 
-// TestPassPublishesUnderTheTenureItAcquired pins the credential the write
-// carries. A pass that wrote with an assumed epoch, or with none, would be
-// asking storage to take its word for holding the role -- which is exactly what
-// the epoch replaces with a comparison, and the comparison is what a takeover
-// turns false.
-func TestPassPublishesUnderTheTenureItAcquired(t *testing.T) {
-	repo := &fakePublisherRepo{segments: oneOwnerSegments()}
-	publisher := NewPublisher(
-		testPublisherConfig(), time.Second, testPublisherInstanceID,
-		repo,
-		&fakeCoordinator{held: true, epoch: 7},
-		nil,
+func TestPlanningPrioritizesRecoveryWithoutMovingHealthySlots(t *testing.T) {
+	nodes := []NodeInfo{{ID: "b", InstanceID: "ib"}, {ID: "a", InstanceID: "ia"}}
+	targets, err := planTargetsFromSegments(
+		[]OwnershipSegment{{StartSlot: 0, EndSlot: SlotCount - 1, State: SlotUnowned}},
+		nodes,
 	)
-
-	require.NoError(t, publisher.Pass(context.Background()))
-
-	require.Len(t, repo.leases, 1)
-	assert.True(t, repo.leases[0].Held)
-	assert.Equal(t, "instance-1", repo.leases[0].InstanceID)
-	assert.Equal(t, uint64(7), repo.leases[0].Epoch)
+	require.NoError(t, err)
+	counts := map[string]int{}
+	for _, s := range targets {
+		counts[s.TargetNodeID]++
+	}
+	assert.Equal(t, SlotCount/2, counts["a"])
+	assert.Equal(t, SlotCount/2, counts["b"])
+	targets, err = planTargetsFromSegments(fullOwnedSegment("a", "ia"), nodes)
+	require.NoError(t, err)
+	for _, s := range targets {
+		require.Equal(t, "a", s.TargetNodeID)
+	}
 }
 
-// TestPassAbandonsAPublishItLostTheRoleFor covers the takeover that lands before
-// the write: the pass acquired the role, another replica took it, and the write
-// is refused rather than made on behalf of a role that is no longer this
-// replica's. The pass is not a failure -- the new publisher republishes the
-// current view -- but the refusal has to be visible.
-func TestPassAbandonsAPublishItLostTheRoleFor(t *testing.T) {
-	repo := &fakePublisherRepo{segments: oneOwnerSegments(), publishErr: ErrCoordinatorLost}
-	publisher := NewPublisher(
-		testPublisherConfig(), time.Second, testPublisherInstanceID,
-		repo,
-		&fakeCoordinator{held: true, epoch: 7},
-		nil,
-	)
-
-	require.NoError(t, publisher.Pass(context.Background()))
-
-	assert.Nil(t, repo.published, "a lost tenure must not publish a directory")
-	assert.Equal(t, int64(1), publisher.Stats().CoordinatorLost)
-	assert.Equal(t, int64(1), publisher.Stats().Passes)
+func TestMigrationStableAdmissionMinimalMovementAndPendingAccounting(t *testing.T) {
+	nodes := []NodeInfo{{ID: "b", InstanceID: "ib"}, {ID: "a", InstanceID: "ia"}}
+	s := fullOwnedSegment("a", "ia")
+	assert.Empty(t, planMigrations(s, nodes, nil, 15*time.Second, SlotCount))
+	nodes[0].StableFor = 15 * time.Second
+	plans := planMigrations(s, nodes, nil, 15*time.Second, SlotCount)
+	require.Len(t, plans, SlotCount/2)
+	for i, h := range plans {
+		assert.Equal(t, uint32(i), h.SlotID)
+		assert.Equal(t, "ib", h.TargetInstanceID)
+		require.NotEmpty(t, h.ID)
+	}
+	assert.Empty(t, planMigrations(s, nodes, plans, 15*time.Second, SlotCount))
 }
 
-// TestPassIsBoundedSoItCannotOutliveItsLease pins the bound that keeps a stalled
-// pass from writing under a tenure it has already spent.
-func TestPassIsBoundedSoItCannotOutliveItsLease(t *testing.T) {
-	cfg := testPublisherConfig()
-	cfg.PassTimeout = 10 * time.Millisecond
-	publisher := NewPublisher(
-		cfg, time.Second, testPublisherInstanceID,
-		&blockingPublisherRepo{&fakePublisherRepo{}},
-		&fakeCoordinator{held: true, epoch: 7},
-		nil,
-	)
-
-	err := publisher.Pass(context.Background())
-	assert.ErrorIs(t, err, context.DeadlineExceeded)
+func TestPlanningPinsTransfersButRecoversCompletedReleaseBoundary(t *testing.T) {
+	segments := fullOwnedSegment("a", "ia")
+	segments[0].State = SlotDraining
+	segments[0].QuietWindowOverdue = true
+	nodes := []NodeInfo{{ID: "b", InstanceID: "ib"}}
+	targets, err := planTargetsFromSegments(segments, nodes)
+	require.NoError(t, err)
+	assert.Equal(t, "a", targets[0].TargetNodeID)
+	segments[0].ReleaseReady = true
+	targets, err = planTargetsFromSegments(segments, nodes)
+	require.NoError(t, err)
+	assert.Equal(t, "b", targets[0].TargetNodeID)
 }
 
-// TestPassRepublishesNothingWhileTheAuthorityIsUnchanged is what keeps a stable
-// fleet from growing the route table: an identical view returns the revision
-// already published rather than minting a new one.
-func TestPassRepublishesNothingWhileTheAuthorityIsUnchanged(t *testing.T) {
-	repo := &fakePublisherRepo{segments: oneOwnerSegments()}
-	publisher := NewPublisher(
-		testPublisherConfig(),
-		time.Second,
-		testPublisherInstanceID,
-		repo,
-		&fakeCoordinator{held: true},
-		nil,
-	)
-
-	require.NoError(t, publisher.Pass(context.Background()))
-	require.NoError(t, publisher.Pass(context.Background()))
-
-	assert.Equal(t, 1, repo.writes)
-	assert.Equal(t, int64(1), publisher.Stats().Revision)
-	assert.Equal(t, int64(2), publisher.Stats().Passes)
+func TestPublisherPublishesOnlyAuthorityAndPreservesVersionForSameContent(t *testing.T) {
+	var cfg ControlPlaneConfig
+	require.NoError(t, testkit.DecodeDefaults(&cfg))
+	f := &placementFake{
+		segments: fullOwnedSegment("a", "ia"),
+		tenure:   CoordinatorLease{Held: true, InstanceID: "control", Epoch: 1},
+	}
+	p := NewPublisher(cfg, 5*time.Second, "control", f, f, nil)
+	require.NoError(t, p.Pass(context.Background()))
+	assert.EqualValues(t, 1, p.Stats().Revision)
+	require.NoError(t, p.Pass(context.Background()))
+	assert.EqualValues(t, 1, p.Stats().Revision)
+	assert.True(t, p.Readiness(time.Now()).Ready)
+	f.tenure.Held = false
+	require.NoError(t, p.Pass(context.Background()))
+	assert.EqualValues(t, 1, p.Stats().Revision)
+	f.segments[0].Epoch++
+	f.tenure.Held = true
+	require.NoError(t, p.Pass(context.Background()))
+	assert.EqualValues(t, 2, p.Stats().Revision)
 }
 
-// TestReadinessReportsTheLoopsState covers the answers a probe can get from a
-// replica: nothing to report on yet, a loop that is turning, a loop whose passes
-// are failing, and a loop that has stopped passing at all.
-//
-// Failing passes are reported rather than made unready: a restart does not fix
-// unreachable storage, and a probe that failed on it would pull every replica out
-// at once.
-func TestReadinessReportsTheLoopsState(t *testing.T) {
-	// Nothing has run yet, so there is no verdict to give and a probe must not be
-	// told the replica is serving.
-	fresh := NewPublisher(
-		testPublisherConfig(),
-		time.Second,
-		testPublisherInstanceID,
-		&fakePublisherRepo{segments: oneOwnerSegments()},
-		&fakeCoordinator{held: true},
-		nil,
+func TestRouteCacheMonotonicVersions(t *testing.T) {
+	c := NewRouteCache()
+	assert.Zero(t, c.Version())
+	c.UpdateRoute(
+		&Route{
+			Version:       2,
+			LayoutVersion: 1,
+			Segments: []RouteSegment{
+				{
+					StartSlot:       0,
+					EndSlot:         SlotCount - 1,
+					OwnerNodeID:     "a",
+					OwnerInstanceID: "ia",
+					Epoch:           3,
+				},
+			},
+		},
 	)
-	assert.Equal(t, PublisherReadiness{Reason: "initializing"}, fresh.Readiness())
-
-	require.NoError(t, fresh.Pass(context.Background()))
-	assert.Equal(t, PublisherReadiness{Ready: true, Reason: "serving"}, fresh.Readiness())
-
-	// A pass that cannot read the authority fails. The replica keeps reporting
-	// ready -- the loop is still turning -- and says so in LastPassFailed, which
-	// is what keeps a storage blip from reading as a dead process.
-	failing := testPublisherConfig()
-	failing.PassTimeout = 10 * time.Millisecond
-	failed := NewPublisher(
-		failing, time.Second, testPublisherInstanceID,
-		&blockingPublisherRepo{&fakePublisherRepo{}},
-		&fakeCoordinator{held: true},
-		nil,
-	)
-	require.Error(t, failed.Pass(context.Background()))
-	assert.Equal(t, PublisherReadiness{
-		Ready:          true,
-		Reason:         "serving",
-		LastPassFailed: true,
-	}, failed.Readiness())
-
-	// The stall window is a multiple of the pass interval, so a replica whose
-	// loop has stopped calling Pass is reported stalled rather than serving on
-	// the strength of its last successful pass.
-	stalling := testPublisherConfig()
-	stalling.ReconcileInterval = time.Millisecond
-	stalled := NewPublisher(
-		stalling, time.Second, testPublisherInstanceID,
-		&fakePublisherRepo{segments: oneOwnerSegments()},
-		&fakeCoordinator{held: true}, nil,
-	)
-	require.NoError(t, stalled.Pass(context.Background()))
-	time.Sleep(5 * time.Millisecond)
-	assert.Equal(t, PublisherReadiness{Reason: "stalled"}, stalled.Readiness())
+	c.UpdateRoute(&Route{Version: 1})
+	assert.EqualValues(t, 2, c.Version())
+	assert.Equal(t, "a", c.OwnerOf(0))
+	epoch, ok := c.EpochOf(0)
+	require.True(t, ok)
+	assert.EqualValues(t, 3, epoch)
+	assert.Empty(t, c.OwnerOf(SlotCount))
 }
 
-// TestReadinessDoesNotMakeAFailedPassUnready is the section D.17 rule on its own:
-// the verdict comes from loop activity, and a failing pass is reported next to
-// it rather than folded into it.
-func TestReadinessDoesNotMakeAFailedPassUnready(t *testing.T) {
-	repo := &fakePublisherRepo{viewErr: errUnreachable}
-	publisher := NewPublisher(
-		testPublisherConfig(),
-		time.Second,
-		testPublisherInstanceID,
-		repo,
-		&fakeCoordinator{held: true},
-		nil,
-	)
-
-	require.Error(t, publisher.Pass(context.Background()))
-
-	readiness := publisher.Readiness()
-	assert.True(t, readiness.Ready)
-	assert.True(t, readiness.LastPassFailed)
-	assert.Equal(t, "serving", readiness.Reason)
+func TestRoutePayloadIgnoresLeaseClassificationButNotAuthority(t *testing.T) {
+	left := []OwnershipSegment{
+		{
+			StartSlot:       0,
+			EndSlot:         9,
+			OwnerNodeID:     "a",
+			OwnerInstanceID: "ia",
+			Epoch:           2,
+			State:           SlotOwned,
+			GrantAgeKnown:   true,
+		},
+		{
+			StartSlot:          10,
+			EndSlot:            SlotCount - 1,
+			OwnerNodeID:        "a",
+			OwnerInstanceID:    "ia",
+			Epoch:              2,
+			State:              SlotDraining,
+			GrantAgeKnown:      true,
+			QuietWindowOverdue: true,
+		},
+	}
+	bytes, err := EncodeOwnershipSegments(left, 1)
+	require.NoError(t, err)
+	route, err := DecodeRoute(1, bytes)
+	require.NoError(t, err)
+	require.Len(t, route.Segments, 1)
+	assert.EqualValues(t, 2, route.Segments[0].Epoch)
+	var pretty map[string]any
+	require.NoError(t, json.Unmarshal(bytes, &pretty))
+	other, err := json.MarshalIndent(pretty, "", "  ")
+	require.NoError(t, err)
+	assert.True(t, SameRoutePayload(bytes, other))
+	assert.False(t, SameRoutePayload(bytes, []byte("{}")))
 }
 
-// errUnreachable stands in for a storage failure that is not worth a restart.
-var errUnreachable = errStorageUnreachable{}
-
-type errStorageUnreachable struct{}
-
-func (errStorageUnreachable) Error() string { return "storage is unreachable" }
+func TestRouteDecodeRejectsIncompleteSegments(t *testing.T) {
+	for _, payload := range []string{`{}`, `{"layout_version":1}`, `{"layout_version":1,"segments":[{"start_slot":1,"end_slot":16383}]}`, `{"layout_version":1,"segments":[{"end_slot":16383,"owner_node_id":"a","owner_instance_id":"ia"}]}`, `{"layout_version":1,"segments":[{"end_slot":16384}]}`} {
+		_, err := DecodeRoute(1, []byte(payload))
+		require.Error(t, err)
+	}
+	bytes, err := EncodeOwnershipSegments(
+		[]OwnershipSegment{{StartSlot: 0, EndSlot: SlotCount - 1, State: SlotUnowned, Epoch: 8}},
+		1,
+	)
+	require.NoError(t, err)
+	r, err := DecodeRoute(1, bytes)
+	require.NoError(t, err)
+	assert.EqualValues(t, 8, r.Segments[0].Epoch)
+}

@@ -1,9 +1,9 @@
 # Sequence high-availability architecture
 
-This is the design record the Sequence code, migrations, and tests cite by
-section. It states what the service guarantees, the exact storage predicates the
-guarantees rest on, and the evidence a deployment is expected to keep. Where a
-section number is referenced from a comment, the comment is pointing here.
+This is the design record for Sequence. It states what the service guarantees,
+the exact storage predicates the guarantees rest on, and the evidence a
+deployment is expected to keep. Code comments state the constraint they enforce
+next to the code; the section numbers here are a reading aid, not the contract.
 
 Sequence hands out strictly increasing IDs per key. That is the whole
 correctness claim: no client may observe an ID that is not greater than every ID
@@ -21,23 +21,77 @@ client that knows the snapshot can compute the same slot the owner does.
 
 A node id names a position in the fleet, such as `sequence-3` in a StatefulSet.
 An instance id names one process start of that position. Ownership is fenced on
-the pair: `slot_ownership` names the node, the instance, and an epoch.
+the pair: `sequence_slot_ownership` names the owner instance, and
+`sequence_instance_leases` carries the instance-level revision, node id, and
+lease clock that the fence is checked against.
+
+One deployable serves every shape. A process starts as `data` (allocator, node
+heartbeat, RPC, local placement), `control` (coordinator lease and directory
+publication), or `both`.
+
+```mermaid
+flowchart LR
+    Client["Client / pkg-sequence SDK"]
+    subgraph Data["mode: data (or both)"]
+        RPC["SequenceGenerator RPC"]
+        RouteCache["RouteCache: current snapshot"]
+        Alloc["Allocator: slots, gates, keyState cache"]
+        Ticker["Task ticker: renew, heartbeat, refresh, handoffs, maintain"]
+    end
+    subgraph Control["mode: control (or both)"]
+        Pub["Publisher: coordinator tenure + snapshot"]
+    end
+    subgraph Store["Strong-consistency database (PostgreSQL 14+ / MySQL 8.0)"]
+        Ranges[("sequence_ranges")]
+        Leases[("sequence_instance_leases")]
+        Slots[("sequence_slot_ownership")]
+        Live[("sequence_node_liveness")]
+        Coord[("sequence_coordinator")]
+        Snapshot[("sequence_route_snapshot")]
+        Handoffs[("sequence_slot_handoffs")]
+    end
+    Client -->|"GetRoute / FetchNext / FetchNextBatch"| RPC
+    RPC --> RouteCache
+    RPC --> Alloc
+    Ticker --> Alloc
+    Ticker -->|"GetNewerRoute"| RouteCache
+    Ticker -->|"read snapshot"| Snapshot
+    Pub --> Snapshot
+    Alloc --> Ranges
+    Alloc --> Leases
+    Alloc --> Slots
+    Alloc --> Live
+    Alloc --> Handoffs
+    Pub --> Leases
+    Pub --> Slots
+    Pub --> Live
+    Pub --> Coord
+    Pub --> Handoffs
+```
+
+`SequenceGenerator`, including `GetRoute`, is registered only by a `data` or
+`both` process. The `control` process publishes `sequence_route_snapshot`; a
+`data` or `both` process refreshes that snapshot into its local `RouteCache` and
+serves `GetRoute` from it. A `control` replica is therefore not a client RPC
+target.
 
 - The **epoch** is a per-slot generation. It is incremented by every grant and
   never decremented or reused. A release preserves the current epoch and only
   clears the owner, so comparing epochs orders two observations.
-- A **local lease** is the interval `L - epsilon` during which an owner serves a
-  slot from memory without re-reading storage. A slot whose local lease has
-  lapsed refuses allocation until a renewal re-confirms the grant.
+- A **local lease** is the interval `L - epsilon` during which an owner serves
+  its slots from memory without re-reading storage. The deadline is
+  instance-wide: one confirmed instance-lease renewal re-arms every slot the
+  instance holds. A slot whose local lease has lapsed refuses allocation until a
+  renewal re-confirms the grant.
 - The **quiet window** `W` is the interval a non-owner must let pass, measured on
   the storage clock since the last grant, before it may take an owned slot over
   without the owner's participation.
 
 The storage is a single strong-consistency database (PostgreSQL 14+ or MySQL
-8.0). Every ownership decision -- claim, renew, release, and each range
-reservation -- is one transaction against `slot_ownership`. There is no
-consensus protocol between nodes and no leader for allocation: nodes coordinate
-only through the rows they share.
+8.0). Every ownership decision -- claim, instance renewal, release, handoff, and
+each range reservation -- is one transaction against the authority tables. There
+is no consensus protocol between nodes and no leader for allocation: nodes
+coordinate only through the rows they share.
 
 ### 1.2 The single hazard
 
@@ -73,7 +127,23 @@ are what the tests and the allocation record (appendix F) check:
 
 A gap is allowed. Unused values from a reserved range become gaps after a
 restart, a handoff, or idle eviction; the contract is monotonicity, not
-contiguity.
+contiguity. State the guarantee precisely, because the weaker readings are
+tempting:
+
+- Every pair of **successful** calls for one key returns non-overlapping blocks;
+  the higher block is strictly greater than the lower.
+- The **delivery order** of concurrent responses is not part of the contract. A
+  caller that needs arrival order must order the responses itself, for example
+  by the returned `id`.
+- `count` requests a **contiguous block**: the response returns `id` and `count`
+  such that `[id, id+count)` is reserved for the key. It does not promise that
+  the next call continues at `id+count`; the next block may start later.
+- A **batch across multiple nodes is not a transaction**. It is grouped by owner
+  and issued as independent requests, so one group may succeed while another
+  fails.
+- A **retry is not exactly-once**. A lost reply or an uncertain commit can
+  consume IDs that the caller never sees; retrying the public call can allocate
+  again for keys that had already succeeded internally.
 
 ### 1.4 Linearisation
 
@@ -94,8 +164,8 @@ traffic.
 ### 2.1 The reservation write-skew fence
 
 A range reservation validates ownership and advances `sequence_ranges`
-(`(namespace, key) -> reserved_end`) in one transaction. The naive shape --
-read `slot_ownership`, check it, then write the watermark -- has a write-skew
+(`sequence_key -> reserved_end`) in one transaction. The naive shape --
+read `sequence_slot_ownership`, check it, then write the watermark -- has a write-skew
 anomaly: a takeover can commit between the check and the write, so both succeed
 and the reservation runs under a superseded epoch.
 
@@ -121,6 +191,56 @@ reservation and storage I/O happen after the read lock is released. A
 reconcile that needs the write lock therefore never waits behind a blocked
 storage statement, which is what removes the periodic tail latency a storage
 stall used to cause.
+
+### 2.3 Key state lifecycle
+
+Each slot keeps a cache of per-key state (`keyState`): the active range, the
+standby range the prefetcher reserved, the next value to hand out, and a retry
+timer. The cache is bounded by idle eviction and by memory admission, so a
+request can race the eviction of the very state it is about to use. The race
+matters because eviction discards an unused tail of the active range: a request
+that prepared a range against a state that a cleanup is simultaneously
+retiring could reserve a *new* range while an older pointer still hands out
+lower IDs -- an ordering regression.
+
+The protocol that closes it is a per-state atomic reference / retirement gate:
+
+- `keyState.references` is a signed counter. Acquisition CAS-increments it only
+  while it is non-negative. Retirement CAS-moves it from `0` to `-1`, which
+  permanently closes the entry: acquisition then fails instead of incrementing.
+- A request calls `acquireState` first. It holds `slotsMu` (read lock) only for
+  the cache lookup and the acquisition, never across range preparation or
+  database I/O. Any load failure whose acquisition fails is not used; the caller
+  re-reads the cache.
+- Every path that holds a reference releases it exactly once on success,
+  failure, or cancellation.
+- Eviction requires, under the slot write lock and the state lock, that the
+  state has no in-flight prefetch (`fetch == nil`) and that
+  `references.CompareAndSwap(0, -1)` succeeds. Only then does it mark the state
+  retired, cancel the retry timer, account for the discarded IDs, and remove it
+  from the slot. A state with a live reference, an in-flight fetch, or a
+  recently used timestamp is left in place.
+- Prefetch keeps its existing guard: a scheduled retry checks `retired` before
+  arming, and `cancelRetry` retires the state so a timer that already fired
+  cannot resurrect it.
+
+Single-key (`FetchNext`), contiguous (`FetchNextN`), and batch
+(`FetchNextBatch`) requests all use the same protocol. The loop is:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Live: acquireState creates the entry
+    Live --> Referenced: acquire increments the reference count
+    Referenced --> Live: release
+    Live --> Retired: eviction CAS 0 -> -1 (fetch == nil, idle)
+    Retired --> [*]: removed from the slot cache and retry timer cancelled
+    Referenced --> Referenced: acquire / release while in use
+    Retired --> Retired: acquireState fails, caller re-reads the cache
+```
+
+Cleanup scans a bounded slice of slots per pass (`cleanup_slots_per_run`) so a
+hot slot cannot stop cold keys in other slots from being evicted, and the
+write lock is held only for the per-candidate retirement decision.
 
 ## 3. Time model
 
@@ -226,21 +346,28 @@ section. A pause can therefore only make an owner serve less, never more.
 A slot's local lifecycle is:
 
 1. **Planned.** The node's heartbeat computes the desired set from
-   `slot_ownership` and `sequence_node_liveness` (section 10.4, appendix C).
+   `sequence_slot_ownership` and `sequence_node_liveness` (section 10.4,
+   appendix C).
 2. **Claimed.** The node asks the authority for the slots it was assigned.
    Granted slots install an epoch and arm a local deadline of `L - epsilon`.
 3. **Serving.** Requests enter the slot gate while the deadline is in the
-   future. Renewals keep the deadline moving.
+   future. One instance-lease renewal keeps the shared deadline moving.
 4. **Fenced.** A renewal that is refused, or a local deadline that passes
-   before a renewal confirms the grant, closes the gate. The slot refuses
+   before a renewal confirms the grant, closes every gate. The slot refuses
    allocation with `SEQUENCE_OWNER_RECOVERING` / `SEQUENCE_LEASE_EXPIRED`
    until a renewal succeeds.
-5. **Released.** On graceful shutdown, a slot that is no longer planned is
-   drained and released with the epoch-CAS (section 6.3, 6.5).
+5. **Released.** On graceful shutdown the instance retires its lease and hands
+   each held slot back through the handoff path (section 5.2, 6.3, 6.5).
 
-Renewals run off the node heartbeat rather than the logical tick, because they
-are a wall-clock obligation: pacing them by a configurable tick would make the
-safety window depend on the tick interval.
+Renewal runs on its own loop at `ha.renew_interval`, not on the node heartbeat
+and not on a logical tick, because it is a wall-clock obligation: pacing it by a
+configurable logical tick would make the safety window depend on the tick
+interval. It is also one storage statement for the whole instance -- it updates
+a single `sequence_instance_leases` row -- so the cost does not grow with the
+number of slots the instance holds, and the deadline it re-arms is shared by all
+of them. `sequence.dataplane.renewal_batch_duration_seconds` and
+`sequence.dataplane.renewal_batch_size` observe that one round trip; the size
+histogram records the one instance row, not the owned slot count.
 
 ## 5. Membership and handoff
 
@@ -263,20 +390,108 @@ registered it. That split is what makes two cases different:
 
 ### 5.2 Planned handoff and crash takeover
 
-To move slots off a node, stop it. The process drains and releases what it holds
-on the way down; the nodes that remain pick those slots up on their next
-heartbeat. That is the planned handoff, and it is why no orchestrator event is
-consulted for ownership: the release itself is the handoff.
+Moving a slot off an instance is a **handoff**: a durable intent in
+`sequence_slot_handoffs` that both parties execute through the coordinator,
+rather than a release done by the leaving instance alone. A handoff has a
+`kind`:
 
-A crash has no release. The row keeps naming the dead instance and only ages;
-the remaining nodes plan the slots away once the owner is not live, and their
-claims wait out the quiet window inside the authority. Recovery RTO for a
-crashed node is therefore bounded by `node_ttl` (to notice) plus `W` (to take
-over), plus a heartbeat.
+- **TRANSFER** names a `target_instance_id`. The target prepares, the source
+  drains, and the target claims at a fresh epoch.
+- **RELEASE** has no target. It is how a graceful shutdown returns a slot to the
+  unowned pool, and it is also what an orphaned TRANSFER degrades to.
 
-This round does not add an operator-driven drain RPC or a management API: the
-only ways to move authority are the honest ones -- stop the process, or let its
-lease lapse.
+The phase is one of `PLANNED`, `READY`, `DRAINING`, `TRANSFERRED`, `COMPLETED`,
+or `CANCELLED`; `drained`, `target_ready`, and `not_before` are the per-phase
+fences.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PLANNED: coordinator plans TRANSFER
+    PLANNED --> READY: target PREPARE
+    READY --> DRAINING: BEGIN sets not_before
+    DRAINING --> DRAINING: source ACK_DRAIN
+    DRAINING --> TRANSFERRED: target TRANSFER (epoch++)
+    DRAINING --> COMPLETED: RELEASE TRANSFER (slot UNOWNED)
+    TRANSFERRED --> COMPLETED: target ACK_ACTIVE
+    PLANNED --> CANCELLED: recovery drops a stale intent
+    READY --> CANCELLED: recovery drops a stale intent
+    DRAINING --> CANCELLED: source/epoch no longer matches
+    TRANSFERRED --> CANCELLED: target does not hold epoch+1
+```
+
+The normal TRANSFER sequence is:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Coordinator (control)
+    participant S as Source instance
+    participant T as Target instance
+    participant DB as Authority tables
+    C->>DB: PlanHandoffs (TRANSFER, PLANNED)
+    T->>DB: PREPARE -> READY, target_ready=true
+    T->>DB: BEGIN -> DRAINING, not_before=max(now, source.granted_at)+W
+    S->>DB: (slot marked DRAINING)
+    S->>S: close the slot gate, wait for in-flight to drain
+    S->>DB: ACK_DRAIN -> drained=true
+    T->>DB: TRANSFER -> owner=target, epoch+1, TRANSFERRED
+    T->>T: install fresh local state (never the old gate)
+    T->>DB: ACK_ACTIVE -> COMPLETED
+```
+
+`not_before` is the quiet window measured from the later of the storage clock
+and the source's last confirmed grant. It is what lets a target finish a
+transfer even when the source never acknowledges: once `not_before` passes, the
+source can no longer legitimately serve the slot, so the target may take it.
+`ACK_DRAIN` lets the source shorten the wait honestly by confirming that its
+in-flight work reached zero.
+
+Graceful shutdown is a RELEASE: the leaving instance issues `WITHDRAW`, which
+creates a `READY`/RELEASE handoff for a slot it still owns, then drains and
+finalizes it with `TRANSFER` once `drained` or `not_before` holds. The slot
+becomes `UNOWNED`, and the next claim takes it immediately without waiting for a
+window.
+
+When a target dies before a transfer completes, the coordinator repairs the
+intent on its next pass (`RecoverHandoffs`), under the coordinator tenure and
+the instance, slot, and handoff locks:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Coordinator (control)
+    participant DB as Authority tables
+    Note over C,DB: target instance is not live
+    C->>DB: lock handoff + source/target leases + slot
+    alt TRANSFER with a fresh replacement target
+        C->>DB: retarget, new handoff_id, drained/target_ready reset
+    else no replacement target
+        C->>DB: kind=RELEASE, target=null, new handoff_id
+        Note right of DB: source, source_epoch, drained and not_before kept
+    end
+    C->>DB: release when drained or not_before has passed
+    DB->>DB: slot UNOWNED, source revision bumped
+```
+
+Degrading to RELEASE is the fix for the single-node case: with no other live
+instance there is nobody to receive a TRANSFER, so the intent must be allowed to
+resolve to "unowned" and be re-claimed by the same instance at a **new epoch**.
+The source's `source_instance_id`, `source_epoch`, its drain acknowledgement,
+and its `not_before` are preserved, so the old target's commands (keyed by the
+old `handoff_id`) are rejected and the release still honors the original drain
+fence. Only after the drain is confirmed or `not_before` passes does the
+existing release/claim path re-grant the slot; the old gate is never reopened,
+and the new grant installs fresh local state.
+
+A crash needs no coordinator repair for ownership itself: the instance lease row
+ages, the remaining nodes plan the slots away once the owner is not live, and
+their claims wait out `W` inside the authority. Recovery RTO for a crashed node
+is therefore bounded by `node_ttl` (to notice) plus `W` (to take over), plus a
+heartbeat. The coordinator repair path above only has to run when a handoff was
+in flight and its target vanished.
+
+There is still no operator-driven drain RPC: the ways to move authority are a
+graceful shutdown (a RELEASE handoff) or letting the lease lapse.
 
 ## 6. Ownership protocol
 
@@ -334,37 +549,46 @@ for its own planning uses `OwnershipSegments`, which classifies a run as
 quiet-window overdue with the same storage clock, so the plan and the claim
 agree about which slots are takeable.
 
-### 6.5 Release epoch-CAS
+### 6.5 Release
 
-`ReleaseSlots` revokes authority only where
-`slot_id + owner_instance_id + epoch + state = OWNED` still matches, and returns
-the number of rows revoked. The epoch is preserved, so the released generation
-can never be handed out again and a stale release cannot revoke a newer owner.
-An exact-match release takes effect immediately: the next claim sees an unowned
-slot and does not wait for the window. A release whose predicates do not match
-revokes nothing.
+Release is expressed as a RELEASE handoff (section 5.2) rather than a bare slot
+update, so the drain fence and the command identity are durable. The slot moves
+to `UNOWNED` only when the source still owns it at the handoff's `source_epoch`
+and the handoff's `drained` flag is set or `not_before` has passed; the epoch is
+preserved, so a released generation can never be handed out again, and a stale
+release cannot revoke a newer owner. An exact-match release takes effect
+immediately: the next claim sees an unowned slot and does not wait for the
+window. A release whose predicates do not match changes nothing.
 
-### 6.6 Grouped renewal
+On startup and shutdown the instance is fenced by its lease row, not by an
+enumeration of slots. `RegisterInstance` inserts the row or refuses when an
+`ACTIVE` row already names a different node for the same instance id;
+`RetireInstance` flips the row to `RETIRED` and bumps the revision, which fences
+any in-flight statement the old process might still be running.
 
-Renewal refreshes `granted_at` for slots the caller still holds under the same
-epoch-CAS predicate. It is deliberately **not** lease-checked: a lease may
-expire early but never late, so a renewal that cannot be confirmed must not
-extend a local deadline; leaving the deadline alone is the safe direction.
+### 6.6 Instance lease renewal
 
-The renewal is grouped by `instance_id + epoch`. Everything one instance holds
-at one epoch shares one predicate, so `RenewSlots` sends one statement per
-generation (chunked to the storage's bind-parameter cap) instead of one per
-slot, and only rows that still match come back. A slot that does not come back
-is fenced locally rather than re-armed: it is no longer held at that epoch.
-Locally draining slots are excluded from the renewal set, and a fenced instance
-stops renewing altogether -- that is what hands its slots to the fleet once
-their grants age past the window.
+Renewal refreshes the single `sequence_instance_leases` row for the instance
+under the CAS `instance_id + state=ACTIVE + ownership_revision`. It is
+deliberately **not** lease-checked: a lease may expire early but never late, so
+a renewal that cannot be confirmed must not extend a local deadline; leaving
+the deadline alone is the safe direction.
+
+Because the row is per instance, one statement re-arms every slot the instance
+holds, whatever the count, and the shared local deadline moves with it. Slots
+are not renewed individually and their `granted_at` is not refreshed; a slot's
+authority is derived from the instance lease plus its own `epoch` and `state`.
+A renewal whose revision no longer matches is refused, the instance resyncs its
+authority, and a resync that cannot confirm the lease fences every gate rather
+than re-arming it. A drained or fenced instance stops renewing altogether --
+that is what lets its slots age past the window and be taken over.
 
 ## 7. The published directory
 
 ### 7.1 Snapshot shape
 
-`sequence_routes` holds one row per published revision. A payload carries:
+`sequence_route_snapshot` holds exactly one row (`id = 1`): the newest published
+revision and its encoded payload. A payload carries:
 
 - `layout_version`, the slot layout the snapshot was minted under;
 - `segments`: ordered, gap-free runs of slots sharing owner node, owner
@@ -376,21 +600,27 @@ owner story starts a stored segment: the quiet-window classification that split
 the read into finer runs is canonicalised away, so a grant ageing across the
 window does not mint a revision for a directory that means the same thing.
 Unowned runs are written without an owner or epoch, so a reader pauses them
-rather than routing them to the empty node.
+rather than routing them to the empty node. Because the snapshot is a single
+row that is replaced in place, there is no revision history to prune and no
+retention setting.
 
 ### 7.2 Client compilation
 
 A client refuses a snapshot that does not cover every slot exactly once, and it
 compiles ownership like this:
 
-- with `segments`: segments are the authoritative owner source. `nodes` is only
-  a projection and may be partial -- it may omit unowned slots, and an owned
-  slot may be missing from its node's list -- but a node list may never claim a
-  slot for the wrong node or for an unowned slot. Such a conflict is refused
-  rather than resolved.
-- without `segments` (a pre-authority snapshot): the node lists must cover all
-  16,384 slots, and the compiled view carries no epochs. A caller then sends no
-  epoch, and the server answers without an epoch comparison.
+- `segments` are required and are the authoritative owner source. They must
+  cover all 16,384 slots exactly once and carry a per-slot epoch for every owned
+  slot; a snapshot with no segments, or with a gap or overlap, is refused as an
+  invalid route.
+- `nodes` is only a projection and may be partial -- it may omit unowned slots,
+  and an owned slot may be missing from its node's list -- but a node list may
+  never claim a slot for the wrong node or for an unowned slot. Such a conflict
+  is refused rather than resolved.
+
+There is no pre-authority snapshot shape and no legacy compilation path: the
+candidate baseline is an empty database, so every snapshot a current server
+publishes carries segments and every caller sends an epoch.
 
 ### 7.3 Version handoff
 
@@ -436,15 +666,38 @@ Cross-section rule: `lease_duration - safety_margin` must exceed
 `renew_interval + allocator.reserve_timeout`, so a renewal can always complete
 before the deadline it has to beat.
 
+Node identity and cadence, `app.sequence.dataplane.node`:
+
+| Parameter | Default | Constraint |
+| --- | --- | --- |
+| `id` | required | the node's fleet position; also its liveness identity |
+| `heartbeat_interval` | `1s` | positive; renews the liveness row |
+| `route_refresh_interval` | `1s` | positive; refreshes the local directory |
+| `handoff_interval` | `250ms` | positive; drives the handoff pass |
+| `route_query_timeout` | `1s` | positive; bounds one route read |
+
 Control plane, `app.sequence.controlplane`:
 
 | Parameter | Default | Constraint |
 | --- | --- | --- |
 | `layout_version` | `1` | positive |
-| `route_retention` | `64` | positive; newest revisions kept in `sequence_routes` |
+| `active_publish_interval` | `250ms` | within `(0, reconcile_interval]` |
 | `coordinator_lease` | `10s` | positive |
 | `reconcile_interval` | `5s` | positive; below the coordinator lease |
 | `pass_timeout` | `3s` | positive; below the coordinator lease |
+| `migration.join_stability_window` | `15s` | positive; a joiner must be live this long before rebalancing |
+| `migration.batch_slots` | `64` | positive; <= 1000 and <= each of the inflight/source/target caps |
+| `migration.max_inflight` | `256` | positive |
+| `migration.max_per_source` | `64` | positive |
+| `migration.max_per_target` | `64` | positive |
+| `migration.max_planned` | `1024` | `>= max_inflight`, `<= SlotCount` |
+
+Validation is scoped by mode. Every mode validates the shared authority bounds
+(lease, quiet window, clock/pause bounds, `node_ttl`) plus the database identity
+and the runtime memory setting. Allocator sizing, node cadence, renewal
+interval, release drain timeout, and the cross-section deadline rule are
+validated only in `data` and `both`, because a `control` replica starts none of
+those components and must not be forced to carry their settings.
 
 ### 8.2 Assumptions
 
@@ -465,7 +718,11 @@ to the slot count (section 10.3).
 | Publisher dies | the coordinator row expires; publication stops | already-published directory keeps being served | any control replica takes the same row and republishes |
 | Publisher partition (stale tenure) | `GuardCoordinator` fails the write | none; no revision is published | the replica that holds the current tenure republishes |
 | Ownership view short or overlapping | the reader refuses it | none; the previous desired set and directory stay in force | the next read retries |
-| `sequence_routes` growth | retention prunes inside the publish transaction | none | the table stays bounded by `route_retention` |
+| Handoff target crashes before `TRANSFERRED` | the `PLANNED`/`READY` intent is left pointing at a dead instance | keys on the slot keep serving from the source | the coordinator cancels it, or retargets a fresh replacement |
+| Handoff target crashes with no replacement target | a `TRANSFER` can never complete | the source keeps serving under its original drain fence | recovery turns it into a `RELEASE` (new `handoff_id`); the source re-claims at a new epoch |
+| Handoff target crashes after `TRANSFERRED` | the slot names an instance that never reached `ACK_ACTIVE` | keys route to the dead target and refuse | recovery cancels the stale intent once it does not hold `source_epoch+1`; the slot is replanned |
+| Duplicate recovery pass | repeated `RecoverHandoffs` under the coordinator tenure | none | every transition is guarded by the handoff `id`, phase, and slot epoch, so it is idempotent |
+| `sequence_slot_handoffs` growth | active intents are bounded by `migration.max_planned`; completed/cancelled rows are overwritten by slot | none | planning is admitted only under `max_planned`, so a burst cannot outrun the budget |
 
 Any failure that could produce a duplicate ID is treated as a safety event, not
 an availability event: the affected slot is fenced and refuses work.
@@ -482,11 +739,11 @@ distinguishing the two. The readiness body reports the bounds in force
 (`quiet_window_seconds`, `lease_duration_seconds`, `max_pause_seconds`) so a
 probe failure can be read against the safety argument.
 
-Shutdown is ordered: the process stops renewing liveness and slots, drains and
-releases the authority it no longer needs, and the remaining nodes converge.
-An ownership outbox used to mirror grant and release events; it had no reader
-(publication is driven by `reconcile_interval` reading the authority tables),
-so the table and its writes were removed. The authority rows are the record.
+Shutdown is ordered: the process pauses admission, stops renewing its instance
+lease and liveness row, drains the slots it holds, and hands them back as
+RELEASE handoffs; the remaining nodes converge. The authority rows are the
+record; publication is driven by `reconcile_interval` reading them, and no
+separate event mirror exists.
 
 ### 10.2 The measured-pause requirement
 
@@ -496,8 +753,8 @@ storage, so the service refuses to start unless `pause_verified` is set. The
 same is true of `J_max`, asserted with `clock_disciplined`: no database bounds a
 forward jump of its own clock, so a deployment must either discipline and
 monitor the storage clock or use a storage whose transactions carry a monotonic
-commit timestamp. Both requirements are stated in `HAConfig.Validate` and in
-section 3.3.
+commit timestamp. Both requirements are asserted by the shared authority
+validation and are the basis of the quiet-window floor.
 
 ### 10.3 Capacity envelope
 
@@ -507,11 +764,11 @@ At 100 live nodes the control plane must not read per-slot rows:
   a steady fleet returns O(number of live nodes) runs rather than 16,384 rows.
   The planner and publisher read that view; the per-slot `OwnershipView` stays
   for diagnostics, tests, and reservation checks only.
-- Renewal is one statement per `instance_id + epoch` generation rather than one
-  per slot (section 6.6), and `sequence.dataplane.renewal_batch_size` /
-  `renewal_batch_duration_seconds` observe it.
-- The route table is bounded by `route_retention`; pruning happens inside the
-  publish transaction, including passes that matched an unchanged payload.
+- Renewal is one statement for the `sequence_instance_leases` row rather than
+  one per slot (section 6.6); `sequence.dataplane.renewal_batch_duration_seconds`
+  and `sequence.dataplane.renewal_batch_size` observe that single round trip.
+- Publication replaces the single `sequence_route_snapshot` row in place, so
+  there is no revision history to prune and no retention setting to bound.
 
 `BenchmarkOwnershipSegmentsAtHundredNodeSteadyState` pins the read's shape: a
 100-node fleet holding the space in even shares reads back as one run per node
@@ -524,7 +781,7 @@ window is a lease decision.
 
 ### 10.4 Placement, liveness, and publisher fencing
 
-Placement is computed locally by every node from `slot_ownership` plus
+Placement is computed locally by every node from `sequence_slot_ownership` plus
 `sequence_node_liveness`; there is no intent table and no central planner.
 Appendix C lists the rules. A node claims only what its own plan assigned it, so
 the authority store -- not the plan -- decides the outcome.
@@ -545,18 +802,23 @@ is what keeps a control-plane outage from affecting what a data node may serve.
 ### 10.5 Schema and migrations
 
 Each dialect owns its migrations under `migrations/sequence/{postgres,mysql}`.
-The HA schema consists of:
+The candidate baseline is a single `init` migration per dialect rather than a
+chain of upgrades, because it is applied to an **empty** database. The schema
+consists of:
 
-- `slot_ownership` with one row per slot (the authority);
+- `sequence_slot_ownership` with one row per slot (the authority), seeded
+  `UNOWNED` by the migration;
+- `sequence_instance_leases` keyed by instance id (revision, node id, lease
+  clock, state);
 - `sequence_node_liveness` keyed by node id (fleet membership);
 - `sequence_coordinator` with its single elected row;
-- `sequence_routes` and `sequence_route_state` for published revisions;
-- `sequence_ranges` keyed by `(namespace, sequence_key)` for watermarks.
+- `sequence_route_snapshot` with the single published revision;
+- `sequence_slot_handoffs` keyed by slot id (the durable migration intents);
+- `sequence_ranges` keyed by `sequence_key` for watermarks.
 
-Releases are forward-only in production; every `Down` section exists so a
-rollback is executable, including the one that rebuilds the empty
-`ownership_outbox` table. Both directions are exercised by the integration
-suite (appendix D).
+The baseline does **not** upgrade a previously populated schema and does not
+add a migration bridge from one: rebuild into an empty database instead. Both
+directions are exercised by the integration suite (appendix D).
 
 ### 10.6 Observability
 
@@ -569,8 +831,8 @@ failure modes together (appendix E).
 
 For a deployment:
 
-- set the bounds in `app.sequence.dataplane.ha` and the publisher cadence in
-  `app.sequence.controlplane` (section 8.1);
+- set the bounds in `app.sequence.dataplane.ha` and the publisher cadence and
+  migration limits in `app.sequence.controlplane` (section 8.1);
 - assert `pause_verified` from a measured platform pause bound and
   `clock_disciplined` from a disciplined, monitored storage clock;
 - keep `node_ttl` well above the heartbeat period, and keep
@@ -582,10 +844,10 @@ For a deployment:
   `sequence.ha.gate_fenced`, and `sequence.ha.clock_drift_seconds` leaving its
   asserted bound.
 
-The publisher's writes are fenced by the coordinator epoch (section 10.4), the
-route payload is validated before it is written, and the table is pruned to
-`route_retention` revisions in the same transaction. `GetRoute` serves the
-newest revision; older rows are a bounded rollback window for operators.
+The publisher's writes are fenced by the coordinator epoch (section 10.4) and
+the route payload is validated before it is written. `GetRoute` serves the
+current snapshot; there is no older revision to roll back to, so a rollback
+re-publishes from the authority rather than restoring a prior row.
 
 ## Appendix A: Caller protocol
 
@@ -600,10 +862,9 @@ newest revision; older rows are a bounded rollback window for operators.
 
 A snapshot carries the revision `version`, the `layout_version`, the `nodes`
 projection, and the `segments` authority view. The segments are what give a
-caller a per-slot epoch; a snapshot without segments is a legacy shape that
-carries no epochs (section 7.2). The router compiles a snapshot only when it
-covers the space exactly once and its node lists do not conflict with the
-segments.
+caller a per-slot epoch. The router compiles a snapshot only when the segments
+cover the space exactly once and the node lists do not conflict with them; a
+snapshot without segments is refused.
 
 ### A.3 Request metadata
 
@@ -645,7 +906,7 @@ fallback classification. Attempts rebuild metadata and reset replies. The
 budget bounds recovery but does not promise exactly-once or cover the full
 takeover interval.
 
-Cross-node `BatchClient` owns one outer budget and limits concurrency to 32.
+Cross-node `Client` owns one outer budget and limits concurrency to 32.
 Successful validated groups are retained; only unfinished keys are regrouped
 and retried, and group interceptors perform no nested retries. Recoverable
 failures leave sibling groups running; terminal errors or cancellation cancel
@@ -659,15 +920,17 @@ pause or remove a problematic node instead, or roll back the SDK independently.
 
 | Table | Key | Role |
 | --- | --- | --- |
-| `slot_ownership` | `slot_id` | the authority: owner node, owner instance, epoch, granted_at, state |
+| `sequence_slot_ownership` | `slot_id` | the authority: owner instance, epoch, state |
+| `sequence_instance_leases` | `instance_id` | instance fence: node id, revision, lease clock, state |
 | `sequence_node_liveness` | `node_id` | fleet membership: instance id and storage-clock renewal time |
 | `sequence_coordinator` | `id = 1` | publisher election: owner instance, epoch, expiry |
-| `sequence_routes` | `version` | published directory payloads, pruned to `route_retention` |
-| `sequence_route_state` | `id = 1` | revision allocator for the directory |
-| `sequence_ranges` | `(namespace, sequence_key)` | reserved high watermark per key |
+| `sequence_route_snapshot` | `id = 1` | the single published directory payload and its revision |
+| `sequence_slot_handoffs` | `slot_id` | durable handoff intents: kind, source epoch, target, phase, fences |
+| `sequence_ranges` | `sequence_key` | reserved high watermark per key |
 
-`slot_ownership` is seeded with one UNOWNED row per slot by the migration, so a
-short read is detectable as a missing slot rather than as an empty fleet.
+`sequence_slot_ownership` is seeded with one `UNOWNED` row per slot by the
+migration, so a short read is detectable as a missing slot rather than as an
+empty fleet.
 
 ## Appendix C: Placement rules
 
@@ -684,29 +947,23 @@ For each slot, in order:
 5. **Owner live with a fresh (or unknown-age) grant**: keep it. A node joining
    does not move a single serving slot.
 
-Every node computes the same function over the same two tables, so the fleet
-agrees without a message passing between processes. A target is intent, never
-authority: the claim inside the store is what decides.
+Every node computes the same function over `sequence_slot_ownership` and
+`sequence_node_liveness`, so the fleet agrees without a message passing between
+processes. A target is intent, never authority: the claim inside the store is
+what decides.
 
 ## Appendix D: Migrations
 
-The labels below are the ones the migration comments cite; they do not follow
-the version order.
+The candidate baseline is one `init` migration per dialect:
 
-- D.1 `20260812000000_init` creates the range watermark
-  (`sequence_ranges`), the directory (`sequence_routes`), and the revision
-  state (`sequence_route_state`).
-- D.2 `20260928000000_ha_ownership` creates `slot_ownership`, extends
-  `sequence_ranges` to `(namespace, sequence_key)`, and seeds every slot
-  UNOWNED.
-- D.3 `20261001000000_ha_node_liveness` adds `sequence_node_liveness`.
-- D.4 `20260929010000_ha_placement` adds `sequence_coordinator`: the single
-  elected publisher row whose epoch fences a stale writer. Losing the row is
-  recoverable -- any live replica's next pass takes the lease and republishes --
-  which is why the Down section needs no guard.
-- D.5 `20261002000000_drop_ownership_outbox` removes the unread outbox; its
-  Down rebuilds the table empty, and both directions are exercised by the
-  integration suite.
+- `20261002010000_init` creates every table in appendix B, seeds
+  `sequence_slot_ownership` with one `UNOWNED` row per slot, and inserts the
+  single `sequence_coordinator` row. Its `Down` drops the tables in dependency
+  order and is guarded by the instruction to stop every Sequence process first.
+
+There is deliberately no chain of upgrade migrations for the previous schema.
+The accepted deployment path is a rebuild into an empty database, and the
+integration suite exercises both the `Up` and the `Down` direction.
 
 ## Appendix E: HA counters and evidence
 
@@ -727,15 +984,15 @@ Control plane: `sequence.control.pass`, `sequence.control.unowned_slots`,
 `sequence.control.coordinator_lost`, `sequence.control.revision`,
 `sequence.control.ownership_view_segments`,
 `sequence.control.ownership_view_duration_seconds`,
-`sequence.control.route_payload_bytes`,
-`sequence.control.route_retention_deleted`.
+`sequence.control.route_payload_bytes`.
 
 Data plane: `sequence.dataplane.renewal_batch_duration_seconds`,
-`sequence.dataplane.renewal_batch_size`.
+`sequence.dataplane.renewal_batch_size` (one instance-lease round trip; the
+size histogram records the single instance row, not the owned slot count).
 
-The counters that section 6.3 requires to stay at zero are registered only
-when `linearization_recording` is on, so an absent series reads as "not
-measured" rather than as a passing check.
+The counters the drain-and-release order requires to stay at zero are
+registered only when `linearization_recording` is on, so an absent series reads
+as "not measured" rather than as a passing check.
 
 ## Appendix F: Linearisation evidence gates
 

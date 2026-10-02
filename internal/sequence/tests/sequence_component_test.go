@@ -27,6 +27,8 @@ import (
 	"github.com/codesjoy/sindri/internal/sequence/biz"
 	sequencedata "github.com/codesjoy/sindri/internal/sequence/data"
 	"github.com/codesjoy/sindri/internal/sequence/service"
+	sequencepkg "github.com/codesjoy/sindri/pkg/sequence"
+	"github.com/codesjoy/yggdrasil/v3/rpc/metadata"
 	"github.com/codesjoy/yggdrasil/v3/rpc/stream"
 	transportclient "github.com/codesjoy/yggdrasil/v3/transport/runtime/client"
 	"github.com/stretchr/testify/assert"
@@ -49,6 +51,7 @@ func (c *inProcessClient) Invoke(
 	method string,
 	args, reply interface{},
 ) error {
+	ctx = metadata.WithInContext(ctx, metadata.Pairs(sequencepkg.VersionMetaKey, "1"))
 	switch method {
 	case "/codesjoy.sindri.sequence.v1.SequenceGenerator/FetchNext":
 		response, err := c.service.FetchNext(ctx, args.(*sequencev1.FetchNextRequest))
@@ -109,12 +112,10 @@ func TestGeneratedClientDrivesServiceAllocatorAndSQLiteRepo(t *testing.T) {
 		testMemorySampler{},
 		nil,
 	)
-	allocator.Open(1, 0, []uint32{biz.SlotForKey(key)})
-	allocator.ApplyRoute(0)
+	allocator.RenewLeases()
+	require.NoError(t, allocator.Claim(context.Background(), []uint32{biz.SlotForKey(key)}))
 	route := biz.NewRouteCache()
-	route.UpdateRoute(&biz.Route{Version: 1, Nodes: []biz.RouteNode{{
-		NodeID: "node-a", Slots: []uint32{biz.SlotForKey(key)},
-	}}})
+	route.UpdateRoute(componentRoute(allocator))
 	client := sequencev1.NewSequenceGeneratorClient(&inProcessClient{
 		service: service.NewSequenceService(allocator, route),
 	})
@@ -130,7 +131,8 @@ func TestGeneratedClientDrivesServiceAllocatorAndSQLiteRepo(t *testing.T) {
 		testMemorySampler{},
 		nil,
 	)
-	restarted.Open(1, 0, []uint32{biz.SlotForKey(key)})
+	allocator.Shutdown()
+	restarted.RenewLeases()
 	restartedClient := sequencev1.NewSequenceGeneratorClient(&inProcessClient{
 		service: service.NewSequenceService(restarted, route),
 	})
@@ -140,7 +142,12 @@ func TestGeneratedClientDrivesServiceAllocatorAndSQLiteRepo(t *testing.T) {
 	// the claim lands on the next storage second rather than on the first retry.
 	var afterRestart *sequencev1.FetchNextResponse
 	require.Eventually(t, func() bool {
-		restarted.ApplyRoute(0)
+		if claimErr := restarted.Claim(
+			context.Background(),
+			[]uint32{biz.SlotForKey(key)},
+		); claimErr != nil {
+			return false
+		}
 		response, fetchErr := restartedClient.FetchNext(
 			context.Background(),
 			&sequencev1.FetchNextRequest{Key: key},
@@ -186,8 +193,8 @@ func TestAllocatorPrefetchesDatabaseRangeBeforeExhaustion(t *testing.T) {
 		testMemorySampler{},
 		nil,
 	)
-	allocator.Open(1, 0, []uint32{biz.SlotForKey(key)})
-	allocator.ApplyRoute(0)
+	allocator.RenewLeases()
+	require.NoError(t, allocator.Claim(context.Background(), []uint32{biz.SlotForKey(key)}))
 
 	for want := int64(1); want <= 5; want++ {
 		got, fetchErr := allocator.FetchNext(context.Background(), key)
@@ -236,13 +243,10 @@ func TestGeneratedClientDrivesBatchAllocation(t *testing.T) {
 		testMemorySampler{},
 		nil,
 	)
-	allocator.Open(1, 0, slots)
-	allocator.ApplyRoute(0)
+	allocator.RenewLeases()
+	require.NoError(t, allocator.Claim(context.Background(), []uint32{slots[0]}))
 	route := biz.NewRouteCache()
-	route.UpdateRoute(&biz.Route{Version: 1, Nodes: []biz.RouteNode{{
-		NodeID: "node-a",
-		Slots:  slots,
-	}}})
+	route.UpdateRoute(componentRoute(allocator))
 	client := sequencev1.NewSequenceGeneratorClient(&inProcessClient{
 		service: service.NewSequenceService(allocator, route),
 	})
@@ -320,13 +324,23 @@ func newComponentAllocator(
 // the GORM models, so the authority table is created here.
 func prepareSQLiteOwnership(t *testing.T, db *gorm.DB, keys ...string) {
 	t.Helper()
+	require.NoError(
+		t,
+		db.Exec(
+			"CREATE TABLE sequence_instance_leases (instance_id text PRIMARY KEY,node_id text NOT NULL,ownership_revision integer NOT NULL DEFAULT 0,granted_at datetime NOT NULL,state text NOT NULL,created_at datetime NOT NULL,updated_at datetime NOT NULL)",
+		).Error,
+	)
+	require.NoError(
+		t,
+		db.Exec(
+			"CREATE TABLE sequence_slot_handoffs (slot_id integer PRIMARY KEY,handoff_id text,kind text,source_instance_id text,source_epoch integer,target_instance_id text,phase text,drained bool,target_ready bool,not_before datetime,created_at datetime,updated_at datetime)",
+		).Error,
+	)
 	require.NoError(t, db.Exec(
-		"CREATE TABLE IF NOT EXISTS slot_ownership ("+
+		"CREATE TABLE IF NOT EXISTS sequence_slot_ownership ("+
 			"slot_id integer PRIMARY KEY, "+
-			"owner_node_id varchar(256), "+
 			"owner_instance_id varchar(256), "+
 			"epoch integer NOT NULL DEFAULT 0, "+
-			"granted_at datetime, "+
 			"state varchar(16) NOT NULL DEFAULT 'UNOWNED', "+
 			"updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP)",
 	).Error)
@@ -338,7 +352,23 @@ func prepareSQLiteOwnership(t *testing.T, db *gorm.DB, keys ...string) {
 		}
 		seen[slot] = struct{}{}
 		require.NoError(t, db.Exec(
-			"INSERT OR IGNORE INTO slot_ownership (slot_id) VALUES (?)", slot,
+			"INSERT OR IGNORE INTO sequence_slot_ownership (slot_id) VALUES (?)", slot,
 		).Error)
+	}
+}
+
+func componentRoute(a *biz.Allocator) *biz.Route {
+	return &biz.Route{
+		Version:       1,
+		LayoutVersion: 1,
+		Segments: []biz.RouteSegment{
+			{
+				StartSlot:       0,
+				EndSlot:         biz.SlotCount - 1,
+				OwnerNodeID:     "node-a",
+				OwnerInstanceID: a.InstanceID(),
+				Epoch:           1,
+			},
+		},
 	}
 }

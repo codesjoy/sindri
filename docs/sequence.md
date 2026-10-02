@@ -29,17 +29,17 @@ docker compose -f deploy/docker/compose.yaml up --build -d
 docker compose -f deploy/docker/compose.yaml ps
 ```
 
-The migration container creates `sequence_ranges`, `sequence_routes`,
-`slot_ownership`, `sequence_route_state`, `sequence_node_liveness` and
-`sequence_coordinator` before Sequence starts, and pre-creates one
-`slot_ownership` row per routing slot. The local stack runs
+The migration container creates `sequence_ranges`, `sequence_slot_ownership`,
+`sequence_instance_leases`, `sequence_node_liveness`, `sequence_coordinator`,
+`sequence_route_snapshot` and `sequence_slot_handoffs` before Sequence starts,
+and pre-creates one `sequence_slot_ownership` row per routing slot. The local stack runs
 Sequence as `mode: both`: the data plane claims and serves slots, and the
 publisher half materialises the first directory as soon as there is ownership to
 snapshot. Until a directory exists `GetRoute` returns
 `SEQUENCE_ROUTE_UNAVAILABLE` and allocation remains paused.
 
 Placement is computed locally, by every node, from the rows the fleet shares.
-The right to hand out IDs still comes from `slot_ownership`, so a node claims
+The right to hand out IDs still comes from `sequence_slot_ownership`, so a node claims
 the slots its own plan hands it: an unowned slot is granted immediately, while a
 slot still held by another instance is only taken over once the quiet window
 `ha.quiet_window` has elapsed since that instance's last grant, unless its owner
@@ -56,14 +56,14 @@ docker compose -f deploy/docker/compose.yaml logs migrate sequence
 ## 2. Wait for the directory to place itself
 
 There is no central placement decision to wait for. Each node reads
-`slot_ownership` and `sequence_node_liveness` on every heartbeat and computes
+`sequence_slot_ownership` and `sequence_node_liveness` on every heartbeat and computes
 which of the 16,384 slots its own node id should hold. A slot nobody owns is
 assigned deterministically across the live node ids; a slot whose owner is gone
 is reassigned to a node that is still there; and a slot whose owner came back
 under the same node id but a new process stays with that node id, so a restart
 reclaims the position it left. The node then claims what it planned, and the
 publisher half of the process materialises the result into
-`sequence_routes` for clients to follow.
+`sequence_route_snapshot` for clients to follow.
 
 Watch a node converge:
 
@@ -76,10 +76,12 @@ Three rules are worth knowing when reading that log:
 - A node only ever takes a slot nobody owns, or one whose owner cannot serve it:
   a dead node id, a node whose grant aged past the quiet window, or a restarted
   process under the same node id. Adding a node does not move a serving slot.
-- To move slots off a node, stop it. It drains and releases what it holds on the
-  way down, and the nodes that remain pick those slots up on their next
-  heartbeat. That is what makes a rollout unable to lose an id, and it is why no
-  orchestrator event is ever consulted for ownership.
+- To move slots off a node, stop it. It drains each slot it holds, records a
+  RELEASE handoff, and the nodes that remain pick those slots up. Draining a
+  slot means closing its gate and waiting for the allocations already inside it
+  to finish, so a rollout cannot hand out an id the next owner also hands out.
+  The coordinator only has to repair a handoff whose target died; it is never
+  consulted for ownership itself.
 - The publisher decides nothing. It snapshots the authority under a coordinator
   lease and advances the published revision, so losing it delays what clients
   see but never stops a node from owning or serving a slot.
@@ -89,6 +91,12 @@ Deployments differ in how the two halves are run: the local stack uses
 `mode: data` and one or more separate replicas as `mode: control`. The mode is
 selected by `app.sequence.mode`, `SKULD_SEQUENCE_MODE`, or `--mode`, and a
 missing or invalid value fails the start.
+
+`GetRoute`, `FetchNext`, and `FetchNextBatch` are registered by `data` and
+`both` only. A `control` replica writes `sequence_route_snapshot`; `data` and
+`both` processes refresh that snapshot into their local `RouteCache` and serve
+`GetRoute` from it. Point client channels at data or both endpoints, not at
+control replicas.
 
 See section 10.7 of [sequence-ha-architecture.md](sequence-ha-architecture.md) for
 the parameters, the metrics the process exports, and the fencing that keeps the
@@ -267,22 +275,23 @@ Applications that use multiple Sequence nodes should use the route-aware Go
 integration in `github.com/codesjoy/sindri/pkg/sequence`. It refreshes route
 snapshots, selects the node that owns the key's slot, and performs bounded
 recovery according to the Router's retry policy.
-`sequence.NewBatchClient(router, client).FetchNext(ctx, requests)` takes
+`sequence.NewClient(router, client).FetchNextBatch(ctx, requests)` takes
 `[]sequence.KeyRequest` and groups the keys by owner, so one owner needs one
 `FetchNextBatch` call per round. Validated successful groups are retained inside
 the call; only unfinished keys are retried and regrouped after a route refresh.
 The public result is still the complete batch in request order or an error,
-never partial success. At most 32 owner RPCs run concurrently. The
-new client checks the response `count` and does not silently downgrade: an old
-server that returns `count=0` is only treated as a single ID, and batches against
-a server without `FetchNextBatch` fail with an explicit compatibility error. The
+never partial success. At most 32 owner RPCs run concurrently. The client
+checks the response against the request and does not silently downgrade: a
+response whose `count` does not match the requested `count` is refused with
+`ErrCountUnsupported` rather than treated as a single ID, and a server that
+does not implement `FetchNextBatch` fails with `ErrBatchUnsupported`. The
 generated request and response types live in
 `github.com/codesjoy/sindri/gen/go/sequence/v1`.
 
 ### Bounded SDK retries
 
 Existing `NewRouter(loader)` calls remain valid. The routing module,
-interceptors and `BatchClient` share the Router's immutable policy:
+interceptors and `Client` share the Router's immutable policy:
 
 ```go
 policy := sequence.DefaultRetryPolicy()
@@ -325,7 +334,13 @@ Upgrade **all servers before enabling the new SDK**. During mixed server
 versions the reservation and allocation safety gaps are not considered closed.
 The lease fences have no bypass switch: stop a problematic node rather than
 disable its safety checks. SDK rollback is independent of the server fixes.
-Database migrations, protobufs and release versions are unchanged.
+
+This change moves the contract and SDK to `v0.2.0` and replaces the migration
+chain with a single empty-database baseline. It does not ship an in-place
+upgrade from the previous schema and does not keep an old-SDK compatibility
+layer: rebuild into an empty database, then publish the contract and SDK before
+the service release. The [Docker deployment
+guide](../deploy/docker/README.md#release-order) lists the exact order.
 
 ## Configuration
 
@@ -356,13 +371,15 @@ key's rate estimate after an idle gap.
 
 Placement bounds live under `app.sequence.dataplane.ha`: `node_ttl` (default
 `15s`) is how long a node's liveness row counts as current, and it must exceed
-`ticker.heartbeat_ticks * ticker.base_tick_interval` by a wide margin.
-`app.sequence.controlplane` configures the publisher: `layout_version` identifies
-the slot layout a snapshot is minted under, `route_retention` (default `64`) is
-how many of the newest directory revisions stay in `sequence_routes`, and each
-publish prunes the older ones in the same transaction, `coordinator_lease` is
-how long one replica keeps the publisher role, and `reconcile_interval` and
-`pass_timeout` bound the cadence and length of one publish pass.
+the node's heartbeat period (`app.sequence.dataplane.node.heartbeat_interval`,
+default `1s`) by a wide margin. `app.sequence.controlplane` configures the
+publisher: `layout_version` identifies the slot layout a snapshot is minted
+under, `coordinator_lease` is how long one replica keeps the publisher role,
+`reconcile_interval` and `pass_timeout` bound the cadence and length of one
+publish pass, and the `migration.*` keys cap how many handoffs may be planned
+and in flight at once. The publisher replaces the single
+`sequence_route_snapshot` row in place, so there is no revision-retention
+setting.
 
 `reserve_timeout` (default `1s`) bounds a foreground reservation, lease renewal,
 clock sample or release batch. A foreground reservation uses its own child
@@ -389,7 +406,11 @@ reload. Consumers must use the same name in their Yggdrasil
 Application names separate service registration, discovery, and application
 identity telemetry. They do not namespace database records. Each independent
 deployment must use its own DSN; deployments that share a database also share
-the `sequence_ranges` and `sequence_routes` tables.
+the `sequence_ranges` and `sequence_slot_ownership` authority.
+
+The complete parameter tables — the data plane, node cadence, and control plane
+with their hard bounds and the mode-scoped validation rules — live in the
+[architecture document](sequence-ha-architecture.md#81-parameters-and-hard-bounds).
 
 Do not commit real credentials or production DSNs. See the
 [Docker deployment guide](../deploy/docker/README.md) for MySQL DSNs, external

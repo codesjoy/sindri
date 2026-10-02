@@ -158,7 +158,9 @@ type NodeConfig struct {
 	// HeartbeatTimeoutTicks is how many base ticks without a heartbeat pause
 	// allocation. The ticker coupling that keeps it above the heartbeat interval
 	// is checked by the configuration composer.
-	HeartbeatTimeoutTicks int64 `mapstructure:"heartbeat_timeout_ticks" default:"3"`
+	HeartbeatInterval    time.Duration `mapstructure:"heartbeat_interval"     default:"1s"`
+	RouteRefreshInterval time.Duration `mapstructure:"route_refresh_interval" default:"1s"`
+	HandoffInterval      time.Duration `mapstructure:"handoff_interval"       default:"250ms"`
 	// RouteQueryTimeout bounds one directory read on the heartbeat.
 	RouteQueryTimeout time.Duration `mapstructure:"route_query_timeout" default:"1s"`
 }
@@ -170,6 +172,9 @@ func (c NodeConfig) Validate() error {
 	}
 	if c.RouteQueryTimeout <= 0 {
 		return errors.New("dataplane.node.route_query_timeout must be positive")
+	}
+	if c.HeartbeatInterval <= 0 || c.RouteRefreshInterval <= 0 || c.HandoffInterval <= 0 {
+		return errors.New("dataplane.node intervals must be positive")
 	}
 	return nil
 }
@@ -198,7 +203,7 @@ type HAConfig struct {
 	ClockJump time.Duration `mapstructure:"clock_jump" default:"100ms"`
 	// SafetyMargin is epsilon, the extra margin in W and the room kept inside L.
 	SafetyMargin time.Duration `mapstructure:"safety_margin" default:"500ms"`
-	// RenewInterval is how often an owned slot is renewed.
+	// RenewInterval is how often the instance lease is renewed.
 	RenewInterval time.Duration `mapstructure:"renew_interval" default:"1s"`
 	// ReleaseDrainTimeout bounds how long an explicit release waits for
 	// in-flight allocations to reach zero.
@@ -251,7 +256,8 @@ func (c HAConfig) LeaseDeadline() time.Duration {
 	return c.LeaseDuration - c.SafetyMargin
 }
 
-// Validate checks the section 8.1 parameters and their hard lower bounds.
+// ValidateAuthority checks the section 8.1 parameters and their hard lower
+// bounds.
 //
 // The quiet window is the only thing standing between a process pause and a
 // silent takeover, so section 3.3's hard lower bound is checked first. Section
@@ -259,7 +265,15 @@ func (c HAConfig) LeaseDeadline() time.Duration {
 // own: neither P_max nor J_max can be derived from the database, so both must be
 // asserted by whoever measured this deployment, or contracted from a storage
 // that provides a monotonic commit timestamp.
-func (c HAConfig) Validate() error {
+func (c HAConfig) ValidateAuthority() error {
+	if c.LeaseDuration <= 0 || c.MaxPause <= 0 || c.NodeTTL <= 0 {
+		return errors.New("dataplane.ha lease_duration, max_pause and node_ttl must be positive")
+	}
+	if c.ClockDrift < 0 || c.ClockJump < 0 || c.SafetyMargin <= 0 {
+		return errors.New(
+			"dataplane.ha clock drift and jump bounds must not be negative and safety_margin must be positive",
+		)
+	}
 	if minimum := c.QuietWindowFloor(); c.QuietWindow < minimum {
 		return fmt.Errorf(
 			"dataplane.ha.quiet_window must be at least "+
@@ -267,6 +281,14 @@ func (c HAConfig) Validate() error {
 				"safety_margin (%s)",
 			minimum,
 		)
+	}
+	return nil
+}
+
+// Validate adds the assertions and scheduling bounds needed by a serving node.
+func (c HAConfig) Validate() error {
+	if err := c.ValidateAuthority(); err != nil {
+		return err
 	}
 	if !c.PauseVerified {
 		return errors.New(
@@ -283,9 +305,6 @@ func (c HAConfig) Validate() error {
 				"whose transactions carry a monotonic commit timestamp",
 		)
 	}
-	if c.LeaseDuration <= 0 {
-		return errors.New("dataplane.ha.lease_duration must be positive")
-	}
 	if c.RenewInterval <= 0 || c.RenewInterval >= c.LeaseDuration {
 		return errors.New(
 			"dataplane.ha.renew_interval must be within (0, lease_duration)",
@@ -293,22 +312,6 @@ func (c HAConfig) Validate() error {
 	}
 	if c.ReleaseDrainTimeout <= 0 {
 		return errors.New("dataplane.ha.release_drain_timeout must be positive")
-	}
-	if c.ClockDrift < 0 || c.ClockJump < 0 || c.SafetyMargin <= 0 {
-		return errors.New(
-			"dataplane.ha clock drift and jump bounds must not be negative " +
-				"and safety_margin must be positive",
-		)
-	}
-	// A pause bound of zero would disable the only check that covers a stall
-	// inside the in-memory linearisation: the node would go on serving a slot
-	// across a freeze it never measured, claiming a bound the deployment never
-	// established.
-	if c.MaxPause <= 0 {
-		return errors.New("dataplane.ha.max_pause must be positive")
-	}
-	if c.NodeTTL <= 0 {
-		return errors.New("dataplane.ha.node_ttl must be positive")
 	}
 	return nil
 }
@@ -355,16 +358,12 @@ func (c DataPlaneConfig) Validate() error {
 // the cadence and bound of one publish pass. Nothing here decides placement --
 // the nodes compute that themselves from the ownership and liveness tables.
 type ControlPlaneConfig struct {
+	Migration             MigrationConfig `mapstructure:"migration"`
+	ActivePublishInterval time.Duration   `mapstructure:"active_publish_interval" default:"250ms"`
 	// LayoutVersion identifies the slot layout the materialised route is minted
 	// under. A deployment whose nodes disagree about it routes by a different
 	// key-to-slot rule, so the value travels in every snapshot.
 	LayoutVersion int64 `mapstructure:"layout_version" default:"1"`
-	// RouteRetention is how many of the newest directory revisions stay in
-	// sequence_routes. A publish deletes every older row in the same
-	// transaction, so the table is bounded no matter how long the fleet runs.
-	// Clients only ever read the newest revision, so the bound costs nothing
-	// while keeping a rollback window an operator can inspect.
-	RouteRetention int `mapstructure:"route_retention" default:"64"`
 	// CoordinatorLease is how long one replica keeps the publisher role.
 	CoordinatorLease time.Duration `mapstructure:"coordinator_lease" default:"10s"`
 	// ReconcileInterval is how often the coordinator runs a publish pass. There
@@ -384,8 +383,13 @@ func (c ControlPlaneConfig) Validate() error {
 	if c.LayoutVersion <= 0 {
 		return errors.New("controlplane.layout_version must be positive")
 	}
-	if c.RouteRetention <= 0 {
-		return errors.New("controlplane.route_retention must be positive")
+	if c.ActivePublishInterval <= 0 || c.ActivePublishInterval > c.ReconcileInterval {
+		return errors.New(
+			"controlplane.active_publish_interval must be within (0,reconcile_interval]",
+		)
+	}
+	if err := c.Migration.Validate(); err != nil {
+		return err
 	}
 	if c.CoordinatorLease <= 0 {
 		return errors.New("controlplane.coordinator_lease must be positive")
@@ -409,6 +413,30 @@ func (c ControlPlaneConfig) Validate() error {
 			"controlplane.pass_timeout must be shorter than " +
 				"controlplane.coordinator_lease",
 		)
+	}
+	return nil
+}
+
+// MigrationConfig bounds the control plane's rebalancing work.
+type MigrationConfig struct {
+	JoinStabilityWindow time.Duration `mapstructure:"join_stability_window" default:"15s"`
+	BatchSlots          int           `mapstructure:"batch_slots"           default:"64"`
+	MaxInflight         int           `mapstructure:"max_inflight"          default:"256"`
+	MaxPerSource        int           `mapstructure:"max_per_source"        default:"64"`
+	MaxPerTarget        int           `mapstructure:"max_per_target"        default:"64"`
+	MaxPlanned          int           `mapstructure:"max_planned"           default:"1024"`
+}
+
+// Validate checks the migration limits against each other and the slot space.
+func (c MigrationConfig) Validate() error {
+	if c.JoinStabilityWindow <= 0 || c.BatchSlots <= 0 || c.BatchSlots > 1000 ||
+		c.MaxInflight <= 0 ||
+		c.MaxPerSource <= 0 ||
+		c.MaxPerTarget <= 0 ||
+		c.MaxPlanned < c.MaxInflight ||
+		c.MaxPlanned > SlotCount ||
+		c.BatchSlots > min(c.MaxInflight, c.MaxPerSource, c.MaxPerTarget) {
+		return errors.New("controlplane.migration limits are invalid")
 	}
 	return nil
 }

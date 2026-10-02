@@ -15,9 +15,9 @@ assets, and release lifecycle.
 
 ## Services
 
-| Service | Capability | Contract | Usage | Deployment |
-| --- | --- | --- | --- | --- |
-| Sequence | Distributed, per-key monotonic ID allocation | [SequenceGenerator v1](api/sindri/sequence/v1/sequence.proto) | [Quick start](docs/sequence.md) | [Docker Compose](deploy/docker/README.md) |
+| Service | Capability | Contract | Usage | Architecture | Deployment |
+| --- | --- | --- | --- | --- | --- |
+| Sequence | Distributed, per-key monotonic ID allocation | [SequenceGenerator v1](api/sindri/sequence/v1/sequence.proto) | [Quick start](docs/sequence.md) | [HA architecture](docs/sequence-ha-architecture.md) | [Docker Compose](deploy/docker/README.md) |
 
 Sequence is currently the only service in the repository. New services follow
 the same independent ownership and deployment model.
@@ -26,8 +26,12 @@ the same independent ownership and deployment model.
 
 - [Sequence quick start](docs/sequence.md): deploy the local stack, watch the
   directory place itself, and call the Sequence RPCs.
+- [Sequence HA architecture](docs/sequence-ha-architecture.md): the safety
+  invariants, the slot-epoch and instance-lease protocol, handoff and crash
+  recovery, storage, configuration bounds, and observability.
 - [Docker deployment guide](deploy/docker/README.md): configure databases,
-  external dependencies, observability, and runtime resources.
+  external dependencies, observability, runtime resources, the empty-database
+  baseline, and the release order.
 - [Engineering standards](docs/engineering-standards.md): repository structure,
   service boundaries, testing, and implementation rules.
 - [Module release process](docs/module-release.md): publish contracts, clients,

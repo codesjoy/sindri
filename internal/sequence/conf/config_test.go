@@ -15,6 +15,9 @@
 package conf
 
 import (
+	"errors"
+	"math"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -108,10 +111,10 @@ func TestLoadAppliesDefaultsForSupportedDrivers(t *testing.T) {
 			assert.Equal(t, 5*time.Second, cfg.DataPlane.HA.QuietWindow)
 			assert.Equal(t, 3*time.Second, cfg.DataPlane.HA.LeaseDuration)
 			assert.Equal(t, time.Second, cfg.DataPlane.HA.RenewInterval)
-			assert.Equal(t, int64(3), cfg.DataPlane.Node.HeartbeatTimeoutTicks)
+			assert.Equal(t, time.Second, cfg.DataPlane.Node.HeartbeatInterval)
 			assert.Equal(t, time.Second, cfg.DataPlane.Node.RouteQueryTimeout)
-			assert.Equal(t, time.Second, cfg.Ticker.BaseTickInterval)
-			assert.Equal(t, int64(1), cfg.Ticker.HeartbeatTicks)
+			assert.Equal(t, time.Second, cfg.DataPlane.Node.RouteRefreshInterval)
+			assert.Equal(t, 250*time.Millisecond, cfg.DataPlane.Node.HandoffInterval)
 			assert.Equal(t, 20, cfg.Database.MaxOpenConns)
 			require.NotNil(t, cfg.Runtime.MemoryLimit)
 			assert.Equal(t, DefaultMemoryLimit, *cfg.Runtime.MemoryLimit)
@@ -186,11 +189,11 @@ func TestLoadRequiresAStartupMode(t *testing.T) {
 
 func TestParseModeAcceptsOnlyTheThreeShapes(t *testing.T) {
 	for _, mode := range []Mode{ModeData, ModeControl, ModeBoth} {
-		parsed, err := ParseMode(string(mode))
+		parsed, err := parseMode(string(mode))
 		require.NoError(t, err)
 		assert.Equal(t, mode, parsed)
 	}
-	_, err := ParseMode("")
+	_, err := parseMode("")
 	require.Error(t, err)
 }
 
@@ -234,7 +237,7 @@ func TestModeFromArgsRefusesAnEmptyValue(t *testing.T) {
 	} {
 		_, found, err := ModeFromArgs(args)
 		assert.True(t, found)
-		require.ErrorIs(t, err, ErrModeValue, "args: %#v", args)
+		require.ErrorIs(t, err, errModeValue, "args: %#v", args)
 	}
 }
 
@@ -247,12 +250,27 @@ func TestLoadAppliesPlaneDefaults(t *testing.T) {
 	assert.Equal(t, ModeBoth, cfg.Mode)
 	assert.Equal(t, 15*time.Second, cfg.DataPlane.HA.NodeTTL)
 	assert.Equal(t, int64(1), cfg.ControlPlane.LayoutVersion)
-	assert.Equal(t, 64, cfg.ControlPlane.RouteRetention)
+	assert.Equal(t, 64, cfg.ControlPlane.Migration.BatchSlots)
 	assert.Equal(t, 10*time.Second, cfg.ControlPlane.CoordinatorLease)
 	assert.Equal(t, 5*time.Second, cfg.ControlPlane.ReconcileInterval)
 	assert.Equal(t, 3*time.Second, cfg.ControlPlane.PassTimeout)
 	assert.Less(t, cfg.ControlPlane.PassTimeout, cfg.ControlPlane.CoordinatorLease)
 	assert.Less(t, cfg.ControlPlane.ReconcileInterval, cfg.ControlPlane.CoordinatorLease)
+}
+
+func TestControlModeValidatesSharedAuthorityOnly(t *testing.T) {
+	values := validValues(xgorm.DriverPostgres)
+	sequenceValues(values)["mode"] = "control"
+	sequenceValues(values)["dataplane"] = map[string]any{}
+	_, err := Load(testkit.NewRuntime(t, values))
+	require.NoError(t, err)
+	for _, field := range []string{"lease_duration", "max_pause", "node_ttl", "clock_drift", "clock_jump", "safety_margin", "quiet_window"} {
+		t.Run(field, func(t *testing.T) {
+			sequenceValues(values)["dataplane"] = map[string]any{"ha": map[string]any{field: "-1s"}}
+			_, err := Load(testkit.NewRuntime(t, values))
+			require.Error(t, err)
+		})
+	}
 }
 
 // TestControlModeSkipsDataPlaneValidation is the scoping rule as a test: a
@@ -299,10 +317,6 @@ func TestLoadTreatsStatedZerosAsDefaults(t *testing.T) {
 		"coordinator_lease": "0s",
 		"pass_timeout":      "0s",
 	}
-	sequenceValues(values)["ticker"] = map[string]any{
-		"base_tick_interval": "0s",
-		"heartbeat_ticks":    0,
-	}
 	sequenceValues(values)["runtime"] = map[string]any{
 		"memory_limit":            "auto",
 		"auto_memory_limit_ratio": 0,
@@ -318,8 +332,8 @@ func TestLoadTreatsStatedZerosAsDefaults(t *testing.T) {
 	assert.Equal(t, 3*time.Second, cfg.DataPlane.HA.LeaseDuration)
 	assert.Equal(t, 10*time.Second, cfg.ControlPlane.CoordinatorLease)
 	assert.Equal(t, 3*time.Second, cfg.ControlPlane.PassTimeout)
-	assert.Equal(t, time.Second, cfg.Ticker.BaseTickInterval)
-	assert.Equal(t, int64(1), cfg.Ticker.HeartbeatTicks)
+	assert.Equal(t, time.Second, cfg.DataPlane.Node.RouteRefreshInterval)
+	assert.Equal(t, time.Second, cfg.DataPlane.Node.HeartbeatInterval)
 }
 
 func TestLoadRejectsInvalidContracts(t *testing.T) {
@@ -473,18 +487,21 @@ func TestLoadRejectsAllocatorAndSchedulingBoundaries(t *testing.T) {
 			},
 		},
 		{
-			name:   "base interval",
-			values: map[string]any{"ticker": map[string]any{"base_tick_interval": "-1s"}},
+			name: "base interval",
+			values: map[string]any{
+				"node": map[string]any{"id": "node-a", "route_refresh_interval": "-1s"},
+			},
 		},
 		{
-			name:   "heartbeat interval",
-			values: map[string]any{"ticker": map[string]any{"heartbeat_ticks": -1}},
+			name: "heartbeat interval",
+			values: map[string]any{
+				"node": map[string]any{"id": "node-a", "heartbeat_interval": "-1s"},
+			},
 		},
 		{
 			name: "heartbeat timeout",
 			values: map[string]any{
-				"node":   map[string]any{"id": "node-a", "heartbeat_timeout_ticks": 2},
-				"ticker": map[string]any{"heartbeat_ticks": 2},
+				"node": map[string]any{"id": "node-a", "handoff_interval": "-1s"},
 			},
 		},
 		{
@@ -558,4 +575,199 @@ func TestValidateDeploymentIsAboutTheReportSurface(t *testing.T) {
 	cfg := Config{}
 	require.Error(t, cfg.ValidateDeployment(false))
 	require.NoError(t, cfg.ValidateDeployment(true))
+}
+
+func TestValidateMemoryLimit(t *testing.T) {
+	require.NoError(t, validateMemoryLimit(MinimumMemoryLimit))
+	assert.Error(t, validateMemoryLimit(0))
+	assert.Error(t, validateMemoryLimit(MinimumMemoryLimit-1))
+	assert.Error(t, validateMemoryLimit(math.MaxInt64))
+	assert.Error(t, validateMemoryLimit(math.MaxUint64))
+}
+
+func TestParseMemoryLimit(t *testing.T) {
+	tests := []struct {
+		value string
+		want  uint64
+	}{
+		{value: "67108864", want: 64 << 20},
+		{value: "64MiB", want: 64 << 20},
+		{value: "1GiB", want: 1 << 30},
+		{value: "2TiB", want: 2 << 40},
+		{value: "1024KiB", want: 1 << 20},
+		{value: " 64MiB ", want: 64 << 20},
+	}
+	for _, test := range tests {
+		t.Run(test.value, func(t *testing.T) {
+			got, err := parseMemoryLimit(test.value)
+			require.NoError(t, err)
+			assert.Equal(t, test.want, got)
+		})
+	}
+	for _, value := range []string{"", "auto", "64MB", "1.5GiB", "-1", "18446744073709551615TiB"} {
+		t.Run("invalid_"+value, func(t *testing.T) {
+			_, err := parseMemoryLimit(value)
+			assert.Error(t, err)
+		})
+	}
+}
+
+func TestDetectMemoryLimit(t *testing.T) {
+	provider := func(value uint64, err error) memoryLimitProvider {
+		return func() (uint64, error) { return value, err }
+	}
+	tests := []struct {
+		name       string
+		cgroup     memoryLimitProvider
+		system     memoryLimitProvider
+		want       uint64
+		wantSource string
+		wantError  bool
+	}{
+		{
+			name:   "cgroup is smaller",
+			cgroup: provider(1<<30, nil), system: provider(8<<30, nil),
+			want: 1 << 30, wantSource: "cgroup",
+		},
+		{
+			name:   "system is smaller",
+			cgroup: provider(8<<30, nil), system: provider(4<<30, nil),
+			want: 4 << 30, wantSource: "system",
+		},
+		{
+			name:   "cgroup fallback",
+			cgroup: provider(1<<30, nil), system: provider(0, errors.New("unavailable")),
+			want: 1 << 30, wantSource: "cgroup",
+		},
+		{
+			name:   "system fallback",
+			cgroup: provider(0, errors.New("unavailable")), system: provider(2<<30, nil),
+			want: 2 << 30, wantSource: "system",
+		},
+		{
+			name:      "both unavailable",
+			cgroup:    provider(0, errors.New("cgroup unavailable")),
+			system:    provider(0, errors.New("system unavailable")),
+			wantError: true,
+		},
+		{
+			name:   "unlimited values",
+			cgroup: provider(math.MaxUint64, nil), system: provider(math.MaxInt64, nil),
+			wantError: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, source, err := detectMemoryLimit(test.cgroup, test.system)
+			if test.wantError {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, test.want, got)
+			assert.Equal(t, test.wantSource, source)
+		})
+	}
+}
+
+func TestConfigureMemoryLimit(t *testing.T) {
+	provider := func(value uint64, err error) memoryLimitProvider {
+		return func() (uint64, error) { return value, err }
+	}
+	tests := []struct {
+		name       string
+		configured string
+		explicit   bool
+		envValue   string
+		envSet     bool
+		ratio      float64
+		cgroup     memoryLimitProvider
+		system     memoryLimitProvider
+		want       uint64
+		wantSource string
+		wantError  bool
+	}{
+		{
+			name:       "explicit fixed overrides environment",
+			configured: "256MiB", explicit: true, envValue: "512MiB", envSet: true,
+			ratio: 0.8, cgroup: provider(1<<30, nil), system: provider(8<<30, nil),
+			want: 256 << 20, wantSource: "configuration",
+		},
+		{
+			name:       "explicit auto overrides environment",
+			configured: "auto", explicit: true, envValue: "512MiB", envSet: true,
+			ratio: 0.8, cgroup: provider(1<<30, nil), system: provider(8<<30, nil),
+			want: 858993459, wantSource: "cgroup",
+		},
+		{
+			name:       "environment compatibility",
+			configured: "auto", explicit: false, envValue: "384MiB", envSet: true,
+			ratio: 0.8, cgroup: provider(1<<30, nil), system: provider(8<<30, nil),
+			want: 384 << 20, wantSource: "environment",
+		},
+		{
+			name:       "default auto",
+			configured: "auto", explicit: false, ratio: 0.75,
+			cgroup: provider(2<<30, nil), system: provider(1<<30, nil),
+			want: 768 << 20, wantSource: "system",
+		},
+		{
+			name:       "detection failure",
+			configured: "auto", explicit: true, ratio: 0.8,
+			cgroup:    provider(0, errors.New("unavailable")),
+			system:    provider(0, errors.New("unavailable")),
+			wantError: true,
+		},
+		{
+			name:       "below minimum",
+			configured: "63MiB", explicit: true, ratio: 0.8,
+			cgroup: provider(1<<30, nil), system: provider(1<<30, nil),
+			wantError: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var applied int64
+			var memoryLimit *string
+			if test.explicit {
+				memoryLimit = &test.configured
+			}
+			result, err := configureMemoryLimit(
+				memoryLimit,
+				test.ratio,
+				nil,
+				memoryLimitDependencies{
+					cgroup: test.cgroup,
+					system: test.system,
+					lookupEnv: func(string) (string, bool) {
+						return test.envValue, test.envSet
+					},
+					setLimit: func(value int64) int64 {
+						applied = value
+						return math.MaxInt64
+					},
+				},
+			)
+			if test.wantError {
+				assert.Error(t, err)
+				assert.Zero(t, applied)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, test.want, result.LimitBytes)
+			assert.Equal(t, test.wantSource, result.Source)
+			assert.Equal(t, int64(test.want), applied)
+		})
+	}
+}
+
+func TestConfigureMemoryLimitAppliesRuntimeSetting(t *testing.T) {
+	previous := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(previous) })
+
+	memoryLimit := "128MiB"
+	result, err := ConfigureMemoryLimit(&memoryLimit, 0.8, nil)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(128<<20), result.LimitBytes)
+	assert.Equal(t, int64(128<<20), debug.SetMemoryLimit(-1))
 }

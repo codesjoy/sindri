@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package sequence provides client-side route-aware sequence RPC support.
 package sequence
 
 import (
@@ -271,7 +270,7 @@ func (p *sequencePicker) Next(info balancer.RPCInfo) (balancer.PickResult, error
 	if info.Method != fetchNextFullMethod && info.Method != fetchNextBatchFullMethod {
 		return nil, fmt.Errorf("%w: method %s", ErrMissingSlot, info.Method)
 	}
-	slot, ok := SlotFromContext(info.Ctx)
+	slot, ok := slotFromContext(info.Ctx)
 	if !ok {
 		return nil, ErrMissingSlot
 	}

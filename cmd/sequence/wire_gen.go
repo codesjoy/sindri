@@ -22,6 +22,7 @@ import (
 	"github.com/codesjoy/yggdrasil/v3/app"
 	"github.com/google/wire"
 	"go.opentelemetry.io/otel/metric"
+	"gorm.io/gorm"
 	"log/slog"
 	"time"
 )
@@ -42,18 +43,18 @@ func initializeSequence(rt app.Runtime, cfg *conf.Config) (*app.BusinessBundle, 
 	}
 	logger := provideLogger(rt)
 	db := database.DB
-	livenessRepo := data.NewLivenessData(db)
+	livenessRepo := provideLivenessData(db, dataPlaneConfig)
 	sequenceRepo := data.NewSequenceData(db)
 	ownershipRepo := data.NewOwnershipData(db)
 	runtimeMemorySampler := metrics.NewRuntimeMemorySampler()
 	allocator := biz.NewAllocator(dataPlaneConfig, sequenceRepo, ownershipRepo, runtimeMemorySampler, logger)
-	taskConfig := cfg.Ticker
 	routeRepo := data.NewRouteModel(db)
-	placementData := data.NewPlacementData(db)
+	placementData := providePlacementData(db, dataPlaneConfig)
 	routeCache := biz.NewRouteCache()
 	storageClockMonitor := provideStorageClockMonitor(dataPlaneConfig, ownershipRepo)
-	nodeManager := biz.NewNodeManager(dataPlaneConfig, allocator, routeRepo, livenessRepo, placementData, routeCache, storageClockMonitor, logger)
-	ticker := task.NewTicker(taskConfig, nodeManager)
+	handoffRepo := data.NewHandoffData(db)
+	nodeManager := biz.NewNodeManager(dataPlaneConfig, allocator, routeRepo, livenessRepo, placementData, routeCache, storageClockMonitor, handoffRepo, controlPlaneConfig, logger)
+	ticker := task.NewTicker(dataPlaneConfig, nodeManager)
 	sequenceService := service.NewSequenceService(allocator, routeCache)
 	duration := provideQuietWindow(dataPlaneConfig)
 	string2, err := newInstanceID()
@@ -62,6 +63,7 @@ func initializeSequence(rt app.Runtime, cfg *conf.Config) (*app.BusinessBundle, 
 	}
 	publisher := biz.NewPublisher(controlPlaneConfig, duration, string2, placementData, placementData, logger)
 	publisherTask := task.NewPublisherTask(publisher)
+	rebalancer := provideRebalancer(controlPlaneConfig, dataPlaneConfig, placementData, handoffRepo)
 	meter := provideAllocatorMeter(rt)
 	metricsMetrics, err := provideDataMetrics(mode, meter, allocator, runtimeMemorySampler, dataPlaneConfig, storageClockMonitor)
 	if err != nil {
@@ -71,7 +73,7 @@ func initializeSequence(rt app.Runtime, cfg *conf.Config) (*app.BusinessBundle, 
 	if err != nil {
 		return nil, err
 	}
-	businessBundle := newBusinessBundle(mode, dataPlaneConfig, controlPlaneConfig, database, logger, livenessRepo, allocator, ticker, sequenceService, publisher, publisherTask, metricsMetrics, publisherMetrics)
+	businessBundle := newBusinessBundle(mode, dataPlaneConfig, controlPlaneConfig, database, logger, livenessRepo, allocator, ticker, sequenceService, publisher, publisherTask, rebalancer, metricsMetrics, publisherMetrics)
 	return businessBundle, nil
 }
 
@@ -88,7 +90,6 @@ var configSet = wire.NewSet(wire.FieldsOf(
 	"Database",
 	"DataPlane",
 	"ControlPlane",
-	"Ticker",
 ),
 )
 
@@ -99,7 +100,7 @@ var configSet = wire.NewSet(wire.FieldsOf(
 // through the same handle, and one graph is what keeps them from opening two.
 var dataPlaneSet = wire.NewSet(
 	provideLogger,
-	provideAllocatorMeter, xgorm.New, wire.FieldsOf(new(*xgorm.Database), "DB"), data.NewSequenceData, data.NewOwnershipData, data.NewLivenessData, data.NewRouteModel, data.NewPlacementData, wire.Bind(new(biz.PlacementRepo), new(*data.PlacementData)), wire.Bind(new(biz.PublisherRepo), new(*data.PlacementData)), wire.Bind(new(biz.CoordinatorRepo), new(*data.PlacementData)), metrics.NewRuntimeMemorySampler, wire.Bind(new(biz.MemorySampler), new(*metrics.RuntimeMemorySampler)), biz.NewRouteCache, provideStorageClockMonitor, biz.NewAllocator, biz.NewNodeManager, wire.Bind(new(task.NodeLifecycle), new(*biz.NodeManager)), task.NewTicker, service.NewSequenceService, provideDataMetrics,
+	provideAllocatorMeter, xgorm.New, wire.FieldsOf(new(*xgorm.Database), "DB"), data.NewSequenceData, data.NewOwnershipData, provideLivenessData, data.NewRouteModel, providePlacementData, data.NewHandoffData, wire.Bind(new(biz.PlacementRepo), new(*data.PlacementData)), wire.Bind(new(biz.PublisherRepo), new(*data.PlacementData)), wire.Bind(new(biz.CoordinatorRepo), new(*data.PlacementData)), metrics.NewRuntimeMemorySampler, wire.Bind(new(biz.MemorySampler), new(*metrics.RuntimeMemorySampler)), biz.NewRouteCache, provideStorageClockMonitor, biz.NewAllocator, biz.NewNodeManager, wire.Bind(new(task.NodeLifecycle), new(*biz.NodeManager)), task.NewTicker, service.NewSequenceService, provideDataMetrics,
 )
 
 // controlPlaneSet builds the publisher half.
@@ -109,11 +110,28 @@ var dataPlaneSet = wire.NewSet(
 // held the role.
 var controlPlaneSet = wire.NewSet(
 	newInstanceID,
-	provideQuietWindow, biz.NewPublisher, task.NewPublisherTask, wire.Bind(new(task.PublisherReconciler), new(*biz.Publisher)), providePublisherMetrics,
+	provideQuietWindow, biz.NewPublisher, provideRebalancer, task.NewPublisherTask, wire.Bind(new(task.PublisherReconciler), new(*biz.Publisher)), providePublisherMetrics,
 )
 
 // bundleSet assembles what the startup mode selects.
 var bundleSet = wire.NewSet(newBusinessBundle)
+
+func providePlacementData(db *gorm.DB, cfg biz.DataPlaneConfig) *data.PlacementData {
+	return data.NewPlacementData(db, cfg.HA.LeaseDuration, cfg.HA.NodeTTL)
+}
+
+func provideLivenessData(db *gorm.DB, cfg biz.DataPlaneConfig) biz.LivenessRepo {
+	return data.NewLivenessData(db, cfg.HA.NodeTTL)
+}
+
+func provideRebalancer(
+	cfg biz.ControlPlaneConfig, data2 biz.DataPlaneConfig,
+
+	placement biz.PlacementRepo,
+	handoffs biz.HandoffRepo,
+) *biz.Rebalancer {
+	return biz.NewRebalancer(cfg, data2.HA, placement, handoffs)
+}
 
 func provideLogger(rt yggdrasil.Runtime) *slog.Logger {
 	return rt.Logger()
@@ -195,9 +213,11 @@ func newBusinessBundle(
 	sequenceService *service.SequenceService,
 	publisher *biz.Publisher,
 	publisherTask *task.PublisherTask,
+	rebalancer *biz.Rebalancer,
 	dataMetrics *metrics.Metrics,
 	publisherMetrics *metrics.PublisherMetrics,
 ) *yggdrasil.BusinessBundle {
+	publisher.SetRebalancer(rebalancer)
 	var readinessAllocator *biz.Allocator
 	var readinessPublisher *biz.Publisher
 	if mode != conf.ModeControl {
@@ -239,8 +259,8 @@ func newBusinessBundle(
 
 			Name:  "sequence.release-slot-authority",
 			Stage: yggdrasil.BusinessHookBeforeStop,
-			Func: func(context.Context) error {
-				allocator.Shutdown()
+			Func: func(ctx context.Context) error {
+				allocator.ShutdownContext(ctx)
 				return nil
 			},
 		}, yggdrasil.BusinessHook{

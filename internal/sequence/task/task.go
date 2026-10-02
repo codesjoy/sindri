@@ -19,7 +19,105 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/codesjoy/sindri/internal/sequence/biz"
 )
+
+// NodeLifecycle is the set of independent loops the ticker drives.
+type NodeLifecycle interface {
+	Renew(context.Context)
+	Heartbeat(context.Context)
+	Refresh(context.Context)
+	Handoffs(context.Context)
+	Maintain(context.Context)
+	Pause()
+}
+
+// Ticker owns independent single-flight loops so a drain or route read cannot delay renewal.
+type Ticker struct {
+	cfg       biz.DataPlaneConfig
+	node      NodeLifecycle
+	ctx       context.Context
+	cancel    context.CancelFunc
+	startedCh chan struct{}
+	stoppedCh chan struct{}
+	serving   atomic.Bool
+	stopOnce  sync.Once
+}
+
+// NewTicker builds the task that drives the node's independent loops.
+func NewTicker(cfg biz.DataPlaneConfig, node NodeLifecycle) *Ticker {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Ticker{
+		cfg:       cfg,
+		node:      node,
+		ctx:       ctx,
+		cancel:    cancel,
+		startedCh: make(chan struct{}),
+		stoppedCh: make(chan struct{}),
+	}
+}
+
+// Serve starts every loop and blocks until they all stop or one interval is
+// invalid.
+func (t *Ticker) Serve() error {
+	if !t.serving.CompareAndSwap(false, true) {
+		return errors.New("sequence task may only serve once")
+	}
+	close(t.startedCh)
+	defer close(t.stoppedCh)
+	var workers sync.WaitGroup
+	loops := []struct {
+		period time.Duration
+		run    func(context.Context)
+	}{
+		{t.cfg.HA.RenewInterval, t.node.Renew},
+		{t.cfg.Node.HeartbeatInterval, t.node.Heartbeat},
+		{t.cfg.Node.RouteRefreshInterval, t.node.Refresh},
+		{t.cfg.Node.HandoffInterval, t.node.Handoffs},
+		{t.cfg.Allocator.CleanupInterval, t.node.Maintain},
+	}
+	for _, loop := range loops {
+		if loop.period <= 0 {
+			t.cancel()
+			workers.Wait()
+			return errors.New("sequence task interval must be positive")
+		}
+		workers.Add(1)
+		go func(period time.Duration, run func(context.Context)) {
+			defer workers.Done()
+			timer := time.NewTicker(period)
+			defer timer.Stop()
+			for t.ctx.Err() == nil {
+				run(t.ctx)
+				select {
+				case <-t.ctx.Done():
+					return
+				case <-timer.C:
+				}
+			}
+		}(loop.period, loop.run)
+	}
+	workers.Wait()
+	return nil
+}
+
+// Stop pauses the node, cancels the loops and waits for them to finish.
+func (t *Ticker) Stop(ctx context.Context) error {
+	t.stopOnce.Do(func() { t.node.Pause(); t.cancel() })
+	select {
+	case <-t.startedCh:
+		select {
+		case <-t.stoppedCh:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // PublisherReconciler is the publish loop this task drives.
 type PublisherReconciler interface {

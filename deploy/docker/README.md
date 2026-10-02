@@ -23,11 +23,12 @@ docker compose -f deploy/docker/compose.yaml exec sequence \
 ```
 The migration job creates the Sequence tables, including the slot ownership and
 placement tables. There is no central placement decision: each node plans its
-own slots from `slot_ownership` and `sequence_node_liveness` on every heartbeat,
-claims what its plan hands it, and serves it. The publisher half of the same
-process snapshots that authority into `sequence_routes` under a coordinator
-lease, so clients can follow the moves. Allocation is paused until the first
-directory appears, which the quick start shows how to watch.
+own slots from `sequence_slot_ownership` and `sequence_node_liveness` on every
+heartbeat, claims what its plan hands it, and serves it. The publisher half of
+the same process snapshots that authority into the single
+`sequence_route_snapshot` row under a coordinator lease, so clients can follow
+the moves. Allocation is paused until the first directory appears, which the
+quick start shows how to watch.
 
 One image runs every shape, selected by `SKULD_SEQUENCE_MODE` (or `--mode`):
 
@@ -36,14 +37,17 @@ One image runs every shape, selected by `SKULD_SEQUENCE_MODE` (or `--mode`):
 - `data` — allocator, heartbeat, RPC and local planning. No directory is
   published by this process.
 - `control` — the publisher only: coordinator lease, route materialisation and
-  control-plane readiness. It never claims a slot or renews a liveness row.
+  control-plane readiness. It never claims a slot or renews a liveness row, and
+  it does not register the Sequence RPC service.
 
 A production StatefulSet normally runs its members as `data` and one (or a
 small number of) separate Deployment replicas as `control`. The publisher only
 decides how quickly a move becomes visible to clients; it is not a precondition
 for a node to own or serve a slot. Losing it leaves the fleet serving the last
-directory. A missing or invalid mode fails the process at startup rather than
-picking a shape silently. See
+directory. Keep control replicas out of the Kubernetes Service or load-balancer
+pool that serves Sequence RPC; clients must reach `GetRoute`, `FetchNext`, and
+`FetchNextBatch` on data members. A missing or invalid mode fails the process at
+startup rather than picking a shape silently. See
 [../../docs/sequence.md](../../docs/sequence.md) section 2.
 
 The two shapes differ by one setting:
@@ -112,8 +116,8 @@ names, such as `github.com.codesjoy.skuld.sequence.user` and
 `github.com.codesjoy.skuld.sequence.group`, and configure consumers to use the
 matching name in both their Yggdrasil `clients.services` entry and `NewClient`
 call. Each deployment must also use a separate DSN: changing the application
-name does not namespace `sequence_ranges` or `sequence_routes` in a shared
-database.
+name does not namespace `sequence_ranges` or `sequence_slot_ownership` in a
+shared database.
 
 ## Memory and CPU sizing
 
@@ -180,3 +184,16 @@ unknown, states are long-lived, and preallocation increases idle RSS. Tune
 `allocator.cleanup_slots_per_run` only when profiles show cleanup latency or CPU
 spikes; increasing it reclaims idle keys sooner at the cost of more work per
 cleanup tick.
+
+## Empty-database baseline
+
+The candidate schema is a **single baseline migration per dialect**
+(`migrations/sequence/{postgres,mysql}/20261002010000_init.sql`). It is written
+for an empty database and replaces the previous chain of upgrade migrations.
+There is no bridge from the older schema and no in-place upgrade: rebuild the
+Sequence database into an empty one, stop every Sequence process first, and let
+the migration job create the tables.
+
+The baseline the migration job applies must match the service you are about to
+run. Applying the baseline from a newer checkout under an older binary, or the
+reverse, is unsupported.

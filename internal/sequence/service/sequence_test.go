@@ -16,8 +16,9 @@ package service
 
 import (
 	"context"
-	"fmt"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,49 +27,40 @@ import (
 	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
 	testkit "github.com/codesjoy/sindri/internal/pkg/tests"
 	"github.com/codesjoy/sindri/internal/sequence/biz"
+	"github.com/codesjoy/sindri/internal/sequence/testutil"
 	sequencepkg "github.com/codesjoy/sindri/pkg/sequence"
 	"github.com/codesjoy/yggdrasil/v3/rpc/metadata"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/genproto/googleapis/rpc/code"
 )
 
 type sequenceStore struct {
-	max int64
-	// err, when set, is what a reservation reports instead of granting a range. It
-	// lets a test drive the authority failures the service has to translate.
+	mu  sync.Mutex
+	max map[string]int64
 	err error
 }
 
-type testMemorySampler struct{}
-
-func (testMemorySampler) MemoryUsage() (uint64, uint64) { return 1, 100 }
-
-// readyAllocator builds the allocator the service tests drive.
-//
-// It carries a pause bound because the allocator measures every in-memory
-// linearisation against one: a zero bound would discard every allocation as a
-// stall and fence the slot. Production injects this from the validated HA
-// section rather than defaulting it here.
-func readyAllocator(store biz.SequenceRepo) *biz.Allocator {
-	plane := biz.DataPlaneConfig{
-		Allocator: biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
-		Node:      biz.NodeConfig{ID: "node-a"},
+func (s *sequenceStore) ReserveRanges(
+	_ context.Context,
+	_ biz.ReservationAuthority,
+	req []biz.ReservationRequest,
+) ([]biz.SequenceRange, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return nil, s.err
 	}
-	if err := testkit.DecodeDefaults(&plane); err != nil {
-		panic(err)
+	if s.max == nil {
+		s.max = map[string]int64{}
 	}
-	return biz.NewAllocator(
-		plane,
-		store,
-		nil,
-		testMemorySampler{},
-		nil,
-	)
+	result := make([]biz.SequenceRange, len(req))
+	for i, r := range req {
+		result[i] = biz.SequenceRange{Start: s.max[r.Key] + 1, End: s.max[r.Key] + r.Step}
+		s.max[r.Key] += r.Step
+	}
+	return result, nil
 }
 
-// segmentedService builds a service whose route carries the ownership view, so
-// the epoch and layout checks of appendix A.3 have something to compare against.
 func segmentedService(
 	t *testing.T,
 	key string,
@@ -79,9 +71,6 @@ func segmentedService(
 	return segmentedServiceWithStore(t, key, epoch, layout, &sequenceStore{})
 }
 
-// segmentedServiceWithStore is segmentedService with the backing store supplied,
-// so a test can push a specific authority failure through the whole service path
-// and check what the caller is actually told about it.
 func segmentedServiceWithStore(
 	t *testing.T,
 	key string,
@@ -90,557 +79,181 @@ func segmentedServiceWithStore(
 	store biz.SequenceRepo,
 ) (*SequenceService, *biz.Allocator) {
 	t.Helper()
-	slot := biz.SlotForKey(key)
-	allocator := readyAllocator(store)
-	allocator.Open(2, 0, []uint32{slot})
-	allocator.ApplyRoute(0)
+	var cfg biz.DataPlaneConfig
+	cfg.Node.ID = "node-a"
+	cfg.Allocator.DefaultStep = 10
+	cfg.Allocator.MaxStep = 100
+	require.NoError(t, testkit.DecodeDefaults(&cfg))
+	authority := testutil.NewAuthority()
+	authority.Epoch = epoch
+	a := biz.NewAllocator(cfg, store, authority, handlerMemorySampler{}, nil)
+	a.RenewLeases()
+	require.NoError(t, a.Claim(context.Background(), []uint32{biz.SlotForKey(key)}))
 	route := biz.NewRouteCache()
-	route.UpdateRoute(&biz.Route{
-		Version:       2,
-		LayoutVersion: layout,
-		Nodes:         []biz.RouteNode{{NodeID: "node-a", Slots: []uint32{slot}}},
-		Segments: []biz.RouteSegment{{
-			StartSlot:       0,
-			EndSlot:         biz.SlotCount - 1,
-			OwnerNodeID:     "node-a",
-			OwnerInstanceID: "instance-a",
-			Epoch:           epoch,
-		}},
-	})
-	return NewSequenceService(allocator, route), allocator
+	route.UpdateRoute(
+		&biz.Route{
+			Version:       2,
+			LayoutVersion: layout,
+			Segments: []biz.RouteSegment{
+				{
+					StartSlot:       0,
+					EndSlot:         biz.SlotCount - 1,
+					OwnerNodeID:     "node-a",
+					OwnerInstanceID: a.InstanceID(),
+					Epoch:           epoch,
+				},
+			},
+		},
+	)
+	return NewSequenceService(a, route), a
 }
 
 func withRequestMetadata(ctx context.Context, pairs map[string]string) context.Context {
+	if _, ok := pairs[sequencepkg.VersionMetaKey]; !ok {
+		pairs[sequencepkg.VersionMetaKey] = "2"
+	}
 	return metadata.WithInContext(ctx, metadata.New(pairs))
 }
 
-// TestFetchNextRefusesACallerAheadOfTheSlotEpoch pins the half of A.3 that is not
-// symmetric: a caller that knows a newer epoch than this node has seen must be
-// sent to refresh rather than answered from a directory it has already passed.
-func TestFetchNextRefusesACallerAheadOfTheSlotEpoch(t *testing.T) {
-	service, _ := segmentedService(t, "orders", 4, 1)
-	ctx := withRequestMetadata(context.Background(), map[string]string{
-		sequencepkg.SlotEpochMetaKey: "5",
-	})
-
-	_, err := service.FetchNext(ctx, &sequencev1.FetchNextRequest{Key: "orders"})
-	require.Error(t, err)
-	assert.True(t, xerror.IsReason(err, reason.Reason_SEQUENCE_EPOCH_STALE))
-
-	_, _, meta, ok := xerror.ReasonOf(err)
-	require.True(t, ok, "the refusal must carry the A.4 envelope")
-	assert.Equal(t, sequencepkg.RetryAfterRefresh, meta[sequencepkg.RetryableMetaKey])
-	assert.Equal(t, "4", meta[sequencepkg.SlotEpochMetaKey])
-	assert.Equal(t, "node-a", meta[sequencepkg.OwnerHintMetaKey])
+func requestContext() context.Context {
+	return withRequestMetadata(context.Background(), map[string]string{})
 }
 
-// TestFetchNextServesACallerBehindTheSlotEpoch is the other direction: a caller
-// that is behind is still served. The response carries the epoch that supersedes
-// the one it sent, which is the refresh it needs (A.5); that field is pinned by
-// TestFetchNextResponseCarriesTheSlotEpoch, and what matters here is that the
-// stale hint does not itself cause a refusal.
-func TestFetchNextServesACallerBehindTheSlotEpoch(t *testing.T) {
-	service, _ := segmentedService(t, "orders", 4, 1)
-	ctx := withRequestMetadata(context.Background(), map[string]string{
-		sequencepkg.SlotEpochMetaKey: "3",
-	})
-
-	response, err := service.FetchNext(ctx, &sequencev1.FetchNextRequest{Key: "orders"})
+func TestFetchNextAndBlockResponseCountEpoch(t *testing.T) {
+	s, _ := segmentedService(t, "orders", 4, 1)
+	first, err := s.FetchNext(requestContext(), &sequencev1.FetchNextRequest{Key: "orders"})
 	require.NoError(t, err)
-	assert.Positive(t, response.GetId())
-}
-
-// TestFetchNextRefusesALayoutVersionMismatch covers the layout half of A.3: a
-// caller hashing under another layout sends slot numbers that mean different
-// keys, so answering would be answering for the wrong slot.
-func TestFetchNextRefusesALayoutVersionMismatch(t *testing.T) {
-	service, _ := segmentedService(t, "orders", 4, 7)
-	ctx := withRequestMetadata(context.Background(), map[string]string{
-		sequencepkg.LayoutVersionMetaKey: "8",
-	})
-
-	_, err := service.FetchNext(ctx, &sequencev1.FetchNextRequest{Key: "orders"})
-	require.Error(t, err)
-	assert.True(t, xerror.IsReason(err, reason.Reason_SEQUENCE_ROUTE_EXPIRED))
-}
-
-// TestFetchNextFailureCarriesTheProtocolEnvelope pins the appendix A.4 fields a
-// caller cannot derive from the reason and code alone.
-func TestFetchNextFailureCarriesTheProtocolEnvelope(t *testing.T) {
-	service, allocator := segmentedService(t, "orders", 4, 1)
-	allocator.Pause()
-
-	_, err := service.FetchNext(context.Background(), &sequencev1.FetchNextRequest{Key: "orders"})
-	require.Error(t, err)
-	assert.True(t, xerror.IsReason(err, reason.Reason_SEQUENCE_ALLOCATOR_PAUSED))
-
-	_, _, meta, ok := xerror.ReasonOf(err)
-	require.True(t, ok, "the refusal must carry the A.4 envelope")
-	assert.Equal(t, sequencepkg.RetryAfterBackoff, meta[sequencepkg.RetryableMetaKey])
-	assert.Equal(t, "4", meta[sequencepkg.SlotEpochMetaKey])
-	assert.Equal(t, "node-a", meta[sequencepkg.OwnerHintMetaKey])
-}
-
-// TestFetchNextCarriesTheEnvelopeForAnAuthorityFailure pins appendix A.4 for the
-// failures that come from the range authority rather than from the allocator's own
-// state. They reach the service as bare sentinels unless something maps them, and
-// the envelope is what tells the caller how to react: an uncertain commit in
-// particular has no safe resolution except to discard the range and retry, so a
-// caller that cannot recognise it cannot retry safely at all.
-//
-// FetchNext waits out a route-version handoff and then retries the allocation.
-// When the node still does not own the slot, the retried authority failure is
-// returned as itself; the client refresh path is what reacts to the reason.
-func TestFetchNextCarriesTheEnvelopeForAnAuthorityFailure(t *testing.T) {
-	cases := []struct {
-		name   string
-		store  error
-		reason reason.Reason
-		retry  string
-	}{
-		{
-			name:   "uncertain commit",
-			store:  fmt.Errorf("%w: connection reset by peer", biz.ErrCommitUncertain),
-			reason: reason.Reason_SEQUENCE_COMMIT_UNCERTAIN,
-			retry:  sequencepkg.RetryAfterBackoff,
-		},
-		{
-			name:   "lease expired",
-			store:  fmt.Errorf("reserve ranges: %w: slot 3", biz.ErrLeaseExpired),
-			reason: reason.Reason_SEQUENCE_LEASE_EXPIRED,
-			retry:  sequencepkg.RetryAfterRefresh,
-		},
-		{
-			name:   "slot not owned",
-			store:  fmt.Errorf("reserve ranges: %w: slot 3", biz.ErrSlotNotOwned),
-			reason: reason.Reason_SEQUENCE_SLOT_NOT_OWNER,
-			retry:  sequencepkg.RetryAfterRefresh,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			service, _ := segmentedServiceWithStore(
-				t,
-				"orders",
-				4,
-				1,
-				&sequenceStore{err: tc.store},
-			)
-			// A real client always sends the directory revision with the request,
-			// which is what lets the service tell "you are behind" from "refresh".
-			ctx := withRequestMetadata(context.Background(), map[string]string{
-				sequencepkg.VersionMetaKey: "2",
-			})
-
-			_, err := service.FetchNext(ctx, &sequencev1.FetchNextRequest{Key: "orders"})
-			require.Error(t, err)
-			assert.True(t, xerror.IsReason(err, tc.reason), "want %s, got %v", tc.reason, err)
-
-			_, _, meta, ok := xerror.ReasonOf(err)
-			require.True(t, ok, "the refusal must carry the A.4 envelope")
-			assert.Equal(t, tc.retry, meta[sequencepkg.RetryableMetaKey])
-			assert.Equal(t, "node-a", meta[sequencepkg.OwnerHintMetaKey])
-		})
-	}
-}
-
-// TestFetchNextIgnoresMalformedOptionalMetadata pins that the appendix A.3 hints
-// stay optional: a caller that sends nothing, or sends nonsense, is served or
-// refused on the request's own merits rather than being answered with a
-// permanent failure it could never resolve.
-func TestFetchNextIgnoresMalformedOptionalMetadata(t *testing.T) {
-	service, _ := segmentedService(t, "orders", 4, 1)
-	for _, pairs := range []map[string]string{
-		{},
-		{sequencepkg.SlotEpochMetaKey: "not-a-number"},
-		{sequencepkg.LayoutVersionMetaKey: "-"},
-	} {
-		ctx := withRequestMetadata(context.Background(), pairs)
-		response, err := service.FetchNext(
-			ctx,
-			&sequencev1.FetchNextRequest{Key: "orders"},
-		)
-		require.NoError(t, err, "%v", pairs)
-		assert.Positive(t, response.GetId())
-	}
-}
-
-func (s *sequenceStore) ReserveRanges(
-	_ context.Context,
-	_ biz.ReservationAuthority,
-	requests []biz.ReservationRequest,
-) ([]biz.SequenceRange, error) {
-	if s.err != nil {
-		return nil, s.err
-	}
-	reserved := make([]biz.SequenceRange, len(requests))
-	for index, request := range requests {
-		start := s.max + 1
-		s.max += request.Step
-		reserved[index] = biz.SequenceRange{Start: start, End: s.max}
-	}
-	return reserved, nil
-}
-
-func readyService(t *testing.T, key string) (*SequenceService, *biz.Allocator, *biz.RouteCache) {
-	t.Helper()
-	allocator := readyAllocator(&sequenceStore{})
-	allocator.Open(2, 0, []uint32{biz.SlotForKey(key)})
-	allocator.ApplyRoute(0)
-	route := biz.NewRouteCache()
-	route.UpdateRoute(&biz.Route{Version: 2, Nodes: []biz.RouteNode{{
-		NodeID: "node-a", Slots: []uint32{biz.SlotForKey(key)},
-	}}})
-	return NewSequenceService(allocator, route), allocator, route
-}
-
-func TestFetchNextSuccess(t *testing.T) {
-	svc, _, _ := readyService(t, "orders")
-	response, err := svc.FetchNext(
-		context.Background(),
-		&sequencev1.FetchNextRequest{Key: "orders"},
-	)
-	require.NoError(t, err)
-	assert.Equal(t, int64(1), response.Id)
-	assert.Equal(t, uint32(1), response.Count)
-}
-
-func TestFetchNextReturnsContiguousBlock(t *testing.T) {
-	svc, _, _ := readyService(t, "orders")
+	assert.EqualValues(t, 1, first.Id)
+	assert.EqualValues(t, 1, first.Count)
+	assert.EqualValues(t, 4, first.SlotEpoch)
 	count := uint32(3)
-	response, err := svc.FetchNext(
-		context.Background(),
+	next, err := s.FetchNext(
+		requestContext(),
 		&sequencev1.FetchNextRequest{Key: "orders", Count: &count},
 	)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), response.Id)
-	assert.Equal(t, uint32(3), response.Count)
-
-	next, err := svc.FetchNext(
-		context.Background(),
-		&sequencev1.FetchNextRequest{Key: "orders"},
-	)
-	require.NoError(t, err)
-	assert.Equal(t, int64(4), next.Id)
-	assert.Equal(t, uint32(1), next.Count)
+	assert.EqualValues(t, 2, next.Id)
+	assert.EqualValues(t, 3, next.Count)
 }
 
-func TestFetchNextBatchSuccess(t *testing.T) {
-	keys := sameSlotKeys(t, "orders", 3)
-	svc, _, _ := readyService(t, keys[0])
-	response, err := svc.FetchNextBatch(
-		context.Background(),
-		&sequencev1.FetchNextBatchRequest{Requests: []*sequencev1.FetchNextRequest{
-			{Key: keys[0]},
-			{Key: keys[1], Count: uint32Pointer(2)},
-			{Key: keys[2], Count: uint32Pointer(3)},
-		}},
-	)
-	require.NoError(t, err)
-	require.Len(t, response.Results, 3)
-	assert.Equal(t, keys[0], response.Results[0].Key)
-	assert.Equal(t, int64(1), response.Results[0].Id)
-	assert.Equal(t, uint32(1), response.Results[0].Count)
-	assert.Equal(t, keys[1], response.Results[1].Key)
-	assert.Equal(t, int64(11), response.Results[1].Id)
-	assert.Equal(t, uint32(2), response.Results[1].Count)
-	assert.Equal(t, keys[2], response.Results[2].Key)
-	assert.Equal(t, int64(21), response.Results[2].Id)
-	assert.Equal(t, uint32(3), response.Results[2].Count)
+func TestCallerVersionCheckNeverWaitsForMigration(t *testing.T) {
+	s, _ := segmentedService(t, "orders", 1, 1)
+	for _, tc := range []struct {
+		version string
+		reason  reason.Reason
+	}{{"1", reason.Reason_SEQUENCE_ROUTE_EXPIRED}, {"3", reason.Reason_SEQUENCE_OWNER_RECOVERING}} {
+		started := time.Now()
+		ctx := withRequestMetadata(
+			context.Background(),
+			map[string]string{sequencepkg.VersionMetaKey: tc.version},
+		)
+		_, err := s.FetchNext(ctx, &sequencev1.FetchNextRequest{Key: "orders"})
+		require.True(t, xerror.IsReason(err, tc.reason))
+		assert.Less(t, time.Since(started), 100*time.Millisecond)
+	}
+	for _, ctx := range []context.Context{context.Background(), metadata.WithInContext(context.Background(), metadata.Pairs(sequencepkg.VersionMetaKey, "bad")), metadata.WithInContext(context.Background(), metadata.Pairs(sequencepkg.VersionMetaKey, "0"))} {
+		_, err := s.FetchNext(ctx, &sequencev1.FetchNextRequest{Key: "orders"})
+		require.Error(t, err)
+	}
 }
 
-func TestFetchNextBatchRejectsInvalidRequests(t *testing.T) {
-	svc, _, _ := readyService(t, "orders")
-	keys := sameSlotKeys(t, "orders", 2)
+func TestCallerLayoutAndEpochChecks(t *testing.T) {
+	s, _ := segmentedService(t, "orders", 4, 1)
+	for _, tc := range []struct {
+		pairs map[string]string
+		want  reason.Reason
+	}{{map[string]string{sequencepkg.LayoutVersionMetaKey: "2"}, reason.Reason_SEQUENCE_ROUTE_EXPIRED}, {map[string]string{sequencepkg.SlotEpochMetaKey: "5"}, reason.Reason_SEQUENCE_EPOCH_STALE}} {
+		_, err := s.FetchNext(
+			withRequestMetadata(context.Background(), tc.pairs),
+			&sequencev1.FetchNextRequest{Key: "orders"},
+		)
+		require.True(t, xerror.IsReason(err, tc.want))
+	}
+	for _, epoch := range []string{"3", "4", "bad"} {
+		_, err := s.FetchNext(
+			withRequestMetadata(
+				context.Background(),
+				map[string]string{sequencepkg.SlotEpochMetaKey: epoch},
+			),
+			&sequencev1.FetchNextRequest{Key: "orders"},
+		)
+		require.NoError(t, err)
+	}
+}
 
-	tests := []struct {
-		name    string
-		request *sequencev1.FetchNextBatchRequest
-	}{
-		{name: "nil", request: nil},
-		{name: "empty", request: &sequencev1.FetchNextBatchRequest{}},
-		{name: "duplicate", request: &sequencev1.FetchNextBatchRequest{
+func TestAuthorityErrorsCarryRetryEnvelope(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want reason.Reason
+	}{{biz.ErrAuthorityChanged, reason.Reason_SEQUENCE_OWNER_RECOVERING}, {biz.ErrSlotNotOwned, reason.Reason_SEQUENCE_SLOT_NOT_OWNER}, {biz.ErrLeaseExpired, reason.Reason_SEQUENCE_LEASE_EXPIRED}, {biz.ErrCommitUncertain, reason.Reason_SEQUENCE_COMMIT_UNCERTAIN}} {
+		s, _ := segmentedServiceWithStore(t, "orders", 1, 1, &sequenceStore{err: tc.err})
+		_, err := s.FetchNext(requestContext(), &sequencev1.FetchNextRequest{Key: "orders"})
+		require.True(t, xerror.IsReason(err, tc.want))
+		assert.NotEmpty(t, retryClass(tc.want))
+	}
+	s, a := segmentedService(t, "orders", 1, 1)
+	a.Pause()
+	_, err := s.FetchNext(requestContext(), &sequencev1.FetchNextRequest{Key: "orders"})
+	require.True(t, xerror.IsReason(err, reason.Reason_SEQUENCE_ALLOCATOR_PAUSED))
+}
+
+func TestProtocolValidationAndBatchCountLimit(t *testing.T) {
+	s, _ := segmentedService(t, "orders", 1, 1)
+	excess := uint32(biz.MaxIDsPerKey + 1)
+	for _, r := range []*sequencev1.FetchNextRequest{nil, {}, {Key: strings.Repeat("a", 257)}, {Key: "orders", Count: &excess}} {
+		_, err := s.FetchNext(requestContext(), r)
+		require.Error(t, err)
+	}
+	for _, r := range []*sequencev1.FetchNextBatchRequest{nil, {}, {Requests: []*sequencev1.FetchNextRequest{{Key: "orders"}, {Key: "orders"}}}, {Requests: []*sequencev1.FetchNextRequest{nil}}} {
+		_, err := s.FetchNextBatch(requestContext(), r)
+		require.Error(t, err)
+	}
+	count := uint32(biz.MaxIDsPerKey)
+	var req []*sequencev1.FetchNextRequest
+	for i := 0; i < int(biz.MaxIDsPerRequest)/int(count)+1; i++ {
+		req = append(req, &sequencev1.FetchNextRequest{Key: strconv.Itoa(i), Count: &count})
+	}
+	_, err := s.FetchNextBatch(requestContext(), &sequencev1.FetchNextBatchRequest{Requests: req})
+	require.Error(t, err)
+}
+
+func TestBatchResponsePreservesOrderAndIndividualCount(t *testing.T) {
+	s, a := segmentedService(t, "orders", 1, 1)
+	keys := []string{"orders", "users", "KEY "}
+	slots := []uint32{biz.SlotForKey(keys[1]), biz.SlotForKey(keys[2])}
+	require.NoError(t, a.Claim(context.Background(), slots))
+	count := uint32(3)
+	r, err := s.FetchNextBatch(
+		requestContext(),
+		&sequencev1.FetchNextBatchRequest{
 			Requests: []*sequencev1.FetchNextRequest{
 				{Key: keys[0]},
-				{Key: keys[0]},
+				{Key: keys[1], Count: &count},
+				{Key: keys[2]},
 			},
-		}},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			_, err := svc.FetchNextBatch(context.Background(), test.request)
-			assert.True(t, xerror.IsCode(err, code.Code_INVALID_ARGUMENT))
-		})
-	}
-}
-
-func TestFetchNextBatchRejectsExcessiveTotalCount(t *testing.T) {
-	keys := sameSlotKeys(t, "orders", 11)
-	svc, _, _ := readyService(t, keys[0])
-	requests := make([]*sequencev1.FetchNextRequest, len(keys))
-	for index, key := range keys {
-		requests[index] = &sequencev1.FetchNextRequest{
-			Key:   key,
-			Count: uint32Pointer(biz.MaxIDsPerKey),
-		}
-	}
-	_, err := svc.FetchNextBatch(
-		context.Background(),
-		&sequencev1.FetchNextBatchRequest{Requests: requests},
-	)
-	assert.True(t, xerror.IsCode(err, code.Code_INVALID_ARGUMENT))
-}
-
-func TestFetchNextReturnsPaused(t *testing.T) {
-	svc, allocator, _ := readyService(t, "orders")
-	allocator.Pause()
-	_, err := svc.FetchNext(context.Background(), &sequencev1.FetchNextRequest{Key: "orders"})
-	assert.True(t, xerror.IsReason(err, reason.Reason_SEQUENCE_ALLOCATOR_PAUSED))
-}
-
-func TestFetchNextValidatesRouteMetadata(t *testing.T) {
-	svc, _, _ := readyService(t, "orders")
-	key := "not-owned"
-	for biz.SlotForKey(key) == biz.SlotForKey("orders") {
-		key += "x"
-	}
-
-	tests := []struct {
-		name string
-		ctx  context.Context
-	}{
-		{name: "missing", ctx: context.Background()},
-		{
-			name: "empty",
-			ctx: metadata.WithInContext(
-				context.Background(),
-				metadata.MD{sequencepkg.VersionMetaKey: {}},
-			),
 		},
-		{
-			name: "malformed",
-			ctx: metadata.WithInContext(
-				context.Background(),
-				metadata.New(map[string]string{sequencepkg.VersionMetaKey: "bad"}),
-			),
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			_, err := svc.FetchNext(test.ctx, &sequencev1.FetchNextRequest{Key: key})
-			assert.True(t, xerror.IsCode(err, code.Code_INVALID_ARGUMENT))
-		})
-	}
-
-	ctx := metadata.WithInContext(context.Background(), metadata.New(map[string]string{
-		sequencepkg.VersionMetaKey: "1",
-	}))
-	_, err := svc.FetchNext(ctx, &sequencev1.FetchNextRequest{Key: key})
-	assert.True(t, xerror.IsReason(err, reason.Reason_SEQUENCE_ROUTE_EXPIRED))
-}
-
-func TestFetchNextStopsWaitingWhenContextIsCanceled(t *testing.T) {
-	svc, _, _ := readyService(t, "orders")
-	key := "not-owned"
-	for biz.SlotForKey(key) == biz.SlotForKey("orders") {
-		key += "x"
-	}
-	ctx, cancel := context.WithCancel(metadata.WithInContext(
-		context.Background(),
-		metadata.New(map[string]string{sequencepkg.VersionMetaKey: "3"}),
-	))
-	cancel()
-	_, err := svc.FetchNext(ctx, &sequencev1.FetchNextRequest{Key: key})
-	assert.ErrorIs(t, err, context.Canceled)
-}
-
-// TestWaitForRouteVersionWaitsAtTheCurrentPublishedVersion covers the handoff
-// race the route cache and allocator version are separate for: the cache can
-// already publish version N while this process is still applying it. A caller at
-// N must wait for the local barrier, while a caller behind N is genuinely stale.
-func TestWaitForRouteVersionWaitsAtTheCurrentPublishedVersion(t *testing.T) {
-	allocator := readyAllocator(&sequenceStore{})
-	allocator.Open(1, 0, nil)
-	route := biz.NewRouteCache()
-	route.UpdateRoute(&biz.Route{
-		Version: 2,
-		Nodes:   []biz.RouteNode{{NodeID: "node-a", Slots: []uint32{0}}},
-	})
-	svc := NewSequenceService(allocator, route)
-
-	ctx := withRequestMetadata(context.Background(), map[string]string{
-		sequencepkg.VersionMetaKey: "2",
-	})
-	waited := make(chan error, 1)
-	go func() {
-		waited <- svc.waitForRouteVersion(ctx)
-	}()
-
-	select {
-	case err := <-waited:
-		t.Fatalf("wait returned before the allocator applied version 2: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
-	allocator.Reconcile(2, 0, nil, false)
-	allocator.ApplyRoute(0)
-	require.NoError(t, <-waited)
-
-	expiredCtx := withRequestMetadata(context.Background(), map[string]string{
-		sequencepkg.VersionMetaKey: "1",
-	})
-	err := svc.waitForRouteVersion(expiredCtx)
-	assert.True(t, xerror.IsReason(err, reason.Reason_SEQUENCE_ROUTE_EXPIRED))
-}
-
-// TestWaitForRouteVersionAheadOfTheCacheWaitsAndCancels covers the other side of
-// the handoff window: a caller that knows a newer version than this node's route
-// cache is not expired, it is early, so it waits for the allocator to reach that
-// version and the wait is bounded by the caller's own context.
-func TestWaitForRouteVersionAheadOfTheCacheWaitsAndCancels(t *testing.T) {
-	allocator := readyAllocator(&sequenceStore{})
-	allocator.Open(1, 0, nil)
-	route := biz.NewRouteCache()
-	route.UpdateRoute(&biz.Route{
-		Version: 2,
-		Nodes:   []biz.RouteNode{{NodeID: "node-a", Slots: []uint32{0}}},
-	})
-	svc := NewSequenceService(allocator, route)
-
-	ctx, cancel := context.WithCancel(withRequestMetadata(
-		context.Background(),
-		map[string]string{sequencepkg.VersionMetaKey: "3"},
-	))
-	waited := make(chan error, 1)
-	go func() {
-		waited <- svc.waitForRouteVersion(ctx)
-	}()
-
-	select {
-	case err := <-waited:
-		t.Fatalf("a caller ahead of the cache returned early: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
-	cancel()
-	select {
-	case err := <-waited:
-		require.ErrorIs(t, err, context.Canceled)
-	case <-time.After(time.Second):
-		t.Fatal("waiting for a newer version ignored the caller's cancellation")
-	}
-
-	// The same wait still answers once the allocator applies the version.
-	applied := make(chan error, 1)
-	go func() {
-		applied <- svc.waitForRouteVersion(withRequestMetadata(
-			context.Background(),
-			map[string]string{sequencepkg.VersionMetaKey: "3"},
-		))
-	}()
-	allocator.Reconcile(3, 0, nil, false)
-	allocator.ApplyRoute(0)
-	require.NoError(t, <-applied)
-}
-
-func TestGetRouteResponses(t *testing.T) {
-	empty := NewSequenceService(
-		readyAllocator(&sequenceStore{}),
-		biz.NewRouteCache(),
-	)
-	_, err := empty.GetRoute(context.Background(), &sequencev1.GetRouteRequest{})
-	assert.True(t, xerror.IsReason(err, reason.Reason_SEQUENCE_ROUTE_UNAVAILABLE))
-
-	svc, _, _ := readyService(t, "orders")
-	for _, knownVersion := range []int64{2, 3} {
-		response, responseErr := svc.GetRoute(
-			context.Background(),
-			&sequencev1.GetRouteRequest{KnownVersion: knownVersion},
-		)
-		require.NoError(t, responseErr)
-		assert.True(t, response.NotModified)
-		assert.Nil(t, response.Route)
-	}
-
-	current, err := svc.GetRoute(
-		context.Background(),
-		&sequencev1.GetRouteRequest{KnownVersion: 1},
 	)
 	require.NoError(t, err)
-	require.NotNil(t, current.Route)
-	assert.Equal(t, int64(2), current.Route.Version)
-	assert.Equal(t, "node-a", current.Route.Nodes[0].NodeId)
-}
-
-// TestFetchNextResponseCarriesTheSlotEpoch pins the translation rather than the
-// value. The epoch is the client-visible half of the linearization record, so
-// dropping it while copying the allocation would quietly remove the only
-// evidence a caller can compare across two responses for one key.
-func TestFetchNextResponseCarriesTheSlotEpoch(t *testing.T) {
-	response := fetchNextResponse(biz.SequenceAllocation{ID: 7, Count: 2, SlotEpoch: 5})
-	assert.Equal(t, int64(7), response.Id)
-	assert.Equal(t, uint32(2), response.Count)
-	assert.Equal(t, uint64(5), response.SlotEpoch)
-}
-
-func TestGetRoutePublishesTheOwnershipView(t *testing.T) {
-	route := biz.NewRouteCache()
-	route.UpdateRoute(&biz.Route{
-		Version:       5,
-		LayoutVersion: 1,
-		Nodes:         []biz.RouteNode{{NodeID: "node-a", Slots: []uint32{0, 1}}},
-		Segments: []biz.RouteSegment{{
-			StartSlot:       0,
-			EndSlot:         1,
-			OwnerNodeID:     "node-a",
-			OwnerInstanceID: "instance-a",
-			Epoch:           9,
-		}},
-	})
-
-	response, err := NewSequenceService(nil, route).GetRoute(
-		context.Background(),
-		&sequencev1.GetRouteRequest{},
-	)
-	require.NoError(t, err)
-	require.NotNil(t, response.Route)
-	assert.Equal(t, int64(1), response.Route.LayoutVersion)
-	require.Len(t, response.Route.Nodes, 1)
-	require.Len(t, response.Route.Segments, 1)
-	assert.Equal(t, "instance-a", response.Route.Segments[0].OwnerInstanceId)
-	assert.Equal(t, uint64(9), response.Route.Segments[0].SlotEpoch)
-}
-
-// TestGetRouteOmitsEpochsForALegacySnapshot covers the snapshots that already
-// exist in deployed databases: they state ownership through nodes alone, so a
-// caller must receive no epoch rather than a zero it would read as a real one.
-func TestGetRouteOmitsEpochsForALegacySnapshot(t *testing.T) {
-	route := biz.NewRouteCache()
-	route.UpdateRoute(&biz.Route{
-		Version: 6,
-		Nodes:   []biz.RouteNode{{NodeID: "node-a", Slots: []uint32{0}}},
-	})
-
-	response, err := NewSequenceService(nil, route).GetRoute(
-		context.Background(),
-		&sequencev1.GetRouteRequest{},
-	)
-	require.NoError(t, err)
-	require.NotNil(t, response.Route)
-	assert.Equal(t, int64(0), response.Route.LayoutVersion)
-	assert.Empty(t, response.Route.Segments)
-	require.Len(t, response.Route.Nodes, 1)
-}
-
-func sameSlotKeys(t *testing.T, base string, count int) []string {
-	t.Helper()
-	slot := biz.SlotForKey(base)
-	keys := []string{base}
-	for candidate := 0; len(keys) < count; candidate++ {
-		key := base + "-" + strconv.Itoa(candidate)
-		if biz.SlotForKey(key) == slot {
-			keys = append(keys, key)
-		}
+	require.Len(t, r.Results, 3)
+	for i, item := range r.Results {
+		assert.Equal(t, keys[i], item.Key)
+		assert.EqualValues(t, 1, item.Id)
+		assert.EqualValues(t, 1, item.SlotEpoch)
 	}
-	return keys
+	assert.EqualValues(t, 3, r.Results[1].Count)
 }
 
-func uint32Pointer(value uint32) *uint32 { return &value }
+func TestGetRouteHasOnlyCompleteSegmentsAndNoFabricatedSnapshot(t *testing.T) {
+	s, _ := segmentedService(t, "orders", 4, 1)
+	r, err := s.GetRoute(context.Background(), &sequencev1.GetRouteRequest{})
+	require.NoError(t, err)
+	require.Len(t, r.Route.Segments, 1)
+	assert.EqualValues(t, biz.SlotCount-1, r.Route.Segments[0].EndSlot)
+	assert.EqualValues(t, 4, r.Route.Segments[0].SlotEpoch)
+	r, err = s.GetRoute(context.Background(), &sequencev1.GetRouteRequest{KnownVersion: 2})
+	require.NoError(t, err)
+	assert.True(t, r.NotModified)
+	s.route = biz.NewRouteCache()
+	_, err = s.GetRoute(context.Background(), &sequencev1.GetRouteRequest{})
+	require.True(t, xerror.IsReason(err, reason.Reason_SEQUENCE_ROUTE_UNAVAILABLE))
+}

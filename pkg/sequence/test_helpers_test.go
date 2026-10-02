@@ -16,26 +16,31 @@ package sequence
 
 import (
 	"context"
-	"errors"
-	"sync"
+	"strconv"
+	"testing"
 
+	"github.com/codesjoy/pkg/basic/xerror"
+	"github.com/codesjoy/sindri/gen/go/sequence/reason"
 	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
-	"github.com/codesjoy/yggdrasil/v3/discovery/resolver"
-	"github.com/codesjoy/yggdrasil/v3/rpc/stream"
-	remote "github.com/codesjoy/yggdrasil/v3/transport"
-	"github.com/codesjoy/yggdrasil/v3/transport/runtime/client/balancer"
+	"github.com/stretchr/testify/require"
 )
 
 func testRoute(version int64, nodeIDs ...string) *sequencev1.RouteSnapshot {
-	nodes := make([]*sequencev1.RouteNode, len(nodeIDs))
-	for i, nodeID := range nodeIDs {
-		nodes[i] = &sequencev1.RouteNode{NodeId: nodeID}
-	}
+	snapshot := &sequencev1.RouteSnapshot{Version: version, LayoutVersion: 1}
 	for slot := 0; slot < SlotCount; slot++ {
-		owner := slot % len(nodes)
-		nodes[owner].Slots = append(nodes[owner].Slots, uint32(slot))
+		nodeID := nodeIDs[slot%len(nodeIDs)]
+		snapshot.Segments = append(
+			snapshot.Segments,
+			&sequencev1.RouteSegment{
+				StartSlot:       uint32(slot),
+				EndSlot:         uint32(slot),
+				OwnerNodeId:     nodeID,
+				OwnerInstanceId: nodeID + "-instance",
+				SlotEpoch:       1,
+			},
+		)
 	}
-	return &sequencev1.RouteSnapshot{Version: version, Nodes: nodes}
+	return snapshot
 }
 
 // testSegment is one run of slots in a segmented test route. Splitting the space
@@ -56,7 +61,6 @@ func testSegmentedRoute(
 	segments ...testSegment,
 ) *sequencev1.RouteSnapshot {
 	snapshot := &sequencev1.RouteSnapshot{Version: version, LayoutVersion: layout}
-	nodeIndex := make(map[string]*sequencev1.RouteNode)
 	for _, segment := range segments {
 		snapshot.Segments = append(snapshot.Segments, &sequencev1.RouteSegment{
 			StartSlot:       segment.from,
@@ -65,109 +69,35 @@ func testSegmentedRoute(
 			OwnerInstanceId: segment.nodeID + "-instance",
 			SlotEpoch:       segment.epoch,
 		})
-		node, ok := nodeIndex[segment.nodeID]
-		if !ok {
-			node = &sequencev1.RouteNode{NodeId: segment.nodeID}
-			nodeIndex[segment.nodeID] = node
-			snapshot.Nodes = append(snapshot.Nodes, node)
-		}
-		for slot := segment.from; slot <= segment.to; slot++ {
-			node.Slots = append(node.Slots, slot)
-		}
 	}
 	return snapshot
 }
 
-type testRemoteClient struct {
-	mu        sync.Mutex
-	state     remote.State
-	closed    bool
-	connected bool
+func newSegmentedTestRouter(t *testing.T, snapshot *sequencev1.RouteSnapshot) *Router {
+	t.Helper()
+	router, err := NewRouter(func(context.Context, int64) (*sequencev1.GetRouteResponse, error) {
+		return &sequencev1.GetRouteResponse{Route: snapshot}, nil
+	})
+	require.NoError(t, err)
+	require.NoError(t, router.Update(snapshot))
+	return router
 }
 
-func (c *testRemoteClient) NewStream(
-	context.Context,
-	*stream.Desc,
-	string,
-) (stream.ClientStream, error) {
-	return nil, errors.New("unused")
-}
-
-func (c *testRemoteClient) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.closed = true
-	return nil
-}
-
-func (*testRemoteClient) Protocol() string { return "grpc" }
-
-func (c *testRemoteClient) State() remote.State {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.state
-}
-
-func (c *testRemoteClient) Connect() {
-	c.mu.Lock()
-	c.connected = true
-	c.mu.Unlock()
-}
-
-type testBalancerClient struct {
-	mu        sync.Mutex
-	state     balancer.State
-	updates   int
-	clients   map[string]*testRemoteClient
-	listeners map[string]func(remote.ClientState)
-}
-
-func newTestBalancerClient() *testBalancerClient {
-	return &testBalancerClient{
-		clients:   make(map[string]*testRemoteClient),
-		listeners: make(map[string]func(remote.ClientState)),
+// keyInSlotRange returns a key that hashes into a slot range, so a test can build
+// a batch whose keys land in chosen segments.
+func keyInSlotRange(t *testing.T, from, to uint32) string {
+	t.Helper()
+	for i := 0; i < 1_000_000; i++ {
+		key := "key-" + strconv.Itoa(i)
+		if slot := SlotForKey(key); slot >= from && slot < to {
+			return key
+		}
 	}
+	t.Fatalf("no key hashes into slots [%d,%d)", from, to)
+	return ""
 }
 
-func (c *testBalancerClient) UpdateState(state balancer.State) {
-	c.mu.Lock()
-	c.state = state
-	c.updates++
-	c.mu.Unlock()
-}
-
-func (c *testBalancerClient) NewRemoteClient(
-	endpoint resolver.Endpoint,
-	options balancer.NewRemoteClientOptions,
-) (remote.Client, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	client := &testRemoteClient{state: remote.Ready}
-	c.clients[endpoint.Name()] = client
-	c.listeners[endpoint.Name()] = options.StateListener
-	return client, nil
-}
-
-func (c *testBalancerClient) picker() balancer.Picker {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.state.Picker
-}
-
-func (c *testBalancerClient) updateCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.updates
-}
-
-func testEndpoint(address, nodeID string) resolver.BaseEndpoint {
-	attributes := map[string]any{}
-	if nodeID != "" {
-		attributes[NodeIDAttribute] = nodeID
-	}
-	return resolver.BaseEndpoint{
-		Address:    address,
-		Protocol:   "grpc",
-		Attributes: attributes,
-	}
+func retryError(action, after string) error {
+	return xerror.NewWithReason(reason.Reason_SEQUENCE_OWNER_RECOVERING,
+		"owner recovering", map[string]string{RetryableMetaKey: action, RetryAfterMetaKey: after})
 }

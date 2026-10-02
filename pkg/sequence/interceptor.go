@@ -184,7 +184,7 @@ func invokeRouted(
 	slot uint32,
 	version int64,
 ) error {
-	ctx = WithSlot(ctx, slot)
+	ctx = withSlot(ctx, slot)
 	pairs := []string{VersionMetaKey, strconv.FormatInt(version, 10)}
 	if layout := router.LayoutVersion(); layout > 0 {
 		pairs = append(pairs, LayoutVersionMetaKey, strconv.FormatInt(layout, 10))
@@ -208,8 +208,7 @@ func validateFetchNextCount(
 	if want == 0 {
 		want = 1
 	}
-	if response.GetCount() != want &&
-		(want != 1 || response.GetCount() != 0) {
+	if response.GetCount() != want {
 		return ErrCountUnsupported
 	}
 	return nil

@@ -31,6 +31,7 @@ import (
 	yapp "github.com/codesjoy/yggdrasil/v3/app"
 	"github.com/codesjoy/yggdrasil/v3/config"
 	"github.com/codesjoy/yggdrasil/v3/config/source/memory"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	tcetcd "github.com/testcontainers/testcontainers-go/modules/etcd"
@@ -55,11 +56,9 @@ type discoveryInstanceRecord struct {
 }
 
 func TestSequenceEtcdDiscoveryAcrossDialects(t *testing.T) {
-	for _, item := range harnesses {
-		t.Run(item.name, func(t *testing.T) {
-			runSequenceEtcdDiscovery(t, item)
-		})
-	}
+	forEachDialect(t, func(t *testing.T, item *harness) {
+		runSequenceEtcdDiscovery(t, item)
+	})
 }
 
 func runSequenceEtcdDiscovery(t *testing.T, database *harness) {
@@ -119,7 +118,7 @@ func runSequenceEtcdDiscovery(t *testing.T, database *harness) {
 	require.Positive(t, firstB)
 	for _, node := range []*sequenceProcess{nodeA, nodeB} {
 		require.Eventually(t, func() bool {
-			status, report, err := probeSequenceReadiness(node.readyURL)
+			status, report, err := probeReadiness(node.readyURL)
 			return err == nil && status == http.StatusOK && report.Ready
 		}, discoveryTestTimeout, 50*time.Millisecond, "readiness never turned green")
 	}
@@ -164,7 +163,7 @@ func newDiscoveredSequenceClient(
 		"sequence-etcd-discovery-client",
 		yapp.WithConfigManager(manager),
 		yapp.WithProcessDefaults(false),
-		yapp.WithModules(etcdmodule.Module(), sequencepkg.NewRoutingModule(router)),
+		yapp.WithModules(etcdmodule.Module(), sequencepkg.NewModule(router)),
 	)
 	require.NoError(t, err)
 	client, err := runtimeApp.NewClient(context.Background(), sequenceAppName)
@@ -263,12 +262,12 @@ func resetSequenceDatabase(t *testing.T, database *harness) error {
 	// in, including the ownership view the planner treats as authoritative.
 	statements := []string{
 		"DELETE FROM sequence_ranges",
-		"DELETE FROM sequence_routes",
+		"DELETE FROM sequence_route_snapshot",
 		"DELETE FROM sequence_node_liveness",
-		"UPDATE sequence_route_state SET revision = 1",
+		"DELETE FROM sequence_slot_handoffs",
 		"UPDATE sequence_coordinator SET owner_instance_id = NULL, expires_at = NULL WHERE id = 1",
-		"UPDATE slot_ownership SET owner_node_id = NULL, owner_instance_id = NULL, " +
-			"epoch = 0, granted_at = NULL, state = 'UNOWNED'",
+		"UPDATE sequence_slot_ownership SET owner_instance_id = NULL, epoch = 0, state = 'UNOWNED'",
+		"DELETE FROM sequence_instance_leases",
 	}
 	for _, statement := range statements {
 		if err := db.Exec(statement).Error; err != nil {
@@ -285,7 +284,7 @@ func publishDiscoveryRoute(
 ) int64 {
 	t.Helper()
 	db := openGORM(t, database)
-	seedSlotOwnership(t, db, owners)
+	seedSlotOwnership(t, db, owners, processLeaseDuration, processNodeTTL)
 	return publishSeededRoute(t, db)
 }
 
@@ -362,16 +361,26 @@ func waitForDiscoveredAllocation(
 	t.Helper()
 	var id int64
 	var lastErr error
-	require.Eventually(t, func() bool {
+	var lastResponse *sequencev1.FetchNextResponse
+	converged := assert.Eventually(t, func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		response, err := client.FetchNext(ctx, &sequencev1.FetchNextRequest{Key: key})
 		lastErr = err
+		lastResponse = response
 		if err != nil || response.GetId() <= 0 {
 			return false
 		}
 		id = response.GetId()
 		return true
-	}, discoveryTestTimeout, 50*time.Millisecond, "last allocation error: %v", lastErr)
+	}, discoveryTestTimeout, 50*time.Millisecond)
+	require.True(
+		t,
+		converged,
+		"allocation for %q never succeeded: last error: %v, response: %v",
+		key,
+		lastErr,
+		lastResponse,
+	)
 	return id
 }

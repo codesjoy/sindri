@@ -78,6 +78,9 @@ func newHATestAllocator(
 	memorySampler MemorySampler,
 	logger *slog.Logger,
 ) *Allocator {
+	if ownership == nil {
+		ownership = newLeaseOwnershipFake()
+	}
 	return NewAllocator(testDataPlaneConfig(*cfg), store, ownership, memorySampler, logger)
 }
 
@@ -129,8 +132,7 @@ func readyAllocatorForKeys(t testing.TB, keys ...string) *Allocator {
 		unlimitedMemorySampler,
 		slog.Default(),
 	)
-	allocator.Open(1, 0, slots)
-	allocator.ApplyRoute(0)
+	allocator.testAssignSlots(slots)
 	return allocator
 }
 
@@ -204,8 +206,7 @@ func BenchmarkAllocatorNewKeys(b *testing.B) {
 		unlimitedMemorySampler,
 		slog.Default(),
 	)
-	allocator.Open(1, 0, slots)
-	allocator.ApplyRoute(0)
+	allocator.testAssignSlots(slots)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := range b.N {
@@ -295,8 +296,7 @@ func TestReadinessSurvivesStorageLossAndEmptySlots(t *testing.T) {
 	// A route that assigns this instance nothing. The version only advances
 	// once the (empty) claim has committed, which is what makes the instance
 	// serving rather than initializing.
-	allocator.Open(7, 0, nil)
-	allocator.ApplyRoute(0)
+	allocator.testAssignSlots(nil)
 	assert.True(t, allocator.Readiness().Ready, "an empty assignment is still serving")
 
 	// A storage blip pauses allocation but must not take the instance out of
@@ -342,6 +342,54 @@ func TestShutdownKeepsAuthorityThatDidNotDrain(t *testing.T) {
 	assert.False(t, allocator.Readiness().Ready)
 }
 
+// TestShutdownReleasesHeldAuthorityThatWasNeverInstalled pins the shutdown
+// contract against the cache/authority split. A slot can be granted to this
+// instance between two local syncs, so the instance holds authority the serving
+// path never installed; the departure still has to give it back, or the
+// successor waits out the full quiet window for a grant nobody is using.
+func TestShutdownReleasesHeldAuthorityThatWasNeverInstalled(t *testing.T) {
+	f := newLeaseOwnershipFake()
+	cfg := testDataPlaneConfig(testAllocatorConfig())
+	cfg.HA.LeaseDuration = 10 * time.Second
+	cfg.HA.RenewInterval = 3 * time.Second
+	cfg.HA.SafetyMargin = time.Second
+	allocator := NewAllocator(
+		cfg,
+		&rangeStore{max: map[string]int64{}},
+		f,
+		unlimitedMemorySampler,
+		slog.Default(),
+	)
+	allocator.SetHandoffs(f, defaultMigrationConfig())
+	allocator.RenewLeases()
+	require.True(t, allocator.initialized.Load())
+
+	// The authority grants the instance slots out of band, exactly like a
+	// handoff that lands between local syncs.
+	slots := []uint32{0, 1, 2, 3}
+	f.mu.Lock()
+	lease := f.leases[allocator.instanceID]
+	for _, id := range slots {
+		f.rows[id] = Ownership{
+			SlotID:          id,
+			OwnerNodeID:     allocator.nodeID,
+			OwnerInstanceID: allocator.instanceID,
+			Epoch:           1,
+			State:           SlotOwned,
+		}
+	}
+	lease.Revision++
+	f.leases[allocator.instanceID] = lease
+	f.mu.Unlock()
+	require.Empty(t, allocator.slots, "the grant must not have reached the cache")
+
+	allocator.Shutdown()
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	assert.EqualValues(t, len(slots), f.released, "held authority must be released")
+}
+
 // TestHAStatsCountsTakeoversAndReleases pins the appendix E counters at the two
 // places they are produced: a claim that moves an epoch, and a release that gives
 // one back.
@@ -352,8 +400,7 @@ func TestHAStatsCountsTakeoversAndReleases(t *testing.T) {
 
 	// Claiming through the route path is what a takeover is, and each granted slot
 	// moves its epoch.
-	allocator.Open(1, 0, []uint32{SlotForKey(key)})
-	allocator.ApplyRoute(0)
+	allocator.testAssignSlots([]uint32{SlotForKey(key)})
 
 	stats := allocator.HAStats()
 	assert.Positive(t, stats.TakeoversGranted)
@@ -405,8 +452,7 @@ func readyAllocatorForCleanup(
 		CleanupInterval: time.Minute,
 	}, store, nil, unlimitedMemorySampler, slog.Default())
 	allocator.now = clock.Now
-	allocator.Open(1, 0, []uint32{SlotForKey(key)})
-	allocator.ApplyRoute(0)
+	allocator.testAssignSlots([]uint32{SlotForKey(key)})
 	return allocator
 }
 
@@ -448,6 +494,88 @@ func TestAllocatorCleanupEvictsIdleStateAndContinuesFromWatermark(t *testing.T) 
 	assert.NotSame(t, oldState, newState)
 }
 
+func TestCleanupRetainsReferencedStateBeforeRangePreparation(t *testing.T) {
+	key := "referenced-orders"
+	clock := &fakeClock{now: time.Unix(1000, 0)}
+	store := &rangeStore{max: map[string]int64{key: 10}}
+	allocator := readyAllocatorForCleanup(t, store, clock, key)
+	slot := allocator.slots[SlotForKey(key)]
+	state := &keyState{allocator: allocator, slot: slot}
+	state.start.Store(1)
+	state.end.Store(10)
+	state.next.Store(9)
+	state.generation.Store(2)
+	state.initialized.Store(true)
+	state.lastUsed.Store(clock.Now().UnixNano())
+	slot.Store(key, state)
+	slot.count.Store(1)
+	allocator.cachedKeys.Store(1)
+	clock.Advance(11 * time.Minute)
+
+	// Pause A after acquiring its cache entry, before preparing its two-ID block.
+	held, err := allocator.acquireState(key, slot)
+	require.NoError(t, err)
+	require.Same(t, state, held)
+	allocator.cleanupIdle()
+	current, ok := slot.Load(key)
+	require.True(t, ok)
+	require.Same(t, held, current)
+	b, err := allocator.FetchNext(context.Background(), key)
+	require.NoError(t, err)
+	require.EqualValues(t, 10, b)
+	a, _, err := held.allocateBlockSlow(context.Background(), allocator.scope(), key, 2,
+		allocator.cfg, allocator.now)
+	held.release()
+	require.NoError(t, err)
+	c, err := allocator.FetchNext(context.Background(), key)
+	require.NoError(t, err)
+	assert.Greater(t, a, b)
+	assert.Greater(t, c, a+1)
+	assert.Zero(t, state.references.Load())
+}
+
+func TestRetiredKeyStateCannotBeAcquiredOrAllocated(t *testing.T) {
+	state := &keyState{}
+	require.True(t, state.references.CompareAndSwap(0, -1))
+	assert.False(t, state.acquire())
+	_, err := state.beginLinearization()
+	require.Error(t, err)
+}
+
+func TestKeyStateAcquisitionAndRetirementAreExclusive(t *testing.T) {
+	for range 100 {
+		state := &keyState{}
+		start := make(chan struct{})
+		acquired := make(chan bool, 1)
+		go func() { <-start; acquired <- state.acquire() }()
+		close(start)
+		retired := state.references.CompareAndSwap(0, -1)
+		held := <-acquired
+		assert.NotEqual(t, retired, held)
+		if held {
+			state.release()
+			assert.Zero(t, state.references.Load())
+		} else {
+			assert.EqualValues(t, -1, state.references.Load())
+		}
+	}
+}
+
+func TestBatchCancellationReleasesKeyReferences(t *testing.T) {
+	key := "cancelled-orders"
+	clock := &fakeClock{now: time.Unix(1000, 0)}
+	store := &blockingRangeStore{started: make(chan struct{}), release: make(chan struct{})}
+	allocator := readyAllocatorForCleanup(t, store, clock, key)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, err := allocator.FetchNextN(ctx, key, 2); done <- err }()
+	<-store.started
+	cancel()
+	require.Error(t, <-done)
+	_, state := allocatorKeyState(t, allocator, key)
+	assert.Zero(t, state.references.Load())
+}
+
 func TestAllocatorCleanupRespectsInterval(t *testing.T) {
 	key := "scheduled-cleanup-orders"
 	clock := &fakeClock{now: time.Unix(1500, 0)}
@@ -486,9 +614,9 @@ func TestNodeBaseTickCleansIdleAllocatorState(t *testing.T) {
 	state := &keyState{}
 	state.lastUsed.Store(clock.Now().Add(-11 * time.Minute).UnixNano())
 	slot.Store(key, state)
-	manager := &NodeManager{allocator: allocator, heartbeatTimeout: 3}
+	manager := &NodeManager{allocator: allocator}
 
-	manager.BaseTick()
+	manager.Maintain(context.Background())
 	_, loaded := slot.Load(key)
 	assert.False(t, loaded)
 }
@@ -627,7 +755,7 @@ func TestAllocatorReconcileAndCleanupDoNotBlockOnReservationIO(t *testing.T) {
 	// have to complete while it is still in flight.
 	reconcileDone := make(chan struct{})
 	go func() {
-		allocator.CommitRoute(2, 0, []uint32{SlotForKey(key)})
+		allocator.testAssignSlots([]uint32{SlotForKey(key)})
 		close(reconcileDone)
 	}()
 	select {

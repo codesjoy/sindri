@@ -117,7 +117,7 @@ func NewReadinessHandler(
 			}
 		}
 		if publisher != nil {
-			readiness := publisher.Readiness()
+			readiness := publisher.Readiness(time.Now())
 			stats := publisher.Stats()
 			body.Control = &controlReadinessBody{
 				Ready:          readiness.Ready,

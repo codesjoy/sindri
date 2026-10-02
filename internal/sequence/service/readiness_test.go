@@ -25,6 +25,7 @@ import (
 
 	testkit "github.com/codesjoy/sindri/internal/pkg/tests"
 	"github.com/codesjoy/sindri/internal/sequence/biz"
+	"github.com/codesjoy/sindri/internal/sequence/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -45,43 +46,6 @@ func (handlerSequenceRepo) ReserveRanges(
 // handlerOwnershipRepo reports every slot as unowned. A readiness verdict that
 // changed on this answer would mean the probe is reading ownership, which the
 // section D.3 rule forbids.
-type handlerOwnershipRepo struct{}
-
-func (handlerOwnershipRepo) LoadOwnership(
-	context.Context,
-	[]uint32,
-) ([]biz.Ownership, error) {
-	return nil, nil
-}
-
-func (handlerOwnershipRepo) StorageClock(context.Context) (time.Time, error) {
-	return time.Now().UTC(), nil
-}
-
-func (handlerOwnershipRepo) ClaimSlots(
-	_ context.Context,
-	request biz.ClaimRequest,
-) ([]biz.ClaimOutcome, error) {
-	grants := make([]biz.ClaimOutcome, len(request.Slots))
-	for index, slot := range request.Slots {
-		grants[index] = biz.ClaimOutcome{Granted: true, Ownership: biz.Ownership{
-			SlotID: slot, OwnerNodeID: request.NodeID, OwnerInstanceID: request.InstanceID,
-			Epoch: 1, State: biz.SlotOwned,
-		}}
-	}
-	return grants, nil
-}
-
-func (handlerOwnershipRepo) RenewSlots(
-	context.Context,
-	biz.RenewRequest,
-) ([]biz.Ownership, error) {
-	return nil, nil
-}
-
-func (handlerOwnershipRepo) ReleaseSlots(context.Context, []biz.SlotAuthority) (int64, error) {
-	return 0, nil
-}
 
 type handlerMemorySampler struct{}
 
@@ -112,7 +76,7 @@ func newProbeAllocator(t *testing.T) *biz.Allocator {
 	return biz.NewAllocator(
 		plane,
 		handlerSequenceRepo{},
-		handlerOwnershipRepo{},
+		testutil.NewAuthority(),
 		handlerMemorySampler{},
 		slog.Default(),
 	)
@@ -137,7 +101,6 @@ func (handlerPublisherRepo) MaterialiseRoute(
 	context.Context,
 	[]biz.OwnershipSegment,
 	int64,
-	int,
 	biz.CoordinatorLease,
 ) (biz.PublishResult, error) {
 	return biz.PublishResult{Revision: 1, PayloadBytes: 64}, nil
@@ -160,7 +123,6 @@ func newProbePublisher(t *testing.T) *biz.Publisher {
 	return biz.NewPublisher(
 		biz.ControlPlaneConfig{
 			LayoutVersion:     1,
-			RouteRetention:    64,
 			CoordinatorLease:  10 * time.Second,
 			ReconcileInterval: time.Minute,
 			PassTimeout:       time.Second,
@@ -215,10 +177,18 @@ func TestReadinessProbeFailsBeforeTheFirstRoute(t *testing.T) {
 
 func TestReadinessProbeSucceedsOnceARouteIsApplied(t *testing.T) {
 	allocator := newProbeAllocator(t)
-	allocator.Open(1, 0, []uint32{0})
-	allocator.ApplyRoute(0)
+	allocator.RenewLeases()
 
+	// A live lease is not a route: the instance is registered and renewing, but
+	// it has nothing to answer from yet, so it must still fail the probe.
 	status, body := probe(t, allocator, nil)
+	assert.Equal(t, http.StatusServiceUnavailable, status)
+	assert.False(t, body.Ready)
+	assert.Equal(t, "initializing", body.Reason)
+
+	// Applying a route is what moves it into service.
+	allocator.MarkRouteApplied()
+	status, body = probe(t, allocator, nil)
 
 	assert.Equal(t, http.StatusOK, status)
 	assert.True(t, body.Ready)
@@ -230,8 +200,7 @@ func TestReadinessProbeSucceedsOnceARouteIsApplied(t *testing.T) {
 // would be the last thing it says.
 func TestReadinessProbeFailsWhileStopping(t *testing.T) {
 	allocator := newProbeAllocator(t)
-	allocator.Open(2, 0, []uint32{0})
-	allocator.ApplyRoute(0)
+	allocator.RenewLeases()
 	allocator.Shutdown()
 
 	status, body := probe(t, allocator, nil)
@@ -253,8 +222,8 @@ func TestReadinessProbeStaysReadyThroughStorageLossAndEmptySlots(t *testing.T) {
 	// A node that applied a route while holding no slots at all: the slot set is
 	// empty and every ownership read fails, which is the worst case this rule
 	// has to survive.
-	allocator.Open(3, 0, nil)
-	allocator.ApplyRoute(0)
+	allocator.RenewLeases()
+	allocator.MarkRouteApplied()
 	allocator.Pause()
 
 	status, body := probe(t, allocator, nil)
@@ -298,8 +267,8 @@ func TestControlReadinessProbeSucceedsOnceTheLoopHasPassed(t *testing.T) {
 // failure a probe has to surface.
 func TestCombinedReadinessIsTheConjunctionOfBothHalves(t *testing.T) {
 	allocator := newProbeAllocator(t)
-	allocator.Open(1, 0, []uint32{0})
-	allocator.ApplyRoute(0)
+	allocator.RenewLeases()
+	allocator.MarkRouteApplied()
 
 	status, body := probe(t, allocator, newProbePublisher(t))
 
@@ -314,8 +283,8 @@ func TestCombinedReadinessIsTheConjunctionOfBothHalves(t *testing.T) {
 
 func TestCombinedReadinessReportsBothHalvesServing(t *testing.T) {
 	allocator := newProbeAllocator(t)
-	allocator.Open(1, 0, []uint32{0})
-	allocator.ApplyRoute(0)
+	allocator.RenewLeases()
+	allocator.MarkRouteApplied()
 	publisher := newProbePublisher(t)
 	require.NoError(t, publisher.Pass(context.Background()))
 

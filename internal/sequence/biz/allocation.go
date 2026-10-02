@@ -15,11 +15,13 @@
 package biz
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
 	"math"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,6 +54,9 @@ type keyState struct {
 	recentBlock atomic.Int64
 	rateGate    atomic.Int64
 	retired     atomic.Bool
+	// Negative references permanently close the cache entry; acquisition and
+	// eviction compete on the same atomic word rather than on lastUsed.
+	references atomic.Int64
 
 	mu           sync.Mutex
 	activeStep   int64
@@ -63,6 +68,39 @@ type keyState struct {
 
 	rateMu sync.Mutex
 	rate   keyRateEstimator
+}
+
+func (k *keyState) acquire() bool {
+	for refs := k.references.Load(); refs >= 0; refs = k.references.Load() {
+		if k.references.CompareAndSwap(refs, refs+1) {
+			return true
+		}
+	}
+	return false
+}
+
+func (k *keyState) release() { k.references.Add(-1) }
+
+func (obj *Allocator) acquireState(key string, slot *allocationSlot) (*keyState, error) {
+	// Cleanup holds the write lock through retirement and removal. This lock
+	// covers cache access only, never range preparation or database I/O.
+	obj.slotsMu.RLock()
+	defer obj.slotsMu.RUnlock()
+	if err := obj.checkAllocationSlot(slot); err != nil {
+		return nil, err
+	}
+	state, ok := slot.Load(key)
+	if !ok {
+		var err error
+		state, err = obj.loadOrCreateState(key, slot)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !state.acquire() {
+		return nil, authorityError(ErrAuthorityChanged)
+	}
+	return state, nil
 }
 
 func (k *keyState) allocate(
@@ -133,6 +171,9 @@ func (k *keyState) gateReading() int64 {
 }
 
 func (k *keyState) beginLinearization() (int64, error) {
+	if k.references.Load() < 0 {
+		return 0, authorityError(ErrAuthorityChanged)
+	}
 	started := k.gateReading()
 	if k.allocator != nil {
 		if err := k.allocator.checkAllocationSlot(k.slot); err != nil {
@@ -229,6 +270,158 @@ func (k *keyState) allocateSlow(
 			return 0, 0, err
 		}
 	}
+}
+
+// linearizationObservation is one allocation as it was handed out.
+//
+// It carries what appendix F.2 asks a test to record, because the property the
+// protocol promises is about this sequence and cannot be checked from a single
+// process's state: an allocation that hands out a lower id than one a caller
+// already received is the violation, and only the sequence shows it.
+type linearizationObservation struct {
+	Key              string
+	ID               int64
+	OwnerInstanceID  string
+	Epoch            uint64
+	Generation       uint64
+	LinearizationSeq uint64
+	RequestStart     time.Time
+	ResponseReceived time.Time
+}
+
+// LinearizationCounters are the three that must stay at zero (appendix F.1).
+//
+// They are separate counters rather than one because they mean different things
+// to whoever has to read them: an ordering violation says the protocol's own
+// promise was broken, a duplicate says the same id reached two callers, and a
+// stale delivery says an id arrived after a larger one. The third is the mildest
+// to read and the most direct symptom of the failure this whole design exists to
+// prevent.
+type LinearizationCounters struct {
+	// EvictedKeys counts forgotten LRU baselines, not ordering violations.
+	EvictedKeys          int64
+	OrderViolations      int64
+	DuplicateDeliveries  int64
+	StaleDeliveries      int64
+	Recorded             int64
+	OrderViolationDetail string
+}
+
+// linearizationRecorder keeps a bounded record of allocations and checks the
+// ordering property as they arrive.
+//
+// The check is the caller's own observable one (section 1.3): if allocation A
+// returned before request B started, then B's id must be greater. That is a
+// narrower test than a global linearisation order -- two overlapping requests are
+// not compared -- but everything it flags is a real violation, and it needs no
+// coordination between nodes. Only this process's retained observations are
+// compared: the recorder is not a complete cross-node ordering audit.
+//
+// Recording is off unless a deployment asks for it. The bound is what keeps it
+// affordable when it is on: both the observation ring and the per-key LRU are
+// bounded by capacity. Eviction forgets a key's baseline; cumulative counters
+// survive eviction and ring replacement.
+type linearizationRecorder struct {
+	capacity int
+
+	mu           sync.Mutex
+	ring         []linearizationObservation
+	next         int
+	lastComplete map[string]*list.Element
+	lru          list.List
+	counters     LinearizationCounters
+}
+
+// newLinearizationRecorder constructs a recorder holding at most capacity
+// observations.
+func newLinearizationRecorder(capacity int) *linearizationRecorder {
+	if capacity <= 0 {
+		capacity = MaxLinearizationSamples
+	}
+	return &linearizationRecorder{
+		capacity:     capacity,
+		ring:         make([]linearizationObservation, 0, capacity),
+		lastComplete: make(map[string]*list.Element),
+	}
+}
+
+// record files one allocation and checks it against the last one for its key that
+// had already returned when this request started.
+func (r *linearizationRecorder) record(observation linearizationObservation) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.counters.Recorded++
+
+	entry := r.lastComplete[observation.Key]
+	if entry != nil &&
+		entry.Value.(linearizationObservation).ResponseReceived.Before(observation.RequestStart) {
+		previous := entry.Value.(linearizationObservation)
+		switch {
+		case observation.ID < previous.ID:
+			r.counters.StaleDeliveries++
+			r.counters.OrderViolations++
+			r.counters.OrderViolationDetail = detail(previous, observation)
+		case observation.ID == previous.ID:
+			r.counters.DuplicateDeliveries++
+			r.counters.OrderViolations++
+			r.counters.OrderViolationDetail = detail(previous, observation)
+		}
+	}
+	if entry == nil {
+		if len(r.lastComplete) == r.capacity {
+			oldest := r.lru.Back()
+			delete(r.lastComplete, oldest.Value.(linearizationObservation).Key)
+			r.lru.Remove(oldest)
+			r.counters.EvictedKeys++
+		}
+		r.lastComplete[observation.Key] = r.lru.PushFront(observation)
+	} else {
+		if observation.ResponseReceived.After(
+			entry.Value.(linearizationObservation).ResponseReceived,
+		) {
+			entry.Value = observation
+		}
+		r.lru.MoveToFront(entry)
+	}
+
+	if len(r.ring) < r.capacity {
+		r.ring = append(r.ring, observation)
+		return
+	}
+	r.ring[r.next] = observation
+	r.next = (r.next + 1) % r.capacity
+}
+
+func detail(previous, current linearizationObservation) string {
+	return previous.OwnerInstanceID + " handed out " +
+		strconv.FormatInt(previous.ID, 10) + " then " + current.OwnerInstanceID + " handed out " +
+		strconv.FormatInt(current.ID, 10) + " for key " + current.Key
+}
+
+// observations returns a copy of the recorded observations, oldest first.
+func (r *linearizationRecorder) observations() []linearizationObservation {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ordered := make([]linearizationObservation, 0, len(r.ring))
+	ordered = append(ordered, r.ring[r.next:]...)
+	ordered = append(ordered, r.ring[:r.next]...)
+	return ordered
+}
+
+// snapshot returns the accumulated counters.
+func (r *linearizationRecorder) snapshot() LinearizationCounters {
+	if r == nil {
+		return LinearizationCounters{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.counters
 }
 
 func (k *keyState) afterAllocate(
@@ -474,6 +667,8 @@ func refusedReservation(format string, args ...any) error {
 // than be flattened into a storage failure.
 func authorityError(err error) error {
 	switch {
+	case errors.Is(err, ErrAuthorityChanged):
+		return xerror.WrapWithReason(err, reason.Reason_SEQUENCE_OWNER_RECOVERING, "", nil)
 	case errors.Is(err, ErrSlotNotOwned):
 		return xerror.WrapWithReason(err, reason.Reason_SEQUENCE_SLOT_NOT_OWNER, "", nil)
 	case errors.Is(err, ErrLeaseExpired):
@@ -538,14 +733,11 @@ func (obj *Allocator) FetchNext(ctx context.Context, key string) (int64, error) 
 	); err != nil {
 		return 0, err
 	}
-	state, ok := slot.Load(key)
-	if !ok {
-		var err error
-		state, err = obj.loadOrCreateState(key, slot)
-		if err != nil {
-			return 0, err
-		}
+	state, err := obj.acquireState(key, slot)
+	if err != nil {
+		return 0, err
 	}
+	defer state.release()
 	id, err := state.allocate(ctx, obj.scope(), key, obj.cfg, obj.now)
 	if err != nil {
 		return 0, err
@@ -691,29 +883,15 @@ func (obj *Allocator) FetchNextBatch(
 	if err := obj.authorize(slots, entered); err != nil {
 		return nil, err
 	}
-	missing := 0
-	for index, request := range normalized {
-		state, ok := slotOf[index].Load(request.Key)
-		if !ok {
-			missing++
-			continue
+	defer func() {
+		for _, state := range states {
+			if state != nil {
+				state.release()
+			}
 		}
-		states[index] = state
-	}
-	if missing > 0 && obj.memoryHighWatermarkReached() {
-		obj.admissionRejected.Add(1)
-		return nil, xerror.NewWithReason(
-			reason.Reason_SEQUENCE_CAPACITY_EXHAUSTED,
-			"sequence allocator memory capacity is exhausted",
-			nil,
-		)
-	}
-
+	}()
 	for index, request := range normalized {
-		if states[index] != nil {
-			continue
-		}
-		state, err := obj.loadOrCreateState(request.Key, slotOf[index])
+		state, err := obj.acquireState(request.Key, slotOf[index])
 		if err != nil {
 			return nil, err
 		}

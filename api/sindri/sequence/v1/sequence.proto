@@ -91,18 +91,10 @@ message GetRouteResponse {
 }
 
 message RouteSnapshot {
-  // The directory revision this snapshot was materialised at. The field number
-  // and name are unchanged for older callers, but the value is now derived from
-  // storage ownership rather than entered by an operator, so it is renamed in
-  // prose: it identifies the ownership directory, not a hand-published route.
-  // It stays monotonically increasing, which is what the client's not-modified
-  // check and stale-route retry both depend on.
+  // The monotonically increasing directory revision of this ownership snapshot.
   int64 version = 1;
-  // Kept for callers that only understand node-level routing. Each node lists
-  // the slots it owns at this revision, so an older caller still selects the
-  // right node; it just cannot check a per-slot epoch. Owners are derived from
-  // segments below and never disagree with them.
-  repeated RouteNode nodes = 2;
+  reserved 2;
+  reserved "nodes";
   // Identifies the slot layout the epochs were minted under: slot count and the
   // key-to-slot function. A caller must discard a cached snapshot whose layout
   // version differs, because the same slot number then means a different key.
@@ -111,11 +103,6 @@ message RouteSnapshot {
   // sharing an owner instance and epoch. Slots owned by nobody are present with
   // an empty owner, so every slot is covered exactly once.
   repeated RouteSegment segments = 4;
-}
-
-message RouteNode {
-  string node_id = 1;
-  repeated uint32 slots = 2;
 }
 
 message RouteSegment {

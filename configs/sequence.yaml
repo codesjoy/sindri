@@ -96,13 +96,10 @@ app:
         # every heartbeat. Every node reads the second to decide which nodes a
         # slot may be assigned to, so two nodes sharing an id look like one.
         id: "${SKULD_SEQUENCE_NODE_ID}"
-        heartbeat_timeout_ticks: 3
-        # Bounds the heartbeat's one route read. The heartbeat runs on the tick
-        # schedule above, and a read that outlives it delays the route it was
-        # fetching; once heartbeat_timeout_ticks elapse without a successful
-        # heartbeat, allocation pauses. So this must stay well under
-        # heartbeat_timeout_ticks * base_tick_interval (3s with the values above),
-        # or a single slow read could pause a node that is otherwise fine.
+        heartbeat_interval: 1s
+        route_refresh_interval: 1s
+        handoff_interval: 250ms
+        # Route I/O does not block the independent instance renewal loop.
         route_query_timeout: 1s
       # Shared strong-consistency ownership protocol. There is one hot path: a
       # node owns a slot, pre-reserves a block of ids for it, and hands those out
@@ -154,10 +151,14 @@ app:
     controlplane:
       # Identifies the slot layout a published snapshot was minted under.
       layout_version: 1
-      # How many of the newest directory revisions stay in sequence_routes.
-      # Each publish deletes the older ones in the same transaction, so the
-      # table is bounded no matter how long the fleet runs.
-      route_retention: 64
+      active_publish_interval: 250ms
+      migration:
+        join_stability_window: 15s
+        batch_slots: 64
+        max_inflight: 256
+        max_per_source: 64
+        max_per_target: 64
+        max_planned: 1024
       # How long one replica keeps the publisher role. Only the holder writes
       # revisions, so two replicas cannot publish the same view twice.
       coordinator_lease: 10s
@@ -168,6 +169,3 @@ app:
       # Bounds one pass. It must stay inside coordinator_lease, because a pass
       # publishes under the tenure it acquired at its start.
       pass_timeout: 3s
-    ticker:
-      base_tick_interval: 1s
-      heartbeat_ticks: 1

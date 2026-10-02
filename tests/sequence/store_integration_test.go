@@ -46,7 +46,6 @@ import (
 	postgresgorm "gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
-	testkit "github.com/codesjoy/sindri/internal/pkg/tests"
 	sharedgorm "github.com/codesjoy/sindri/internal/pkg/xgorm"
 	"github.com/codesjoy/sindri/internal/sequence/biz"
 	sequencedata "github.com/codesjoy/sindri/internal/sequence/data"
@@ -151,57 +150,103 @@ func parseTestDialects(value string) (map[string]bool, error) {
 }
 
 func TestSequenceStoreContractAcrossDialects(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, item *harness) {
+		require.NoError(t, resetSequenceDatabase(t, item))
+		db := openGORM(t, item)
+		runRangeContract(t, db, item.name)
+		runBatchRangeContract(t, db, item.name)
+		runRouteContract(t, db, item.name)
+	})
+}
+
+// forEachDialect runs a dialect-scoped integration test once per enabled
+// database. Every contract test is written against the dialect as the variable
+// under test, so the loop lives in one helper rather than being repeated.
+func forEachDialect(t *testing.T, run func(t *testing.T, database *harness)) {
+	t.Helper()
 	for _, item := range harnesses {
 		t.Run(item.name, func(t *testing.T) {
-			db := openGORM(t, item)
-			runRangeContract(t, db, item.name)
-			runBatchRangeContract(t, db, item.name)
-			runRouteContract(t, db, item.name)
+			run(t, item)
 		})
 	}
 }
 
-// TestOwnershipOutboxMigrationRollsForwardAndBackAcrossDialects pins the one
-// migration whose Down section has to rebuild a dropped table: the outbox was
-// removed because nothing read it, so the rollback restores an empty table an
-// operator can still roll forward again.
-//
-// The provider is driven outside TestMain's single Up so both statements run on
-// a real server per dialect, and the migration is left in its Up state so the
-// rest of the suite sees the schema it expects.
-func TestOwnershipOutboxMigrationRollsForwardAndBackAcrossDialects(t *testing.T) {
-	// The migration immediately before the drop. Rolling back to it rebuilds the
-	// outbox; rolling forward again removes it.
-	const beforeOutboxDrop = int64(20261001000000)
-	for _, item := range harnesses {
-		t.Run(item.name, func(t *testing.T) {
-			ctx := context.Background()
-			provider, db, err := openMigrationProvider(item)
-			require.NoError(t, err)
-			defer func() { require.NoError(t, db.Close()) }()
-
-			exists, err := tableExists(ctx, db, item, "ownership_outbox")
-			require.NoError(t, err)
-			require.False(t, exists, "Up must leave the outbox dropped")
-
-			_, err = provider.DownTo(ctx, beforeOutboxDrop)
-			require.NoError(t, err)
-			exists, err = tableExists(ctx, db, item, "ownership_outbox")
-			require.NoError(t, err)
-			require.True(t, exists, "Down must rebuild the outbox")
-			var count int64
-			require.NoError(t, db.QueryRowContext(
-				ctx, "SELECT COUNT(*) FROM ownership_outbox",
-			).Scan(&count))
-			require.Zero(t, count, "the rebuilt outbox starts empty")
-
+// TestBaselineMigrationLifecycleInIsolatedDatabaseAcrossDialects pins the
+// baseline migration on an empty server per dialect: Up creates exactly the
+// seven tables and the 16,384 unowned slots once, a repeated Up is a no-op, the
+// legacy tables are absent, the slot bound is enforced, and Down removes the
+// final schema before a clean re-Up.
+func TestBaselineMigrationLifecycleInIsolatedDatabaseAcrossDialects(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, item *harness) {
+		ctx := context.Background()
+		start := startPostgres
+		if item.name == "mysql" {
+			start = startMySQL
+		}
+		isolated, err := start(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			require.NoError(t, isolated.terminate(stopCtx))
+		})
+		provider, db, err := openMigrationProvider(isolated)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, db.Close()) }()
+		tables := []string{
+			"sequence_ranges",
+			"sequence_slot_ownership",
+			"sequence_instance_leases",
+			"sequence_node_liveness",
+			"sequence_coordinator",
+			"sequence_route_snapshot",
+			"sequence_slot_handoffs",
+		}
+		for round := 0; round < 2; round++ {
 			_, err = provider.Up(ctx)
 			require.NoError(t, err)
-			exists, err = tableExists(ctx, db, item, "ownership_outbox")
+			results, err := provider.Up(ctx)
 			require.NoError(t, err)
-			require.False(t, exists, "rolling forward again must drop the outbox")
-		})
-	}
+			assert.Empty(t, results)
+			for _, table := range tables {
+				exists, err := tableExists(ctx, db, isolated, table)
+				require.NoError(t, err)
+				require.True(t, exists, table)
+			}
+			for _, table := range []string{"ownership_outbox", "slot_ownership", "sequence_routes", "sequence_route_state"} {
+				exists, err := tableExists(ctx, db, isolated, table)
+				require.NoError(t, err)
+				assert.False(t, exists, table)
+			}
+			var count, minSlot, maxSlot int64
+			require.NoError(
+				t,
+				db.QueryRowContext(ctx, "SELECT COUNT(*),MIN(slot_id),MAX(slot_id) FROM sequence_slot_ownership WHERE state='UNOWNED' AND owner_instance_id IS NULL AND epoch=0").
+					Scan(&count, &minSlot, &maxSlot),
+			)
+			assert.EqualValues(t, biz.SlotCount, count)
+			assert.Zero(t, minSlot)
+			assert.EqualValues(t, biz.SlotCount-1, maxSlot)
+			require.NoError(
+				t,
+				db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sequence_route_snapshot").
+					Scan(&count),
+			)
+			assert.Zero(t, count)
+			_, err = db.ExecContext(
+				ctx,
+				"INSERT INTO sequence_slot_ownership (slot_id) VALUES (16384)",
+			)
+			require.Error(t, err)
+			_, err = provider.DownTo(ctx, 0)
+			require.NoError(t, err)
+			for _, table := range tables {
+				exists, err := tableExists(ctx, db, isolated, table)
+				require.NoError(t, err)
+				assert.False(t, exists, table)
+			}
+		}
+	})
 }
 
 // TestSequenceProcessLifecycleAcrossDialects runs the real cmd/sequence binary
@@ -210,11 +255,9 @@ func TestOwnershipOutboxMigrationRollsForwardAndBackAcrossDialects(t *testing.T)
 // and the database state its shutdown hooks leave behind, so those are what the
 // test pins rather than the internal shape of the composition.
 func TestSequenceProcessLifecycleAcrossDialects(t *testing.T) {
-	for _, item := range harnesses {
-		t.Run(item.name, func(t *testing.T) {
-			runSequenceProcessLifecycle(t, item)
-		})
-	}
+	forEachDialect(t, func(t *testing.T, item *harness) {
+		runSequenceProcessLifecycle(t, item)
+	})
 }
 
 func runSequenceProcessLifecycle(t *testing.T, database *harness) {
@@ -237,7 +280,7 @@ func runSequenceProcessLifecycle(t *testing.T, database *harness) {
 		})
 
 		// A data process that has never been given a route cannot serve.
-		status, report, err := probeSequenceReadiness(process.readyURL)
+		status, report, err := probeReadiness(process.readyURL)
 		require.NoError(t, err)
 		assert.Equal(t, http.StatusServiceUnavailable, status)
 		assert.False(t, report.Ready)
@@ -253,7 +296,7 @@ func runSequenceProcessLifecycle(t *testing.T, database *harness) {
 		// directory, and the process claims what its own heartbeat reads.
 		publishDiscoveryRoute(t, database, allSlots(nodeID))
 		require.Eventually(t, func() bool {
-			status, report, probeErr := probeSequenceReadiness(process.readyURL)
+			status, report, probeErr := probeReadiness(process.readyURL)
 			return probeErr == nil && status == http.StatusOK && report.Ready &&
 				report.Data != nil && report.Data.Reason == "serving"
 		}, discoveryTestTimeout, 50*time.Millisecond,
@@ -290,7 +333,7 @@ func runSequenceProcessLifecycle(t *testing.T, database *harness) {
 			modeOverride:   "control",
 		})
 		require.Eventually(t, func() bool {
-			status, report, probeErr := probeSequenceReadiness(process.readyURL)
+			status, report, probeErr := probeReadiness(process.readyURL)
 			return probeErr == nil && status == http.StatusOK && report.Ready &&
 				report.Control != nil && report.Data == nil
 		}, discoveryTestTimeout, 50*time.Millisecond, "control readiness never turned green")
@@ -306,8 +349,8 @@ func ownedInstanceForNode(t *testing.T, db *gorm.DB, nodeID string) string {
 	t.Helper()
 	var instanceID string
 	require.NoError(t, db.Raw(
-		"SELECT owner_instance_id FROM slot_ownership "+
-			"WHERE owner_node_id = ? AND owner_instance_id IS NOT NULL LIMIT 1",
+		"SELECT o.owner_instance_id FROM sequence_slot_ownership o JOIN sequence_instance_leases i ON o.owner_instance_id=i.instance_id "+
+			"WHERE i.node_id = ? LIMIT 1",
 		nodeID,
 	).Scan(&instanceID).Error)
 	return instanceID
@@ -422,6 +465,10 @@ func claimOwnedSlots(
 ) biz.ReservationAuthority {
 	t.Helper()
 	ownership := sequencedata.NewOwnershipData(db)
+	ctx := context.Background()
+	require.NoError(t, ownership.RegisterInstance(ctx, "test-node", instanceID))
+	snapshot, err := ownership.InstanceAuthority(ctx, instanceID)
+	require.NoError(t, err)
 	slots := make([]uint32, 0, len(keys))
 	seen := make(map[uint32]struct{}, len(keys))
 	for _, key := range keys {
@@ -432,11 +479,13 @@ func claimOwnedSlots(
 		seen[slot] = struct{}{}
 		slots = append(slots, slot)
 	}
-	outcomes, err := ownership.ClaimSlots(context.Background(), biz.ClaimRequest{
+	outcomes, err := ownership.ClaimSlots(ctx, biz.ClaimRequest{
 		Slots:       slots,
 		NodeID:      "test-node",
 		InstanceID:  instanceID,
-		QuietWindow: 0,
+		Revision:    snapshot.Lease.Revision,
+		Lease:       time.Minute,
+		QuietWindow: time.Minute,
 	})
 	require.NoError(t, err)
 	require.Len(t, outcomes, len(slots))
@@ -444,7 +493,18 @@ func claimOwnedSlots(
 		require.True(t, outcome.Granted,
 			"slot %d must be granted to %s", outcome.Ownership.SlotID, instanceID)
 	}
-	return biz.ReservationAuthority{InstanceID: instanceID}
+	snapshot, err = ownership.InstanceAuthority(ctx, instanceID)
+	require.NoError(t, err)
+	authority := biz.ReservationAuthority{
+		InstanceID: instanceID,
+		Revision:   snapshot.Lease.Revision,
+		Lease:      time.Minute,
+		Epochs:     map[uint32]uint64{},
+	}
+	for _, o := range snapshot.Slots {
+		authority.Epochs[o.SlotID] = o.Epoch
+	}
+	return authority
 }
 
 func reserveRange(
@@ -617,11 +677,18 @@ func runRouteContract(t *testing.T, db *gorm.DB, prefix string) {
 	if prefix == "mysql" {
 		baseVersion = 20
 	}
-	for _, version := range []int64{baseVersion, baseVersion + 1} {
-		require.NoError(t, db.Create(&sequencedata.RouteModel{
-			Version: version, Payload: completeRoutePayload(t), CreatedAt: time.Now().UTC(),
-		}).Error)
-	}
+	require.NoError(t, db.Exec("DELETE FROM sequence_route_snapshot").Error)
+	require.NoError(
+		t,
+		db.Create(
+			&sequencedata.RouteModel{
+				ID:        1,
+				Version:   baseVersion + 1,
+				Payload:   completeRoutePayload(t),
+				UpdatedAt: time.Now().UTC(),
+			},
+		).Error,
+	)
 	route, err := store.GetNewerRoute(context.Background(), 0)
 	require.NoError(t, err)
 	require.NotNil(t, route)
@@ -637,17 +704,15 @@ func runRouteContract(t *testing.T, db *gorm.DB, prefix string) {
 
 func completeRoutePayload(t *testing.T) []byte {
 	t.Helper()
-	view := make([]biz.Ownership, int(biz.SlotCount))
-	for index := range view {
-		view[index] = biz.Ownership{
-			SlotID:          uint32(index),
-			State:           biz.SlotOwned,
-			OwnerNodeID:     "node-a",
-			OwnerInstanceID: "instance-a",
-			Epoch:           1,
-		}
-	}
-	payload, err := biz.EncodeOwnershipView(view, 1)
+	view := []biz.OwnershipSegment{{
+		StartSlot: 0, EndSlot: biz.SlotCount - 1,
+		State:           biz.SlotOwned,
+		OwnerNodeID:     "node-a",
+		OwnerInstanceID: "instance-a",
+		Epoch:           1,
+		GrantAgeKnown:   true,
+	}}
+	payload, err := biz.EncodeOwnershipSegments(view, 1)
 	require.NoError(t, err)
 	return payload
 }
@@ -851,107 +916,3 @@ func waitForDatabase(ctx context.Context, driver, dsn string) error {
 		}
 	}
 }
-
-// TestCrashFailoverAcrossDialects covers the crash-failover path against a real
-// database, which is where its correctness lives: a node that stops leaves its
-// grant behind, and the claim that follows has to be granted by the authority's
-// own clock rather than by anything the departed node did.
-//
-// The scenario is a node that stopped. Its grant ages past the quiet window, and
-// nothing rewrites its ownership row -- only an explicit release does, and a dead
-// process cannot issue one -- so the slot stays stranded until another node is
-// told to take it. The directory that tells it so is published directly, the way
-// an operator or the control plane would: sequence reads routes and claims what
-// they grant, and that is the whole path under test.
-func TestCrashFailoverAcrossDialects(t *testing.T) {
-	for _, item := range harnesses {
-		t.Run(item.name, func(t *testing.T) {
-			db := openGORM(t, item)
-			ctx := context.Background()
-			// The directory is published at version 1 below, so the table has to
-			// start empty: another test in this package may have left a route
-			// behind, and the version is the primary key.
-			require.NoError(t, resetSequenceDatabase(t, item))
-			const (
-				deadNode    = "node-failover-dead"
-				deadProcess = "instance-failover-dead"
-				survivor    = "node-failover-live"
-				quietWindow = 50 * time.Millisecond
-				// How many heartbeats the route takes to become active on, which is
-				// the node's own HeartbeatTimeoutTicks.
-				applyTicks = 3
-			)
-			slot := uint32(42)
-
-			ownership := sequencedata.NewOwnershipData(db)
-			base := resetSlot(t, ownership, slot).Epoch
-			granted, err := ownership.ClaimSlots(ctx, biz.ClaimRequest{
-				Slots:       []uint32{slot},
-				NodeID:      deadNode,
-				InstanceID:  deadProcess,
-				QuietWindow: 0,
-			})
-			require.NoError(t, err)
-			require.True(t, granted[0].Granted)
-
-			// A takeover is only legal once that much storage time has passed.
-			time.Sleep(quietWindow + 50*time.Millisecond)
-
-			plane := biz.DataPlaneConfig{
-				Allocator: biz.AllocatorConfig{DefaultStep: 10, MaxStep: 100},
-				Node: biz.NodeConfig{
-					ID:                    survivor,
-					HeartbeatTimeoutTicks: applyTicks,
-					RouteQueryTimeout:     time.Second,
-				},
-				HA: biz.HAConfig{
-					QuietWindow:   quietWindow,
-					LeaseDuration: 10 * time.Second,
-					MaxPause:      time.Second,
-					NodeTTL:       time.Minute,
-				},
-			}
-			require.NoError(t, testkit.DecodeDefaults(&plane))
-			allocator := biz.NewAllocator(
-				plane,
-				sequencedata.NewSequenceData(db),
-				ownership,
-				failoverSampler{},
-				nil,
-			)
-
-			// The directory is materialised from the authority as it stands: the
-			// departed node's grant is still on the row and already past the quiet
-			// window, and it renews no liveness lease, so the surviving node's own
-			// plan hands it the stranded slot along with everything else. The claim
-			// is what makes the handover real.
-			publishSeededRoute(t, db)
-			placement := sequencedata.NewPlacementData(db)
-			manager := biz.NewNodeManager(
-				plane,
-				allocator,
-				sequencedata.NewRouteModel(db),
-				sequencedata.NewLivenessData(db),
-				placement,
-				biz.NewRouteCache(),
-				nil,
-				nil,
-			)
-			// The heartbeat installs the directory and schedules the claim for the
-			// tick the route becomes active on; driving the allocator to that tick
-			// performs the takeover, which a real fleet reaches one base tick later.
-			manager.Heartbeat()
-			allocator.ApplyRoute(applyTicks)
-
-			after := loadSlotOwnership(t, ownership, slot)
-			assert.Equal(t, biz.SlotOwned, after.State)
-			assert.Equal(t, allocator.InstanceID(), after.OwnerInstanceID,
-				"the surviving node must own the slot the departed one left behind")
-			assert.Greater(t, after.Epoch, base+1, "the takeover starts a new epoch")
-		})
-	}
-}
-
-type failoverSampler struct{}
-
-func (failoverSampler) MemoryUsage() (uint64, uint64) { return 1, math.MaxInt64 }

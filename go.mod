@@ -13,8 +13,8 @@ require (
 	github.com/codesjoy/pkg/basic/transaction/gorm v0.0.0-20260328013517-15736fbea914
 	github.com/codesjoy/pkg/basic/xerror v0.0.0-20260812100337-f4b6f4ac7d17
 	github.com/codesjoy/pkg/basic/xgorm v0.0.0-20260514091847-8c522c350e05
-	github.com/codesjoy/sindri/gen/go/sequence v0.1.0
-	github.com/codesjoy/sindri/pkg/sequence v0.1.0
+	github.com/codesjoy/sindri/gen/go/sequence v0.2.0
+	github.com/codesjoy/sindri/pkg/sequence v0.2.0
 	github.com/codesjoy/yggdrasil-ecosystem/modules/etcd/v3 v3.0.0-20260429033927-d1bc68f367b9
 	github.com/codesjoy/yggdrasil-ecosystem/modules/otlp/v3 v3.0.0-20260429033927-d1bc68f367b9
 	github.com/codesjoy/yggdrasil-ecosystem/modules/polaris/v3 v3.0.0-20260429033927-d1bc68f367b9

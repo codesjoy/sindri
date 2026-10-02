@@ -32,20 +32,6 @@ import (
 	"google.golang.org/genproto/googleapis/rpc/code"
 )
 
-// keyInSlotRange returns a key that hashes into a slot range, so a test can build
-// a batch whose keys land in chosen segments.
-func keyInSlotRange(t *testing.T, from, to uint32) string {
-	t.Helper()
-	for i := 0; i < 1_000_000; i++ {
-		key := "key-" + strconv.Itoa(i)
-		if slot := SlotForKey(key); slot >= from && slot < to {
-			return key
-		}
-	}
-	t.Fatalf("no key hashes into slots [%d,%d)", from, to)
-	return ""
-}
-
 // TestSequenceInterceptorSendsTheLayoutAndEpoch pins appendix A.3 from the caller
 // side: every attempt carries the slot layout its keys were hashed under and the
 // epoch it believes the target slot is at, which is what lets an owner tell a
@@ -69,6 +55,7 @@ func TestSequenceInterceptorSendsTheLayoutAndEpoch(t *testing.T) {
 			assert.Equal(t, []string{"9"}, outgoing.Get(LayoutVersionMetaKey))
 			assert.Equal(t, []string{"5"}, outgoing.Get(SlotEpochMetaKey))
 			response.(*sequencev1.FetchNextResponse).Id = 42
+			response.(*sequencev1.FetchNextResponse).Count = 1
 			return nil
 		},
 	)
@@ -80,7 +67,7 @@ func TestSequenceInterceptorSendsTheLayoutAndEpoch(t *testing.T) {
 // TestSequenceInterceptorSendsNoEpochWithoutAnOwnershipView pins the other half:
 // a snapshot that carries no segments must not make the caller invent an epoch,
 // because an invented one is a claim about ownership the caller cannot make.
-func TestSequenceInterceptorSendsNoEpochWithoutAnOwnershipView(t *testing.T) {
+func TestSequenceInterceptorAlwaysSendsAuthorityHints(t *testing.T) {
 	router := newSegmentedTestRouter(t, testRoute(3, "node-a"))
 	middleware := newUnaryClientInterceptor(router)
 	err := middleware(
@@ -91,9 +78,10 @@ func TestSequenceInterceptorSendsNoEpochWithoutAnOwnershipView(t *testing.T) {
 		func(ctx context.Context, _ string, _, response any) error {
 			outgoing, ok := metadata.FromOutContext(ctx)
 			require.True(t, ok)
-			assert.Empty(t, outgoing.Get(SlotEpochMetaKey))
-			assert.Empty(t, outgoing.Get(LayoutVersionMetaKey))
+			assert.Equal(t, []string{"1"}, outgoing.Get(SlotEpochMetaKey))
+			assert.Equal(t, []string{"1"}, outgoing.Get(LayoutVersionMetaKey))
 			response.(*sequencev1.FetchNextResponse).Id = 1
+			response.(*sequencev1.FetchNextResponse).Count = 1
 			return nil
 		},
 	)
@@ -162,7 +150,7 @@ func TestSequenceInterceptorRefreshesAndRetriesRouteErrorOnce(t *testing.T) {
 			outgoing, ok := metadata.FromOutContext(ctx)
 			require.True(t, ok)
 			require.Equal(t, []string{strconv.Itoa(calls)}, outgoing.Get(VersionMetaKey))
-			slot, ok := SlotFromContext(ctx)
+			slot, ok := slotFromContext(ctx)
 			require.True(t, ok)
 			require.Equal(t, SlotForKey("orders"), slot)
 			if calls == 1 {
@@ -175,6 +163,7 @@ func TestSequenceInterceptorRefreshesAndRetriesRouteErrorOnce(t *testing.T) {
 			}
 			require.Zero(t, response.(*sequencev1.FetchNextResponse).GetId())
 			response.(*sequencev1.FetchNextResponse).Id = 42
+			response.(*sequencev1.FetchNextResponse).Count = 1
 			return nil
 		},
 	)
@@ -373,7 +362,7 @@ func TestSequenceInterceptorValidatesRequestedCount(t *testing.T) {
 			return nil
 		},
 	)
-	require.NoError(t, err, "legacy count=0 response is accepted for a single ID")
+	require.ErrorIs(t, err, ErrCountUnsupported, "count=0 is never a valid response")
 }
 
 func TestSequenceInterceptorRoutesHomogeneousBatch(t *testing.T) {
@@ -392,7 +381,7 @@ func TestSequenceInterceptorRoutesHomogeneousBatch(t *testing.T) {
 		&sequencev1.FetchNextBatchRequest{Requests: requests},
 		reply,
 		func(ctx context.Context, _ string, _, response any) error {
-			slot, ok := SlotFromContext(ctx)
+			slot, ok := slotFromContext(ctx)
 			require.True(t, ok)
 			assert.Equal(t, SlotForKey("orders"), slot)
 			outgoing, ok := metadata.FromOutContext(ctx)

@@ -18,13 +18,10 @@ package sequence_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	toxiclient "github.com/Shopify/toxiproxy/v2/client"
@@ -51,7 +48,6 @@ import (
 	tctoxiproxy "github.com/testcontainers/testcontainers-go/modules/toxiproxy"
 	"github.com/testcontainers/testcontainers-go/network"
 	"github.com/testcontainers/testcontainers-go/wait"
-	"google.golang.org/genproto/googleapis/rpc/code"
 )
 
 const (
@@ -281,7 +277,9 @@ app:
         reserve_timeout: 1s
       node:
         id: %s
-        heartbeat_timeout_ticks: 3
+        heartbeat_interval: 50ms
+        route_refresh_interval: 50ms
+        handoff_interval: 50ms
         route_query_timeout: 150ms
       # The quiet window is deliberately short here: these tests assert protocol
       # behaviour, not the platform's real pause bound, and the suite's recovery
@@ -329,9 +327,6 @@ app:
         # so the TTL is scaled the same way the lease was. It still has to exceed
         # the heartbeat period by a wide margin (50ms here).
         node_ttl: %s
-    ticker:
-      base_tick_interval: 50ms
-      heartbeat_ticks: 1
 `,
 		s.h.driver,
 		dsn,
@@ -384,12 +379,7 @@ app:
 		}
 		s.Require().NoError(err)
 	}
-	endpoint, err := s.proxyContainer.PortEndpoint(
-		s.ctx,
-		nat.Port(fmt.Sprintf("%d/tcp", grpcProxyPort)),
-		"",
-	)
-	s.Require().NoError(err)
+	endpoint := s.proxyEndpoint(grpcProxyPort)
 	readyPort, err := container.MappedPort(s.ctx, "8080/tcp")
 	s.Require().NoError(err)
 	host, err := container.Host(s.ctx)
@@ -400,6 +390,25 @@ app:
 		grpcAddr:  endpoint,
 		readyAddr: fmt.Sprintf("http://%s:%s%s", host, readyPort.Port(), service.ReadinessPath),
 	}
+}
+
+// proxyEndpoint resolves the host address of one of the toxiproxy container's
+// published proxy ports. The container reports itself ready before Docker has
+// necessarily surfaced every published-port binding under a loaded host, so the
+// lookup is retried here instead of failing the whole test in setup on a
+// container-start race.
+func (s *SequenceSystemSuite) proxyEndpoint(port int) string {
+	target := nat.Port(fmt.Sprintf("%d/tcp", port))
+	var endpoint string
+	s.Require().Eventually(func() bool {
+		resolved, err := s.proxyContainer.PortEndpoint(s.ctx, target, "")
+		if err != nil {
+			return false
+		}
+		endpoint = resolved
+		return true
+	}, time.Minute, 100*time.Millisecond, "toxiproxy port %s never resolved", target)
+	return endpoint
 }
 
 func (s *SequenceSystemSuite) restartNode(id string) {
@@ -426,12 +435,12 @@ func (s *SequenceSystemSuite) resetDatabase() error {
 	// anything.
 	statements := []string{
 		"DELETE FROM sequence_ranges",
-		"DELETE FROM sequence_routes",
+		"DELETE FROM sequence_route_snapshot",
 		"DELETE FROM sequence_node_liveness",
-		"UPDATE sequence_route_state SET revision = 1",
+		"DELETE FROM sequence_slot_handoffs",
 		"UPDATE sequence_coordinator SET owner_instance_id = NULL, expires_at = NULL WHERE id = 1",
-		"UPDATE slot_ownership SET owner_node_id = NULL, owner_instance_id = NULL, " +
-			"epoch = 0, granted_at = NULL, state = 'UNOWNED'",
+		"UPDATE sequence_slot_ownership SET owner_instance_id = NULL, epoch = 0, state = 'UNOWNED'",
+		"DELETE FROM sequence_instance_leases",
 	}
 	for _, statement := range statements {
 		if err := db.Exec(statement).Error; err != nil {
@@ -481,7 +490,7 @@ func (s *SequenceSystemSuite) publishRoute(owners map[string][]uint32) int64 {
 	// reasoning, they simply read the new view when the database answers again.
 	s.quiesceDatabase()
 	db := openGORM(s.T(), s.h)
-	seedSlotOwnership(s.T(), db, owners)
+	seedSlotOwnership(s.T(), db, owners, systemLeaseDuration, systemNodeTTL)
 	version := publishSeededRoute(s.T(), db)
 	s.resumeDatabase()
 	return version
@@ -569,9 +578,10 @@ func (s *SequenceSystemSuite) waitForBootstrapAllocation(key string) int64 {
 	var lastErr error
 	converged := assert.Eventually(s.T(), func() bool {
 		var owner string
-		if err := db.Table("slot_ownership").
-			Select("owner_node_id").
-			Where("slot_id = ?", biz.SlotForKey(key)).
+		if err := db.Table("sequence_slot_ownership o").
+			Joins("JOIN sequence_instance_leases i ON i.instance_id=o.owner_instance_id").
+			Select("i.node_id").
+			Where("o.slot_id = ?", biz.SlotForKey(key)).
 			Scan(&owner).Error; err != nil || owner == "" {
 			lastErr = fmt.Errorf("owner read: %w", err)
 			return false
@@ -630,7 +640,11 @@ func (s *SequenceSystemSuite) waitForOwnership(nodeID, key string, version int64
 // outage has to wait for this first: while the node is outside the live set its
 // slots are planned onto its peer, and the stage would hand them there instead.
 func (s *SequenceSystemSuite) waitForLiveNode(nodeID string) {
-	placement := sequencedata.NewPlacementData(openGORM(s.T(), s.h))
+	placement := sequencedata.NewPlacementData(
+		openGORM(s.T(), s.h),
+		systemLeaseDuration,
+		systemNodeTTL,
+	)
 	s.Require().Eventually(func() bool {
 		live, err := placement.LiveNodes(s.ctx, systemNodeTTL)
 		if err != nil {
@@ -717,7 +731,7 @@ func (s *SequenceSystemSuite) routedClient() sequencev1.SequenceGeneratorClient 
 		"sequence-routed",
 		endpoints,
 		sequencepkg.BalancerType,
-		sequencepkg.NewRoutingModule(router),
+		sequencepkg.NewModule(router),
 		true,
 	)
 	s.clients["sequence-routed"] = client
@@ -783,211 +797,34 @@ func (s *SequenceSystemSuite) watermark(key string) int64 {
 	return model.ReservedEnd
 }
 
-func allowedTransient(err error) bool {
-	if err == nil {
-		return true
-	}
-	return xerror.IsCode(err, code.Code_UNAVAILABLE) ||
-		xerror.IsCode(err, code.Code_DEADLINE_EXCEEDED) ||
-		xerror.IsCode(err, code.Code_CANCELLED) ||
-		errors.Is(err, context.DeadlineExceeded) ||
-		errors.Is(err, context.Canceled) ||
-		xerror.IsReason(err, reason.Reason_SEQUENCE_ALLOCATOR_PAUSED) ||
-		xerror.IsReason(err, reason.Reason_SEQUENCE_ROUTE_EXPIRED) ||
-		xerror.IsReason(err, reason.Reason_SEQUENCE_SLOT_NOT_OWNER) ||
-		xerror.IsReason(err, reason.Reason_SEQUENCE_ROUTE_UNAVAILABLE)
+// slotEpoch reads the generation of the slot a key maps to, so a failover test
+// can assert that ownership moved by exactly one epoch rather than only that
+// some new owner appeared.
+func (s *SequenceSystemSuite) slotEpoch(key string) uint64 {
+	db := openGORM(s.T(), s.h)
+	var epoch uint64
+	s.Require().NoError(db.Raw(
+		"SELECT epoch FROM sequence_slot_ownership WHERE slot_id = ?",
+		biz.SlotForKey(key),
+	).Scan(&epoch).Error)
+	return epoch
 }
 
-// allocationObservation is one allocation attempt as observed by a client.
+// refusedWhileStorageUnavailable reports whether err is the refusal a node
+// returns when it cannot reach the authority.
 //
-// The (Started, Received) pair is what makes the strict-ordering contract
-// checkable from the client side: §1.3 constrains only requests that were
-// initiated after an earlier request had already returned, so overlapping
-// requests — whose responses may legitimately arrive out of order (§1.4) — are
-// excluded from the ordering check.
-type allocationObservation struct {
-	Key      string
-	ID       int64
-	Err      error
-	Started  time.Time
-	Received time.Time
-}
-
-// orderLogCompactionThreshold is the entry count beyond which an
-// allocationOrderLog folds its oldest safe prefix into baseMax.
-const orderLogCompactionThreshold = 1 << 14
-
-// allocationOrderLog records, per key, the ids of successful allocations in
-// completion order together with a prefix maximum, so the largest id that had
-// already been delivered when a given request started is answerable in O(log n).
-//
-// Entries whose completion predates Received-retention can never be the
-// already-delivered record for a request that is still to be observed, so they
-// are folded into baseMax and dropped. That bounds memory under long load
-// without weakening the check.
-type allocationOrderLog struct {
-	received  []time.Time
-	prefixMax []int64
-	baseMax   int64
-}
-
-// maxDeliveredBefore returns the largest id whose delivery completed strictly
-// before t.
-func (l *allocationOrderLog) maxDeliveredBefore(t time.Time) int64 {
-	index := sort.Search(len(l.received), func(i int) bool { return !l.received[i].Before(t) })
-	best := l.baseMax
-	if index > 0 && l.prefixMax[index-1] > best {
-		best = l.prefixMax[index-1]
-	}
-	return best
-}
-
-func (l *allocationOrderLog) append(received time.Time, id int64) {
-	best := id
-	if n := len(l.prefixMax); n > 0 && l.prefixMax[n-1] > best {
-		best = l.prefixMax[n-1]
-	}
-	l.received = append(l.received, received)
-	l.prefixMax = append(l.prefixMax, best)
-}
-
-func (l *allocationOrderLog) compact(cutoff time.Time) {
-	drop := 0
-	for drop < len(l.received) && l.received[drop].Before(cutoff) {
-		drop++
-	}
-	if drop == 0 {
-		return
-	}
-	if max := l.prefixMax[drop-1]; max > l.baseMax {
-		l.baseMax = max
-	}
-	l.received = append([]time.Time(nil), l.received[drop:]...)
-	l.prefixMax = append([]int64(nil), l.prefixMax[drop:]...)
-}
-
-// allocationRecorder aggregates every allocation a client observes and enforces
-// the Appendix F.1 gate: no duplicated id, no stale and no out-of-order
-// delivery.
-//
-// A client cannot observe the server's linearization order, so what is checked
-// here is the observable form of S2 stated in §1.3: if request A has already
-// returned and request B is initiated afterwards, then id(B) must be greater
-// than id(A). Separating a stale delivery from an ordering violation needs the
-// per-slot epoch that Phase 3 adds to responses; until then both collapse into
-// orderViolations, which is the stronger client-visible signal.
-type allocationRecorder struct {
-	mu     sync.Mutex
-	ids    map[string]map[int64]struct{}
-	max    map[string]int64
-	order  map[string]*allocationOrderLog
-	errors []error
-	phases []string
-
-	duplicateDeliveries int
-	orderViolations     int
-
-	// retention bounds how long a request may remain in flight. It must exceed
-	// the largest client call timeout in the suite, or compaction could drop an
-	// entry that is still the already-delivered record for a live request.
-	retention time.Duration
-}
-
-func newAllocationRecorder() *allocationRecorder {
-	return &allocationRecorder{
-		ids:       make(map[string]map[int64]struct{}),
-		max:       make(map[string]int64),
-		order:     make(map[string]*allocationOrderLog),
-		retention: 30 * time.Second,
-	}
-}
-
-func (r *allocationRecorder) phase(name string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.phases = append(r.phases, name)
-}
-
-func (r *allocationRecorder) record(observation allocationObservation) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	key := observation.Key
-	if observation.Err != nil {
-		r.errors = append(r.errors, observation.Err)
-		if !allowedTransient(observation.Err) {
-			codeValue, hasCode := xerror.CodeOf(observation.Err)
-			reasonValue, domain, metadata, hasReason := xerror.ReasonOf(observation.Err)
-			return fmt.Errorf(
-				"unexpected allocation error: type=%T code=%s has_code=%t "+
-					"reason=%q domain=%q metadata=%v has_reason=%t: %w",
-				observation.Err,
-				codeValue,
-				hasCode,
-				reasonValue,
-				domain,
-				metadata,
-				hasReason,
-				observation.Err,
-			)
-		}
-		return nil
-	}
-	if r.ids[key] == nil {
-		r.ids[key] = make(map[int64]struct{})
-	}
-	if _, duplicate := r.ids[key][observation.ID]; duplicate {
-		r.duplicateDeliveries++
-		return fmt.Errorf("duplicate successful id for %q: %d", key, observation.ID)
-	}
-	r.ids[key][observation.ID] = struct{}{}
-	if observation.ID > r.max[key] {
-		r.max[key] = observation.ID
-	}
-
-	log := r.order[key]
-	if log == nil {
-		log = &allocationOrderLog{}
-		r.order[key] = log
-	}
-	deliveredBefore := log.maxDeliveredBefore(observation.Started)
-	if observation.ID <= deliveredBefore {
-		r.orderViolations++
-		return fmt.Errorf(
-			"allocation order violation for %q: id %d returned for a request started at %s, "+
-				"but id %d had already been delivered before it started",
-			key,
-			observation.ID,
-			observation.Started.Format(time.RFC3339Nano),
-			deliveredBefore,
-		)
-	}
-	log.append(observation.Received, observation.ID)
-	if len(log.received) > orderLogCompactionThreshold {
-		log.compact(observation.Received.Add(-r.retention))
-	}
-	return nil
-}
-
-func (r *allocationRecorder) maxID(key string) int64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.max[key]
-}
-
-// counters returns the Appendix F.1 gate counters. Every one of them must stay
-// at zero: a single duplicated, stale or out-of-order delivery is a P0 defect,
-// never a bounded or acceptable degradation (D8).
-func (r *allocationRecorder) counters() (duplicates, orderViolations int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.duplicateDeliveries, r.orderViolations
-}
-
-// assertNoViolations fails the test when the F.1 gate counters are non-zero.
-func (r *allocationRecorder) assertNoViolations(t require.TestingT) {
-	duplicates, orderViolations := r.counters()
-	require.Zero(t, duplicates, "duplicate_delivery_count must be zero")
-	require.Zero(t, orderViolations, "allocation_order_violation must be zero")
+// The reason that surfaces depends on where the outage is noticed, and no
+// single one covers the whole window: a reservation whose write outcome is
+// unknown is COMMIT_UNCERTAIN, an immediate connect or read failure is
+// STORAGE_UNAVAILABLE, and a node whose local lease lapsed before it could renew
+// is LEASE_EXPIRED. What they share is the property these tests assert: the node
+// stops serving rather than answering as if storage were healthy, and the
+// refusal is retriable.
+func refusedWhileStorageUnavailable(err error) bool {
+	return xerror.IsReason(err, reason.Reason_SEQUENCE_STORAGE_UNAVAILABLE) ||
+		xerror.IsReason(err, reason.Reason_SEQUENCE_COMMIT_UNCERTAIN) ||
+		xerror.IsReason(err, reason.Reason_SEQUENCE_LEASE_EXPIRED) ||
+		xerror.IsReason(err, reason.Reason_SEQUENCE_ALLOCATOR_PAUSED)
 }
 
 func harnessByDialect(dialect string) *harness {

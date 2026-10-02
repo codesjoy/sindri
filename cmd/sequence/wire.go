@@ -36,6 +36,7 @@ import (
 	"github.com/codesjoy/yggdrasil/v3"
 	"github.com/google/wire"
 	"go.opentelemetry.io/otel/metric"
+	"gorm.io/gorm"
 )
 
 // configSet exposes the loaded configuration by the section that owns it.
@@ -50,7 +51,6 @@ var configSet = wire.NewSet(
 		"Database",
 		"DataPlane",
 		"ControlPlane",
-		"Ticker",
 	),
 )
 
@@ -66,9 +66,10 @@ var dataPlaneSet = wire.NewSet(
 	wire.FieldsOf(new(*xgorm.Database), "DB"),
 	sequencedata.NewSequenceData,
 	sequencedata.NewOwnershipData,
-	sequencedata.NewLivenessData,
+	provideLivenessData,
 	sequencedata.NewRouteModel,
-	sequencedata.NewPlacementData,
+	providePlacementData,
+	sequencedata.NewHandoffData,
 	wire.Bind(new(biz.PlacementRepo), new(*sequencedata.PlacementData)),
 	wire.Bind(new(biz.PublisherRepo), new(*sequencedata.PlacementData)),
 	wire.Bind(new(biz.CoordinatorRepo), new(*sequencedata.PlacementData)),
@@ -93,6 +94,7 @@ var controlPlaneSet = wire.NewSet(
 	newInstanceID,
 	provideQuietWindow,
 	biz.NewPublisher,
+	provideRebalancer,
 	task.NewPublisherTask,
 	wire.Bind(new(task.PublisherReconciler), new(*biz.Publisher)),
 	providePublisherMetrics,
@@ -100,6 +102,23 @@ var controlPlaneSet = wire.NewSet(
 
 // bundleSet assembles what the startup mode selects.
 var bundleSet = wire.NewSet(newBusinessBundle)
+
+func providePlacementData(db *gorm.DB, cfg biz.DataPlaneConfig) *sequencedata.PlacementData {
+	return sequencedata.NewPlacementData(db, cfg.HA.LeaseDuration, cfg.HA.NodeTTL)
+}
+
+func provideLivenessData(db *gorm.DB, cfg biz.DataPlaneConfig) biz.LivenessRepo {
+	return sequencedata.NewLivenessData(db, cfg.HA.NodeTTL)
+}
+
+func provideRebalancer(
+	cfg biz.ControlPlaneConfig,
+	data biz.DataPlaneConfig,
+	placement biz.PlacementRepo,
+	handoffs biz.HandoffRepo,
+) *biz.Rebalancer {
+	return biz.NewRebalancer(cfg, data.HA, placement, handoffs)
+}
 
 func provideLogger(rt yggdrasil.Runtime) *slog.Logger {
 	return rt.Logger()
@@ -183,9 +202,11 @@ func newBusinessBundle(
 	sequenceService *service.SequenceService,
 	publisher *biz.Publisher,
 	publisherTask *task.PublisherTask,
+	rebalancer *biz.Rebalancer,
 	dataMetrics *metrics.Metrics,
 	publisherMetrics *metrics.PublisherMetrics,
 ) *yggdrasil.BusinessBundle {
+	publisher.SetRebalancer(rebalancer)
 	var readinessAllocator *biz.Allocator
 	var readinessPublisher *biz.Publisher
 	if mode != conf.ModeControl {
@@ -232,8 +253,8 @@ func newBusinessBundle(
 				// the quiet window instead.
 				Name:  "sequence.release-slot-authority",
 				Stage: yggdrasil.BusinessHookBeforeStop,
-				Func: func(context.Context) error {
-					allocator.Shutdown()
+				Func: func(ctx context.Context) error {
+					allocator.ShutdownContext(ctx)
 					return nil
 				},
 			},

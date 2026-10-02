@@ -66,56 +66,54 @@ func countLivenessRows(t *testing.T, db *gorm.DB, nodeID string) int64 {
 // own would put the node host's clock into a membership decision, and the two
 // sides would disagree by however far that host had drifted.
 func TestNodeLivenessLeaseContractAcrossDialects(t *testing.T) {
-	for _, item := range harnesses {
-		t.Run(item.name, func(t *testing.T) {
-			db := openGORM(t, item)
-			repo := sequencedata.NewLivenessData(db)
-			ctx := context.Background()
+	forEachDialect(t, func(t *testing.T, item *harness) {
+		db := openGORM(t, item)
+		repo := sequencedata.NewLivenessData(db, 15*time.Second)
+		ctx := context.Background()
 
-			const nodeID = "node-liveness-contract"
-			require.NoError(t, db.Exec(
-				"DELETE FROM sequence_node_liveness WHERE node_id = ?", nodeID,
-			).Error)
+		const nodeID = "node-liveness-contract"
+		require.NoError(t, db.Exec(
+			"DELETE FROM sequence_node_liveness WHERE node_id = ?", nodeID,
+		).Error)
 
-			// The first report has no row to update, which is the case a node
-			// starting up produces and the one an update-only writer would fail.
-			require.NoError(t, repo.RenewLiveness(ctx, nodeID, "instance-first"))
-			first := loadLiveness(t, db, nodeID)
-			require.Equal(t, "instance-first", first.InstanceID)
-			require.WithinDuration(t, time.Now(), first.LastSeenAt, time.Minute)
+		// The first report has no row to update, which is the case a node
+		// starting up produces and the one an update-only writer would fail.
+		require.NoError(t, repo.RenewLiveness(ctx, nodeID, "instance-first"))
+		first := loadLiveness(t, db, nodeID)
+		require.Equal(t, "instance-first", first.InstanceID)
+		require.WithinDuration(t, time.Now(), first.LastSeenAt, time.Minute)
 
-			// A later renewal is the same statement and must not add a second row:
-			// node_id is the key, which is what keeps the table bounded by the
-			// fleet size and the expiry a pure read.
-			require.NoError(t, repo.RenewLiveness(ctx, nodeID, "instance-first"))
-			require.EqualValues(t, 1, countLivenessRows(t, db, nodeID))
+		// A later renewal is the same statement and must not add a second row:
+		// node_id is the key, which is what keeps the table bounded by the
+		// fleet size and the expiry a pure read.
+		require.NoError(t, repo.RenewLiveness(ctx, nodeID, "instance-first"))
+		require.EqualValues(t, 1, countLivenessRows(t, db, nodeID))
 
-			// A restarted node comes back under the same id with a new process
-			// identity, and the row follows it rather than doubling.
-			require.NoError(t, repo.RenewLiveness(ctx, nodeID, "instance-second"))
-			require.EqualValues(t, 1, countLivenessRows(t, db, nodeID))
-			assert.Equal(t, "instance-second", loadLiveness(t, db, nodeID).InstanceID)
+		// A restarted node comes back under the same id with a new process
+		// identity, and the row follows it rather than doubling.
+		require.NoError(t, repo.RenewLiveness(ctx, nodeID, "instance-second"))
+		require.EqualValues(t, 1, countLivenessRows(t, db, nodeID))
+		assert.Equal(t, "instance-second", loadLiveness(t, db, nodeID).InstanceID)
 
-			// The renewal moves the timestamp forward, which is the whole of what
-			// keeps the node inside the reader's window.
-			require.NoError(t, db.Exec(
-				"UPDATE sequence_node_liveness SET last_seen_at = '2000-01-01 00:00:00' "+
-					"WHERE node_id = ?",
-				nodeID,
-			).Error)
-			require.NoError(t, repo.RenewLiveness(ctx, nodeID, "instance-second"))
-			assert.WithinDuration(
-				t, time.Now(), loadLiveness(t, db, nodeID).LastSeenAt, time.Minute,
-			)
+		// The renewal moves the timestamp forward, which is the whole of what
+		// keeps the node inside the reader's window.
+		require.NoError(t, db.Exec(
+			"UPDATE sequence_node_liveness SET last_seen_at = '2000-01-01 00:00:00' "+
+				"WHERE node_id = ?",
+			nodeID,
+		).Error)
+		require.NoError(t, repo.RenewLiveness(ctx, nodeID, "instance-second"))
+		assert.WithinDuration(
+			t, time.Now(), loadLiveness(t, db, nodeID).LastSeenAt, time.Minute,
+		)
 
-			// The graceful-shutdown write is scoped to the instance, so a shutdown
-			// racing a restart cannot delete the row the new process just wrote.
-			require.NoError(t, repo.DropLiveness(ctx, nodeID, "instance-old"))
-			require.EqualValues(t, 1, countLivenessRows(t, db, nodeID),
-				"a stale shutdown must not delete its successor's row")
+		// The graceful-shutdown write is scoped to the instance, so a shutdown
+		// racing a restart cannot delete the row the new process just wrote.
+		require.NoError(t, repo.DropLiveness(ctx, nodeID, "instance-old"))
+		require.EqualValues(t, 1, countLivenessRows(t, db, nodeID),
+			"a stale shutdown must not delete its successor's row")
 
-			require.NoError(t, repo.DropLiveness(ctx, nodeID, "instance-second"))
-			assert.Zero(t, countLivenessRows(t, db, nodeID))
-		})
-	}
+		require.NoError(t, repo.DropLiveness(ctx, nodeID, "instance-second"))
+		assert.Zero(t, countLivenessRows(t, db, nodeID))
+	})
 }

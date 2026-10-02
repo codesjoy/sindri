@@ -22,6 +22,7 @@ import (
 
 	testkit "github.com/codesjoy/sindri/internal/pkg/tests"
 	"github.com/codesjoy/sindri/internal/sequence/biz"
+	"github.com/codesjoy/sindri/internal/sequence/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
@@ -72,7 +73,7 @@ func TestAllocatorMetricsCollectsRuntimeAndAllocatorValues(t *testing.T) {
 	allocator := biz.NewAllocator(
 		testDataPlane(),
 		testSequenceRepo{},
-		nil,
+		testutil.NewAuthority(),
 		sampler,
 		slog.Default(),
 	)
@@ -163,7 +164,7 @@ func TestAllocatorMetricsLifecycle(t *testing.T) {
 	allocator := biz.NewAllocator(
 		testDataPlane(),
 		testSequenceRepo{},
-		nil,
+		testutil.NewAuthority(),
 		sampler,
 		slog.Default(),
 	)
@@ -187,7 +188,7 @@ func TestAllocatorMetricsRejectsMissingDependencies(t *testing.T) {
 	allocator := biz.NewAllocator(
 		testDataPlane(),
 		testSequenceRepo{},
-		nil,
+		testutil.NewAuthority(),
 		sampler,
 		slog.Default(),
 	)
@@ -238,7 +239,7 @@ func TestHASeriesCarryTheirLabels(t *testing.T) {
 	allocator := biz.NewAllocator(
 		testDataPlane(),
 		testSequenceRepo{},
-		nil,
+		testutil.NewAuthority(),
 		sampler,
 		slog.Default(),
 	)
@@ -315,7 +316,6 @@ func (f *publisherMetricRepo) MaterialiseRoute(
 	context.Context,
 	[]biz.OwnershipSegment,
 	int64,
-	int,
 	biz.CoordinatorLease,
 ) (biz.PublishResult, error) {
 	return biz.PublishResult{Revision: f.revision, PayloadBytes: 128}, nil
@@ -348,7 +348,6 @@ func testPublisher(t *testing.T) *biz.Publisher {
 	publisher := biz.NewPublisher(
 		biz.ControlPlaneConfig{
 			LayoutVersion:     1,
-			RouteRetention:    64,
 			CoordinatorLease:  10 * time.Second,
 			ReconcileInterval: 5 * time.Second,
 			PassTimeout:       3 * time.Second,

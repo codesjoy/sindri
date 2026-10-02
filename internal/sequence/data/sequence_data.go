@@ -31,16 +31,8 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// defaultNamespace is the namespace every key uses today. Section 5.2 models
-// the high watermark as (namespace, key); the column exists so that introducing
-// a real namespace later is a data migration rather than a schema change. A
-// non-empty namespace also changes slot placement, so it must ship with a
-// layout_version bump and a client release.
-const defaultNamespace = ""
-
 // SequenceModel stores the reserved high watermark of one key.
 type SequenceModel struct {
-	Namespace   string    `gorm:"column:namespace;size:64;primaryKey"`
 	SequenceKey string    `gorm:"column:sequence_key;size:256;primaryKey"`
 	ReservedEnd int64     `gorm:"column:reserved_end;not null"`
 	UpdatedAt   time.Time `gorm:"column:updated_at;not null"`
@@ -73,7 +65,7 @@ func (d *sequenceData) ReserveRanges(
 	if d == nil || d.db == nil {
 		return nil, errors.New("sequence gorm store: database is required")
 	}
-	if authority.InstanceID == "" {
+	if authority.InstanceID == "" || authority.Lease <= 0 || len(authority.Epochs) == 0 {
 		return nil, errors.New("sequence gorm store: reservation authority is required")
 	}
 	if err := validateReservationRequests(requests); err != nil {
@@ -157,7 +149,7 @@ func lockOwnership(
 	dialect string,
 	slots []uint32,
 ) ([]ownershipRow, error) {
-	query := tx.WithContext(ctx).Table("slot_ownership").
+	query := tx.WithContext(ctx).Table("sequence_slot_ownership").
 		Select(ownershipColumns).
 		Where("slot_id IN ?", slots).
 		Order("slot_id")
@@ -174,10 +166,18 @@ func lockOwnership(
 // checkAuthority validates the locked authority rows before any watermark moves.
 func checkAuthority(
 	authority biz.ReservationAuthority,
+	instance instanceRow,
 	slots []uint32,
 	locked []ownershipRow,
 	now time.Time,
 ) error {
+	if instance.State != "ACTIVE" || instance.InstanceID != authority.InstanceID ||
+		instance.Revision != authority.Revision {
+		return biz.ErrAuthorityChanged
+	}
+	if authority.Lease <= 0 || !now.Before(instance.GrantedAt.Add(authority.Lease)) {
+		return biz.ErrLeaseExpired
+	}
 	bySlot := make(map[uint32]ownershipRow, len(locked))
 	for _, row := range locked {
 		bySlot[row.SlotID] = row
@@ -191,7 +191,7 @@ func checkAuthority(
 			*row.OwnerInstanceID != authority.InstanceID {
 			return fmt.Errorf("%w: slot %d", biz.ErrSlotNotOwned, slotID)
 		}
-		if authority.Epochs != nil {
+		{
 			epoch, ok := authority.Epochs[slotID]
 			if !ok || row.Epoch != epoch {
 				return fmt.Errorf(
@@ -201,11 +201,6 @@ func checkAuthority(
 					row.Epoch,
 					epoch,
 				)
-			}
-		}
-		if authority.Lease > 0 {
-			if row.GrantedAt == nil || now.After(row.GrantedAt.Add(authority.Lease)) {
-				return fmt.Errorf("%w: slot %d", biz.ErrLeaseExpired, slotID)
 			}
 		}
 	}
@@ -221,6 +216,10 @@ func (d *sequenceData) reservePostgres(
 ) ([]biz.SequenceRange, error) {
 	var reserved []biz.SequenceRange
 	err := d.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		instances, err := lockInstances(ctx, tx, []string{authority.InstanceID}, "SHARE")
+		if err != nil {
+			return err
+		}
 		locked, err := lockOwnership(ctx, tx, "postgres", slots)
 		if err != nil {
 			return err
@@ -229,12 +228,18 @@ func (d *sequenceData) reservePostgres(
 		if err != nil {
 			return err
 		}
-		if err := checkAuthority(authority, slots, locked, now); err != nil {
+		if err := checkAuthority(
+			authority,
+			instances[authority.InstanceID],
+			slots,
+			locked,
+			now,
+		); err != nil {
 			return err
 		}
 
 		query, args := batchInsertQuery(targets, "clock_timestamp()",
-			" ON CONFLICT (namespace, sequence_key) DO UPDATE SET "+
+			" ON CONFLICT (sequence_key) DO UPDATE SET "+
 				"reserved_end = sequence_ranges.reserved_end + EXCLUDED.reserved_end, "+
 				"updated_at = clock_timestamp() RETURNING sequence_key, reserved_end")
 		var rows []SequenceModel
@@ -260,6 +265,10 @@ func (d *sequenceData) reserveTransactional(
 	dialect := d.db.Name()
 	var reserved []biz.SequenceRange
 	err := d.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		instances, err := lockInstances(ctx, tx, []string{authority.InstanceID}, "SHARE")
+		if err != nil {
+			return err
+		}
 		locked, err := lockOwnership(ctx, tx, dialect, slots)
 		if err != nil {
 			return err
@@ -268,7 +277,13 @@ func (d *sequenceData) reserveTransactional(
 		if err != nil {
 			return err
 		}
-		if err := checkAuthority(authority, slots, locked, now); err != nil {
+		if err := checkAuthority(
+			authority,
+			instances[authority.InstanceID],
+			slots,
+			locked,
+			now,
+		); err != nil {
 			return err
 		}
 
@@ -276,11 +291,11 @@ func (d *sequenceData) reserveTransactional(
 			"reserved_end = sequence_ranges.reserved_end + VALUES(reserved_end), " +
 			"updated_at = VALUES(updated_at)"
 		if dialect == "sqlite" {
-			suffix = " ON CONFLICT (namespace, sequence_key) DO UPDATE SET " +
+			suffix = " ON CONFLICT (sequence_key) DO UPDATE SET " +
 				"reserved_end = sequence_ranges.reserved_end + excluded.reserved_end, " +
 				"updated_at = excluded.updated_at"
 		}
-		timestamp, err := StorageNowExpression(dialect)
+		timestamp, err := storageNowExpression(dialect)
 		if err != nil {
 			return err
 		}
@@ -295,7 +310,7 @@ func (d *sequenceData) reserveTransactional(
 		}
 		var rows []SequenceModel
 		dbQuery := tx.WithContext(ctx).
-			Where("namespace = ? AND sequence_key IN ?", defaultNamespace, keys)
+			Where("sequence_key IN ?", keys)
 		if dialect != "sqlite" {
 			dbQuery = dbQuery.Clauses(clause.Locking{Strength: "UPDATE"})
 		}
@@ -321,15 +336,15 @@ func batchInsertQuery(
 ) (string, []any) {
 	var query strings.Builder
 	query.WriteString(
-		"INSERT INTO sequence_ranges (namespace, sequence_key, reserved_end, updated_at) VALUES ",
+		"INSERT INTO sequence_ranges (sequence_key, reserved_end, updated_at) VALUES ",
 	)
-	args := make([]any, 0, len(targets)*3)
+	args := make([]any, 0, len(targets)*2)
 	for index, target := range targets {
 		if index > 0 {
 			query.WriteString(", ")
 		}
-		query.WriteString("(?, ?, ?, " + timestampExpression + ")")
-		args = append(args, defaultNamespace, target.key, target.step)
+		query.WriteString("(?, ?, " + timestampExpression + ")")
+		args = append(args, target.key, target.step)
 	}
 	query.WriteString(suffix)
 	return query.String(), args

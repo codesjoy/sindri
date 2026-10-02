@@ -14,6 +14,8 @@
 
 package sequence
 
+import "context"
+
 const (
 	// VersionMetaKey carries the client route version on FetchNext requests.
 	VersionMetaKey = "routerVersion"
@@ -63,3 +65,20 @@ const (
 	// RetryNever means retrying the request unchanged cannot help.
 	RetryNever = "never"
 )
+
+type slotContextKey struct{}
+
+// withSlot stores the routing slot for one attempt in ctx. The interceptor
+// writes it and the balancer reads it; it is not part of the public surface.
+func withSlot(ctx context.Context, slot uint32) context.Context {
+	return context.WithValue(ctx, slotContextKey{}, slot)
+}
+
+// slotFromContext returns the routing slot stored in ctx.
+func slotFromContext(ctx context.Context) (uint32, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	slot, ok := ctx.Value(slotContextKey{}).(uint32)
+	return slot, ok
+}

@@ -23,55 +23,47 @@ import (
 	"time"
 
 	toxiclient "github.com/Shopify/toxiproxy/v2/client"
-	"github.com/codesjoy/pkg/basic/xerror"
-	"github.com/codesjoy/sindri/gen/go/sequence/reason"
 	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
 )
 
-func (s *SequenceSystemSuite) TestOwnerTimeoutDuringRouteHandoff() {
-	key := "chaos-owner-timeout"
-	versionA := s.publishRoute(allSlots("node-a"))
-	before := s.waitForOwnership("node-a", key, versionA)
-	routed := s.routedClient()
-	before = s.waitRoutedAbove(routed, key, before)
+// TestOwnerOutageDuringRouteHandoff covers the two ways a misbehaving owner
+// surfaces to a routed client while a key moves away from it: the call hangs
+// until its deadline and the call is reset outright. In both cases the client
+// must keep making progress on the successor once the route moves, and the
+// watermark may never run ahead of an id the client actually received.
+func (s *SequenceSystemSuite) TestOwnerOutageDuringRouteHandoff() {
+	cases := []struct {
+		name  string
+		toxic string
+		attrs toxiclient.Attributes
+	}{
+		{name: "timeout", toxic: "timeout", attrs: toxiclient.Attributes{"timeout": 100}},
+		{name: "reset", toxic: "reset_peer", attrs: toxiclient.Attributes{"timeout": 0}},
+	}
+	for _, test := range cases {
+		s.Run(test.name, func() {
+			key := "chaos-owner-" + test.name
+			versionA := s.publishRoute(allSlots("node-a"))
+			before := s.waitForOwnership("node-a", key, versionA)
+			routed := s.routedClient()
+			before = s.waitRoutedAbove(routed, key, before)
 
-	_, err := s.proxies["grpc-a"].AddToxic(
-		"owner-timeout",
-		"timeout",
-		"downstream",
-		1,
-		toxiclient.Attributes{"timeout": 100},
-	)
-	s.Require().NoError(err)
-	versionB := s.publishRoute(allSlots("node-b"))
-	s.waitForOwnership("node-b", key, versionB)
-	after := s.waitRoutedAbove(routed, key, before)
-	removeToxic(s.T(), s.proxies["grpc-a"], "owner-timeout")
-	s.Greater(after, before)
-	s.GreaterOrEqual(s.watermark(key), after)
-}
-
-func (s *SequenceSystemSuite) TestOwnerResetDuringRouteHandoff() {
-	key := "chaos-owner-reset"
-	versionA := s.publishRoute(allSlots("node-a"))
-	before := s.waitForOwnership("node-a", key, versionA)
-	routed := s.routedClient()
-	before = s.waitRoutedAbove(routed, key, before)
-
-	_, err := s.proxies["grpc-a"].AddToxic(
-		"owner-reset",
-		"reset_peer",
-		"downstream",
-		1,
-		toxiclient.Attributes{"timeout": 0},
-	)
-	s.Require().NoError(err)
-	versionB := s.publishRoute(allSlots("node-b"))
-	s.waitForOwnership("node-b", key, versionB)
-	after := s.waitRoutedAbove(routed, key, before)
-	removeToxic(s.T(), s.proxies["grpc-a"], "owner-reset")
-	s.Greater(after, before)
-	s.GreaterOrEqual(s.watermark(key), after)
+			_, err := s.proxies["grpc-a"].AddToxic(
+				"owner-outage",
+				test.toxic,
+				"downstream",
+				1,
+				test.attrs,
+			)
+			s.Require().NoError(err)
+			versionB := s.publishRoute(allSlots("node-b"))
+			s.waitForOwnership("node-b", key, versionB)
+			after := s.waitRoutedAbove(routed, key, before)
+			removeToxic(s.T(), s.proxies["grpc-a"], "owner-outage")
+			s.Greater(after, before)
+			s.GreaterOrEqual(s.watermark(key), after)
+		})
+	}
 }
 
 func (s *SequenceSystemSuite) TestDatabaseLatencyPausesAndRecovers() {
@@ -88,13 +80,15 @@ func (s *SequenceSystemSuite) TestDatabaseLatencyPausesAndRecovers() {
 	)
 	s.Require().NoError(err)
 	// Every statement the node makes now costs more than the route query's own
-	// timeout, so its heartbeats stop confirming anything and it refuses to
-	// allocate rather than spend a lease it cannot renew.
+	// timeout, so its renewals stop confirming and its local lease lapses. The
+	// node then refuses to allocate rather than spend a lease it cannot renew;
+	// which retriable reason surfaces depends on where the stall is noticed, so
+	// the assertion is the shared property, not one reason code.
 	s.Require().Eventually(func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 		defer cancel()
 		_, fetchErr := s.fetchDirect(ctx, "node-a", key, version)
-		return xerror.IsReason(fetchErr, reason.Reason_SEQUENCE_ALLOCATOR_PAUSED)
+		return refusedWhileStorageUnavailable(fetchErr)
 	}, recoveryDeadline, 50*time.Millisecond)
 
 	removeToxic(s.T(), s.proxies["db-a"], "route-query-latency")
@@ -249,7 +243,6 @@ func (s *SequenceSystemSuite) TestDeterministicHandoffsAndRestartsUnderLoad() {
 	}
 
 	for index, owner := range []string{"node-b", "node-a", "node-b", "node-a"} {
-		recorder.phase("handoff-" + owner)
 		s.T().Logf("chaos phase: publish ownership to %s", owner)
 		before := recorder.maxID(key)
 		version = s.publishRoute(allSlots(owner))
@@ -258,13 +251,11 @@ func (s *SequenceSystemSuite) TestDeterministicHandoffsAndRestartsUnderLoad() {
 		s.T().Logf("chaos phase: %s converged at route %d", owner, version)
 		s.Require().NoError(waitForProgress(before))
 		if index == 1 {
-			recorder.phase("restart-node-b")
 			s.T().Log("chaos phase: restart node-b")
 			s.stopNode("node-b")
 			s.restartNode("node-b")
 		}
 		if index == 2 {
-			recorder.phase("restart-node-a")
 			s.T().Log("chaos phase: restart node-a")
 			s.stopNode("node-a")
 			s.restartNode("node-a")

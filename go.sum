@@ -244,6 +244,10 @@ github.com/codesjoy/pkg/proto/codesjoy/reason v0.0.0-20260812100337-f4b6f4ac7d17
 github.com/codesjoy/pkg/proto/codesjoy/reason v0.0.0-20260812100337-f4b6f4ac7d17/go.mod h1:LC0g7vwj6i3fUmxhJTU5wKIDKjjPIy+xpTrkrnnAHP0=
 github.com/codesjoy/pkg/utils v0.0.0-20260316022210-2e62ff5ff745 h1:v3THuZpCYs2+Ud8Y9Wgw3aGEdOn7/oxRpyq9GUXQk7U=
 github.com/codesjoy/pkg/utils v0.0.0-20260316022210-2e62ff5ff745/go.mod h1:U0/UABf9bPmj2mjbDvXvE3emANneRnHgrzB8yEctqow=
+github.com/codesjoy/sindri/gen/go/sequence v0.2.0 h1:rWCrt5COdXpPVh+b2IrHRLWVkgV0m0ytzCUFUqLnpaM=
+github.com/codesjoy/sindri/gen/go/sequence v0.2.0/go.mod h1:JpUqqcVkLiaBepUAp8Vt4uMoCzQzmaI+AnKYXzw2zuM=
+github.com/codesjoy/sindri/pkg/sequence v0.2.0 h1:omgh6THWK9am8u66dtYE+220YjJILTfvNwk+0zzrkmA=
+github.com/codesjoy/sindri/pkg/sequence v0.2.0/go.mod h1:s3fhaL1V376Cw/S7IwVaUrjecuKF7N6oDt/ZQW7o9n0=
 github.com/codesjoy/yggdrasil-ecosystem/modules/etcd/v3 v3.0.0-20260429033927-d1bc68f367b9 h1:ReCCgpRYjIFtLMFaIBn2E19Auje4rRCrrGPQIyBln4U=
 github.com/codesjoy/yggdrasil-ecosystem/modules/etcd/v3 v3.0.0-20260429033927-d1bc68f367b9/go.mod h1:80AiVZ+BCyftw20u+rlaZbLllxCGBtsjmjWa3Eoi8ik=
 github.com/codesjoy/yggdrasil-ecosystem/modules/otlp/v3 v3.0.0-20260429033927-d1bc68f367b9 h1:J1OaHHJTqPVz0MadpO4wmDTOx9eTdt8qDSi2z9BwjmY=

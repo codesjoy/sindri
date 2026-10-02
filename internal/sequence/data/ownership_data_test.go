@@ -19,119 +19,273 @@ import (
 	"testing"
 	"time"
 
+	testkit "github.com/codesjoy/sindri/internal/pkg/tests"
 	"github.com/codesjoy/sindri/internal/sequence/biz"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	gormio "gorm.io/gorm"
+	"gorm.io/gorm"
 )
 
-// These tests run on SQLite because the grouped renewal is about the shape of
-// the predicate, not about dialect lock semantics; the PostgreSQL and MySQL
-// forms are exercised by the dialect contract tests.
-
-func openOwnershipTestDB(t *testing.T) *gormio.DB {
+func authorityFor(
+	t testing.TB,
+	db *gorm.DB,
+	node, instance string,
+	slots ...uint32,
+) biz.ReservationAuthority {
 	t.Helper()
-	db := openPlacementTestDB(t)
-	require.NoError(t, db.Exec(
-		"CREATE TABLE slot_ownership ("+
-			"slot_id integer PRIMARY KEY, owner_node_id text, owner_instance_id text, "+
-			"epoch integer NOT NULL DEFAULT 0, granted_at datetime, state text NOT NULL, "+
-			"updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-	).Error)
-	return db
-}
-
-// seedOwnedSlot writes one authority row with the columns a renewal compares.
-func seedOwnedSlot(
-	t *testing.T,
-	db *gormio.DB,
-	slot uint32,
-	instanceID string,
-	epoch int64,
-	grantedAt time.Time,
-) {
-	t.Helper()
-	require.NoError(t, db.Exec(
-		"INSERT INTO slot_ownership "+
-			"(slot_id, owner_node_id, owner_instance_id, epoch, granted_at, state) "+
-			"VALUES (?, 'node-a', ?, ?, ?, 'OWNED')",
-		slot, instanceID, epoch, grantedAt,
-	).Error)
-}
-
-// grantTime reads the stored grant time for one slot.
-func grantTime(t *testing.T, db *gormio.DB, slot uint32) time.Time {
-	t.Helper()
-	var row struct {
-		GrantedAt *time.Time
+	ctx := context.Background()
+	repo := NewOwnershipData(db)
+	require.NoError(t, repo.RegisterInstance(ctx, node, instance))
+	snapshot, err := repo.InstanceAuthority(ctx, instance)
+	require.NoError(t, err)
+	grants, err := repo.ClaimSlots(
+		ctx,
+		biz.ClaimRequest{
+			Slots:       slots,
+			NodeID:      node,
+			InstanceID:  instance,
+			Revision:    snapshot.Lease.Revision,
+			Lease:       3 * time.Second,
+			QuietWindow: 5 * time.Second,
+		},
+	)
+	require.NoError(t, err)
+	snapshot, err = repo.InstanceAuthority(ctx, instance)
+	require.NoError(t, err)
+	auth := biz.ReservationAuthority{
+		InstanceID: instance,
+		Revision:   snapshot.Lease.Revision,
+		Lease:      3 * time.Second,
+		Epochs:     map[uint32]uint64{},
 	}
-	require.NoError(t, db.Raw(
-		"SELECT granted_at FROM slot_ownership WHERE slot_id = ?", slot,
-	).Scan(&row).Error)
-	require.NotNil(t, row.GrantedAt)
-	return *row.GrantedAt
+	for _, o := range grants {
+		require.True(t, o.Granted)
+		auth.Epochs[o.Ownership.SlotID] = o.Ownership.Epoch
+	}
+	return auth
 }
 
-// TestRenewSlotsRefreshesOnlyTheMatchingGroup pins the epoch-CAS renewal: one
-// statement covers a whole group, only rows still held by that instance at that
-// epoch come back, and a slot whose owner or epoch moved is left untouched so a
-// renewal can never resurrect authority a takeover replaced.
-func TestRenewSlotsRefreshesOnlyTheMatchingGroup(t *testing.T) {
-	db := openOwnershipTestDB(t)
-	data := NewOwnershipData(db)
+func TestInstanceRenewalTouchesNoSlotRowsAndCASCannotResurrectRetiredInstance(t *testing.T) {
+	db := openPlacementTestDB(t)
 	ctx := context.Background()
-	old := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
-	seedOwnedSlot(t, db, 0, "instance-a", 1, old)
-	seedOwnedSlot(t, db, 1, "instance-a", 1, old)
-	seedOwnedSlot(t, db, 2, "instance-b", 2, old)
-	seedOwnedSlot(t, db, 3, "instance-a", 3, old)
-
-	renewed, err := data.RenewSlots(ctx, biz.RenewRequest{
-		Groups: []biz.RenewGroup{
-			{InstanceID: "instance-a", Epoch: 1, Slots: []uint32{0, 1, 2, 3}},
-		},
-	})
+	auth := authorityFor(t, db, "a", "ia", 1, 2)
+	repo := NewOwnershipData(db)
+	var before, after []ownershipRow
+	require.NoError(
+		t,
+		db.Table("sequence_slot_ownership").
+			Where("slot_id IN ?", []uint32{1, 2}).
+			Find(&before).
+			Error,
+	)
+	_, err := repo.RenewInstance(ctx, "ia", auth.Revision)
 	require.NoError(t, err)
-	require.Len(t, renewed, 2)
-	assert.Equal(t, []uint32{0, 1}, []uint32{renewed[0].SlotID, renewed[1].SlotID})
-
-	// Only the matching rows were refreshed: the other two keep their original
-	// grant times, which is what leaves them to be taken over by the fleet.
-	assert.WithinDuration(t, time.Now(), grantTime(t, db, 0), time.Minute)
-	assert.WithinDuration(t, time.Now(), grantTime(t, db, 1), time.Minute)
-	assert.Equal(t, old, grantTime(t, db, 2))
-	assert.Equal(t, old, grantTime(t, db, 3))
+	require.NoError(
+		t,
+		db.Table("sequence_slot_ownership").
+			Where("slot_id IN ?", []uint32{1, 2}).
+			Find(&after).
+			Error,
+	)
+	assert.Equal(t, before, after)
+	_, err = repo.RenewInstance(ctx, "ia", auth.Revision-1)
+	require.ErrorIs(t, err, biz.ErrAuthorityChanged)
+	require.NoError(t, repo.RetireInstance(ctx, "ia"))
+	_, err = repo.RenewInstance(ctx, "ia", auth.Revision)
+	require.ErrorIs(t, err, biz.ErrAuthorityChanged)
+	require.ErrorIs(t, repo.RegisterInstance(ctx, "a", "ia"), biz.ErrAuthorityChanged)
 }
 
-// TestRenewSlotsReportsOnlyRowsStillHeld covers the fence a renewal doubles as:
-// a slot the caller no longer holds does not come back, and the allocator reads
-// that as "fence this slot" rather than re-arming a deadline it cannot honour.
-func TestRenewSlotsReportsOnlyRowsStillHeld(t *testing.T) {
-	db := openOwnershipTestDB(t)
-	data := NewOwnershipData(db)
+func TestStrictReservationAuthorityAndKeyBytes(t *testing.T) {
+	db := openPlacementTestDB(t)
 	ctx := context.Background()
-	old := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
-	seedOwnedSlot(t, db, 0, "instance-b", 4, old)
-
-	renewed, err := data.RenewSlots(ctx, biz.RenewRequest{
-		Groups: []biz.RenewGroup{
-			{InstanceID: "instance-a", Epoch: 1, Slots: []uint32{0}},
-		},
-	})
+	keys := []string{"key", "KEY", "key ", "key  ", "é", "é", "订单"}
+	var slots []uint32
+	seen := map[uint32]bool{}
+	for _, k := range keys {
+		id := biz.SlotForKey(k)
+		if !seen[id] {
+			seen[id] = true
+			slots = append(slots, id)
+		}
+	}
+	auth := authorityFor(t, db, "a", "ia", slots...)
+	repo := NewSequenceData(db)
+	for _, k := range keys {
+		ranges, err := repo.ReserveRanges(ctx, auth, []biz.ReservationRequest{{Key: k, Step: 10}})
+		require.NoError(t, err)
+		assert.EqualValues(t, 1, ranges[0].Start)
+	}
+	for _, bad := range []biz.ReservationAuthority{{}, {InstanceID: auth.InstanceID, Revision: auth.Revision, Lease: auth.Lease}, {InstanceID: auth.InstanceID, Revision: auth.Revision, Epochs: auth.Epochs}, {InstanceID: auth.InstanceID, Revision: auth.Revision + 1, Lease: auth.Lease, Epochs: auth.Epochs}} {
+		_, err := repo.ReserveRanges(ctx, bad, []biz.ReservationRequest{{Key: keys[0], Step: 10}})
+		require.Error(t, err)
+	}
+	require.NoError(
+		t,
+		db.Exec(
+			"UPDATE sequence_instance_leases SET granted_at=? WHERE instance_id='ia'",
+			time.Now().Add(-time.Hour),
+		).Error,
+	)
+	_, err := repo.ReserveRanges(ctx, auth, []biz.ReservationRequest{{Key: keys[0], Step: 10}})
+	require.ErrorIs(t, err, biz.ErrLeaseExpired)
+	_, err = NewOwnershipData(db).RenewInstance(ctx, "ia", auth.Revision)
 	require.NoError(t, err)
-	assert.Empty(t, renewed, "a slot another instance took over is not renewed")
-	assert.Equal(t, old, grantTime(t, db, 0))
+	_, err = repo.ReserveRanges(ctx, auth, []biz.ReservationRequest{{Key: keys[0], Step: 10}})
+	require.NoError(t, err)
 }
 
-// TestRenewSlotsRejectsAnEmptyInstance pins that a group without an identity is
-// refused rather than renewing rows a wildcard predicate would match.
-func TestRenewSlotsRejectsAnEmptyInstance(t *testing.T) {
-	db := openOwnershipTestDB(t)
-	data := NewOwnershipData(db)
-	_, err := data.RenewSlots(context.Background(), biz.RenewRequest{
-		Groups: []biz.RenewGroup{
-			{Epoch: 1, Slots: []uint32{0}},
-		},
-	})
-	require.Error(t, err)
+func TestDurableHandoffFixedBoundaryDrainTokenAndRetargetReadiness(t *testing.T) {
+	db := openPlacementTestDB(t)
+	ctx := context.Background()
+	source := authorityFor(t, db, "a", "ia", 0)
+	target := authorityFor(t, db, "b", "ib")
+	authorityFor(t, db, "c", "ic")
+	var ha biz.HAConfig
+	var limits biz.MigrationConfig
+	require.NoError(t, testkit.DecodeDefaults(&ha))
+	require.NoError(t, testkit.DecodeDefaults(&limits))
+	p := NewPlacementData(db, ha.LeaseDuration, ha.NodeTTL)
+	tenure, err := p.AcquireCoordinator(ctx, "control", time.Minute)
+	require.NoError(t, err)
+	repo := NewHandoffData(db)
+	h := biz.Handoff{
+		SlotID:           0,
+		ID:               "token",
+		Kind:             "TRANSFER",
+		SourceInstanceID: "ia",
+		SourceEpoch:      source.Epochs[0],
+		TargetInstanceID: "ib",
+		Phase:            "PLANNED",
+	}
+	require.NoError(t, repo.PlanHandoffs(ctx, []biz.Handoff{h}, tenure, limits, ha.LeaseDuration))
+	apply := func(actor string, revision uint64, action string, h biz.Handoff) {
+		t.Helper()
+		require.NoError(
+			t,
+			repo.ApplyHandoffs(
+				ctx,
+				biz.HandoffRequest{
+					InstanceID: actor,
+					Revision:   revision,
+					HA:         ha,
+					Limits:     limits,
+					Commands:   []biz.HandoffCommand{{Handoff: h, Action: action}},
+				},
+			),
+		)
+	}
+	read := func() biz.Handoff {
+		t.Helper()
+		rows, err := repo.Handoffs(ctx, "", 100)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+		return rows[0]
+	}
+	apply("ib", target.Revision, "TRANSFER", h)
+	assert.Equal(t, "PLANNED", read().Phase)
+	apply("ib", target.Revision, "PREPARE", h)
+	h = read()
+	assert.Equal(t, "READY", h.Phase)
+	apply("ib", target.Revision, "BEGIN", h)
+	h = read()
+	assert.Equal(t, "DRAINING", h.Phase)
+	boundary := h.NotBefore
+	snap, err := NewOwnershipData(db).InstanceAuthority(ctx, "ia")
+	require.NoError(t, err)
+	_, err = NewOwnershipData(db).RenewInstance(ctx, "ia", snap.Lease.Revision)
+	require.NoError(t, err)
+	assert.Equal(t, boundary, read().NotBefore)
+	apply("ib", target.Revision, "TRANSFER", h)
+	assert.Equal(t, "DRAINING", read().Phase)
+	require.NoError(t, NewOwnershipData(db).RetireInstance(ctx, "ib"))
+	require.NoError(
+		t,
+		repo.RecoverHandoffs(
+			ctx,
+			tenure,
+			[]biz.NodeInfo{{ID: "a", InstanceID: "ia"}, {ID: "c", InstanceID: "ic"}},
+			ha,
+			64,
+		),
+	)
+	retargeted := read()
+	assert.NotEqual(t, h.ID, retargeted.ID)
+	assert.Equal(t, boundary, retargeted.NotBefore)
+	assert.False(t, retargeted.TargetReady)
+	apply("ia", snap.Lease.Revision, "ACK_DRAIN", h)
+	assert.False(t, read().Drained)
+	apply("ia", snap.Lease.Revision, "ACK_DRAIN", retargeted)
+	apply("ic", 0, "TRANSFER", retargeted)
+	assert.Equal(t, "DRAINING", read().Phase)
+	apply("ic", 0, "PREPARE", retargeted)
+	retargeted = read()
+	apply("ic", 0, "TRANSFER", retargeted)
+	transferred := read()
+	assert.Equal(t, "TRANSFERRED", transferred.Phase)
+	destination, err := NewOwnershipData(db).InstanceAuthority(ctx, "ic")
+	require.NoError(t, err)
+	require.Len(t, destination.Slots, 1)
+	assert.EqualValues(t, 2, destination.Slots[0].Epoch)
+	_, err = NewOwnershipData(db).RenewInstance(ctx, "ic", destination.Lease.Revision)
+	require.NoError(t, err)
+	apply("ic", destination.Lease.Revision, "ACK_ACTIVE", transferred)
+	rows, err := repo.Handoffs(ctx, "", 100)
+	require.NoError(t, err)
+	assert.Empty(t, rows)
+}
+
+func TestLeaderlessReleaseRecoveryDoesNotBypassTransferPin(t *testing.T) {
+	db := openPlacementTestDB(t)
+	ctx := context.Background()
+	source := authorityFor(t, db, "a", "ia", 0, 1)
+	target := authorityFor(t, db, "b", "ib")
+	var ha biz.HAConfig
+	var limits biz.MigrationConfig
+	require.NoError(t, testkit.DecodeDefaults(&ha))
+	require.NoError(t, testkit.DecodeDefaults(&limits))
+	repo := NewHandoffData(db)
+	require.NoError(
+		t,
+		repo.ApplyHandoffs(
+			ctx,
+			biz.HandoffRequest{
+				InstanceID: "ia",
+				HA:         ha,
+				Limits:     limits,
+				Commands: []biz.HandoffCommand{
+					{
+						Action: "WITHDRAW",
+						Handoff: biz.Handoff{
+							SlotID:           0,
+							ID:               "release",
+							SourceInstanceID: "ia",
+							SourceEpoch:      source.Epochs[0],
+						},
+					},
+				},
+			},
+		),
+	)
+	withdrawn, err := repo.Handoffs(ctx, "ia", 10)
+	require.NoError(t, err)
+	require.Len(t, withdrawn, 1)
+	assert.Equal(t, "RELEASE", withdrawn[0].Kind)
+	assert.Equal(t, "DRAINING", withdrawn[0].Phase,
+		"a withdrawal starts the drain; recovery completes it after the quiet window")
+	assert.False(t, withdrawn[0].NotBefore.IsZero())
+	require.Empty(t, withdrawn[0].TargetInstanceID)
+	require.NoError(
+		t,
+		db.Exec(
+			"UPDATE sequence_slot_handoffs SET not_before=? WHERE slot_id=0",
+			time.Now().Add(-time.Second),
+		).Error,
+	)
+	outcomes, err := NewOwnershipData(
+		db,
+	).ClaimSlots(ctx, biz.ClaimRequest{Slots: []uint32{0}, NodeID: "b", InstanceID: "ib", Revision: target.Revision, Lease: ha.LeaseDuration, QuietWindow: ha.QuietWindow})
+	require.NoError(t, err)
+	require.True(t, outcomes[0].Granted)
+	assert.EqualValues(t, 2, outcomes[0].Ownership.Epoch)
 }

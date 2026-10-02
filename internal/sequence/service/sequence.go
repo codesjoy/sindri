@@ -62,18 +62,7 @@ func (s *SequenceService) FetchNext(
 		return fetchNextResponse(allocation), nil
 	}
 
-	if !xerror.IsReason(err, reason.Reason_SEQUENCE_SLOT_NOT_OWNER) {
-		return nil, s.envelope(err, slot)
-	}
-	if err = s.waitForRouteVersion(ctx); err != nil {
-		return nil, s.envelope(err, slot)
-	}
-
-	allocation, err = s.allocator.FetchNextN(ctx, request.Key, request.Count)
-	if err != nil {
-		return nil, s.envelope(err, slot)
-	}
-	return fetchNextResponse(allocation), nil
+	return nil, s.envelope(err, slot)
 }
 
 func fetchNextResponse(allocation biz.SequenceAllocation) *sequencev1.FetchNextResponse {
@@ -104,18 +93,7 @@ func (s *SequenceService) FetchNextBatch(
 		return fetchNextBatchResponse(requests, allocations), nil
 	}
 
-	if !xerror.IsReason(err, reason.Reason_SEQUENCE_SLOT_NOT_OWNER) {
-		return nil, s.envelope(err, slot)
-	}
-	if err = s.waitForRouteVersion(ctx); err != nil {
-		return nil, s.envelope(err, slot)
-	}
-
-	allocations, err = s.allocator.FetchNextBatch(ctx, requests)
-	if err != nil {
-		return nil, s.envelope(err, slot)
-	}
-	return fetchNextBatchResponse(requests, allocations), nil
+	return nil, s.envelope(err, slot)
 }
 
 // checkCallerView compares the caller's own view of the slot with this node's,
@@ -134,6 +112,9 @@ func (s *SequenceService) FetchNextBatch(
 // that would otherwise be answered permanently instead of being served by a node
 // whose own fences still decide whether it may answer.
 func (s *SequenceService) checkCallerView(ctx context.Context, slot uint32) error {
+	if err := s.checkRouteVersion(ctx); err != nil {
+		return s.envelope(err, slot)
+	}
 	layout, epoch, hasEpoch := callerView(ctx)
 	if layout > 0 {
 		if local := s.route.LayoutVersion(); local > 0 && layout != local {
@@ -255,7 +236,7 @@ func parseMetadataUint(values []string) uint64 {
 	return parsed
 }
 
-func (s *SequenceService) waitForRouteVersion(ctx context.Context) error {
+func (s *SequenceService) checkRouteVersion(ctx context.Context) error {
 	md, ok := metadata.FromInContext(ctx)
 	if !ok {
 		return xerror.New(code.Code_INVALID_ARGUMENT, "not found metadata")
@@ -265,7 +246,7 @@ func (s *SequenceService) waitForRouteVersion(ctx context.Context) error {
 		return xerror.New(code.Code_INVALID_ARGUMENT, "version not found")
 	}
 	rv, err := strconv.ParseInt(v[0], 10, 64)
-	if err != nil {
+	if err != nil || rv < 0 {
 		return xerror.New(code.Code_INVALID_ARGUMENT, "version not found")
 	}
 
@@ -273,12 +254,12 @@ func (s *SequenceService) waitForRouteVersion(ctx context.Context) error {
 		return xerror.NewWithReason(reason.Reason_SEQUENCE_ROUTE_EXPIRED, "", nil)
 	}
 
-	// A caller at the current published version may still arrive before this
-	// node's allocator has applied it. Treat that as a handoff barrier to wait
-	// for, not as an expired route: only a version older than the route cache is
-	// genuinely stale.
-	if err = s.allocator.WaitForVersion(ctx, rv); err != nil {
-		return err
+	if rv > s.route.Version() {
+		return xerror.NewWithReason(
+			reason.Reason_SEQUENCE_OWNER_RECOVERING,
+			"local route is recovering",
+			nil,
+		)
 	}
 	return nil
 }
@@ -374,32 +355,18 @@ func (s *SequenceService) GetRoute(
 	out := &sequencev1.RouteSnapshot{
 		Version:       route.Version,
 		LayoutVersion: route.LayoutVersion,
-		Nodes:         make([]*sequencev1.RouteNode, 0, len(route.Nodes)),
 		Segments:      make([]*sequencev1.RouteSegment, 0, len(route.Segments)),
 	}
-	for _, node := range route.Nodes {
-		out.Nodes = append(
-			out.Nodes,
-			&sequencev1.RouteNode{
-				NodeId: node.NodeID,
-				Slots:  append([]uint32(nil), node.Slots...),
-			},
-		)
-	}
-	// Segments carry the per-slot epoch, so they are sent only when the snapshot
-	// has them. A route published from storage ownership always does; a legacy
-	// one does not, and a caller then has no epoch to check rather than a
-	// misleading zero.
-	if len(route.Segments) > 0 {
-		for _, segment := range route.Segments {
-			out.Segments = append(out.Segments, &sequencev1.RouteSegment{
-				StartSlot:       segment.StartSlot,
-				EndSlot:         segment.EndSlot,
-				OwnerNodeId:     segment.OwnerNodeID,
-				OwnerInstanceId: segment.OwnerInstanceID,
-				SlotEpoch:       segment.Epoch,
-			})
-		}
+	// Every snapshot is published from storage ownership and carries complete
+	// segments with a per-slot epoch, so there is no shape without them.
+	for _, segment := range route.Segments {
+		out.Segments = append(out.Segments, &sequencev1.RouteSegment{
+			StartSlot:       segment.StartSlot,
+			EndSlot:         segment.EndSlot,
+			OwnerNodeId:     segment.OwnerNodeID,
+			OwnerInstanceId: segment.OwnerInstanceID,
+			SlotEpoch:       segment.Epoch,
+		})
 	}
 	return &sequencev1.GetRouteResponse{Route: out}, nil
 }

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package sequence provides client-side route-aware sequence RPC support.
 package sequence
 
 import (
@@ -22,6 +23,8 @@ import (
 	"sync"
 
 	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
+	"github.com/codesjoy/yggdrasil/v3/capabilities"
+	"github.com/codesjoy/yggdrasil/v3/module"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -33,7 +36,7 @@ const (
 	MaxIDsPerKey = 10000
 	// MaxIDsPerRequest is the maximum number of IDs accepted by one batch request.
 	MaxIDsPerRequest = 100000
-	// MaxBatchConcurrency bounds concurrent owner RPCs from BatchClient.
+	// MaxBatchConcurrency bounds concurrent owner RPCs from Client.
 	MaxBatchConcurrency = 32
 )
 
@@ -59,29 +62,29 @@ type KeyAllocation struct {
 	Count   uint32
 }
 
-// BatchClient groups unfinished keys by route owner within one retry budget.
-type BatchClient struct {
+// Client groups unfinished keys by route owner within one retry budget.
+type Client struct {
 	router *Router
 	client sequencev1.SequenceGeneratorClient
 }
 
-// NewBatchClient constructs a route-aware batch client.
-func NewBatchClient(
+// NewClient constructs a route-aware client.
+func NewClient(
 	router *Router,
 	client sequencev1.SequenceGeneratorClient,
-) (*BatchClient, error) {
+) (*Client, error) {
 	if router == nil {
-		return nil, errors.New("sequence batch client: router is required")
+		return nil, errors.New("sequence client: router is required")
 	}
 	if client == nil {
-		return nil, errors.New("sequence batch client: generated client is required")
+		return nil, errors.New("sequence client: generated client is required")
 	}
-	return &BatchClient{router: router, client: client}, nil
+	return &Client{router: router, client: client}, nil
 }
 
-// FetchNext allocates every requested block or returns a whole-batch error.
+// FetchNextBatch allocates every requested block or returns a whole-batch error.
 // Results preserve request order. IDs consumed by a failed attempt may become gaps.
-func (c *BatchClient) FetchNext(
+func (c *Client) FetchNextBatch(
 	ctx context.Context,
 	requests []KeyRequest,
 ) ([]KeyAllocation, error) {
@@ -90,10 +93,10 @@ func (c *BatchClient) FetchNext(
 		return nil, err
 	}
 	if c == nil || c.router == nil || c.client == nil {
-		return nil, errors.New("sequence batch client is not initialized")
+		return nil, errors.New("sequence client is not initialized")
 	}
 	if ctx == nil {
-		return nil, errors.New("sequence batch client: context is required")
+		return nil, errors.New("sequence client: context is required")
 	}
 
 	allocations := make([]KeyAllocation, len(normalized))
@@ -152,11 +155,11 @@ func (c *BatchClient) FetchNext(
 
 func normalizeKeyRequests(requests []KeyRequest) ([]KeyRequest, error) {
 	if len(requests) == 0 {
-		return nil, errors.New("sequence batch client: requests must not be empty")
+		return nil, errors.New("sequence client: requests must not be empty")
 	}
 	if len(requests) > MaxBatchKeys {
 		return nil, fmt.Errorf(
-			"sequence batch client: at most %d keys are allowed",
+			"sequence client: at most %d keys are allowed",
 			MaxBatchKeys,
 		)
 	}
@@ -166,10 +169,10 @@ func normalizeKeyRequests(requests []KeyRequest) ([]KeyRequest, error) {
 	var total int64
 	for index, request := range requests {
 		if request.Key == "" || len(request.Key) > 256 {
-			return nil, errors.New("sequence batch client: key must contain 1..256 bytes")
+			return nil, errors.New("sequence client: key must contain 1..256 bytes")
 		}
 		if _, exists := seen[request.Key]; exists {
-			return nil, fmt.Errorf("sequence batch client: duplicate key %q", request.Key)
+			return nil, fmt.Errorf("sequence client: duplicate key %q", request.Key)
 		}
 		seen[request.Key] = struct{}{}
 		count := request.Count
@@ -178,7 +181,7 @@ func normalizeKeyRequests(requests []KeyRequest) ([]KeyRequest, error) {
 		}
 		if count > MaxIDsPerKey {
 			return nil, fmt.Errorf(
-				"sequence batch client: count for %q must not exceed %d",
+				"sequence client: count for %q must not exceed %d",
 				request.Key,
 				MaxIDsPerKey,
 			)
@@ -186,7 +189,7 @@ func normalizeKeyRequests(requests []KeyRequest) ([]KeyRequest, error) {
 		total += int64(count)
 		if total > MaxIDsPerRequest {
 			return nil, fmt.Errorf(
-				"sequence batch client: at most %d IDs are allowed per request",
+				"sequence client: at most %d IDs are allowed per request",
 				MaxIDsPerRequest,
 			)
 		}
@@ -232,7 +235,7 @@ func groupKeyRequests(
 	return groups, nil
 }
 
-func (c *BatchClient) fetchGroups(
+func (c *Client) fetchGroups(
 	ctx context.Context,
 	requests []KeyRequest,
 	groups []ownerGroup,
@@ -319,13 +322,13 @@ func decodeGroupResponse(
 	allocations []KeyAllocation,
 ) error {
 	if response == nil || len(response.GetResults()) != len(group.indexes) {
-		return errors.New("sequence batch client: server result count does not match request")
+		return errors.New("sequence client: server result count does not match request")
 	}
 	for resultIndex, original := range group.indexes {
 		request := requests[original]
 		result := response.GetResults()[resultIndex]
 		if result == nil || result.GetKey() != request.Key {
-			return errors.New("sequence batch client: server result key does not match request")
+			return errors.New("sequence client: server result key does not match request")
 		}
 		if result.GetCount() != request.Count || result.GetId() <= 0 {
 			return ErrCountUnsupported
@@ -344,4 +347,33 @@ func normalizeBatchRPCError(err error) error {
 		return fmt.Errorf("%w: %v", ErrBatchUnsupported, err)
 	}
 	return err
+}
+
+// Module registers sequence routing as App-local Yggdrasil capabilities.
+type Module struct {
+	router *Router
+}
+
+// NewModule constructs the sequence routing module.
+func NewModule(router *Router) *Module {
+	return &Module{router: router}
+}
+
+// Name returns the stable module identifier.
+func (*Module) Name() string { return ModuleName }
+
+// Capabilities registers the sequence balancer and unary client interceptor.
+func (m *Module) Capabilities() []module.Capability {
+	return []module.Capability{
+		capabilities.ProvideNamed(
+			capabilities.BalancerProviderSpec,
+			BalancerType,
+			NewBalancerProvider(m.router),
+		),
+		capabilities.ProvideOrdered(
+			capabilities.UnaryClientInterceptorSpec,
+			InterceptorName,
+			NewUnaryClientInterceptorProvider(m.router),
+		),
+	}
 }

@@ -18,11 +18,9 @@ package sequence_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -69,6 +67,18 @@ type sequenceProcessOptions struct {
 	// modeOverride is passed as --mode, which is how one image runs two shapes.
 	// When set it must win over configuredMode.
 	modeOverride string
+	// grpcPort pins the data plane's gRPC listener so a test can dial the
+	// process directly; zero asks the kernel for an ephemeral port.
+	grpcPort int
+	// migration overrides the control plane's migration limits when set.
+	migration *sequenceMigrationOptions
+}
+
+// sequenceMigrationOptions are the controlplane.migration values a test needs
+// to change; the rest keep their defaults.
+type sequenceMigrationOptions struct {
+	joinStabilityWindow time.Duration
+	batchSlots          int
 }
 
 // sequenceProcess is one started cmd/sequence child process.
@@ -180,7 +190,12 @@ func startSequenceProcess(t *testing.T, options sequenceProcessOptions) *sequenc
 		process.waitErr = cmd.Wait()
 		close(process.waitCh)
 	}()
-	t.Cleanup(func() { process.stopOrKill(t) })
+	t.Cleanup(func() {
+		process.stopOrKill(t)
+		if t.Failed() {
+			t.Logf("sequence process %s logs:\n%s", options.nodeID, process.logs())
+		}
+	})
 	process.waitForGovernor(t)
 	return process
 }
@@ -222,6 +237,22 @@ func (p *sequenceProcess) signalAndWait(ctx context.Context) error {
 	}
 }
 
+// kill terminates the process without giving it a shutdown path, which is the
+// crash a SIGKILL models: no drain, no release, no goodbye write of any kind.
+func (p *sequenceProcess) kill(t *testing.T) {
+	t.Helper()
+	p.stopOnce.Do(func() {
+		if p.cmd.Process == nil {
+			return
+		}
+		if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Errorf("kill sequence process: %v", err)
+			return
+		}
+		<-p.waitCh
+	})
+}
+
 func (p *sequenceProcess) logs() string {
 	body, err := os.ReadFile(p.logPath)
 	if err != nil {
@@ -241,27 +272,12 @@ func (p *sequenceProcess) waitForGovernor(t *testing.T) {
 			t.Fatalf("sequence process exited during startup: %v\n%s", p.waitErr, p.logs())
 		default:
 		}
-		if _, _, err := probeSequenceReadiness(p.readyURL); err == nil {
+		if _, _, err := probeReadiness(p.readyURL); err == nil {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("sequence process did not expose readiness at %s\n%s", p.readyURL, p.logs())
-}
-
-// probeSequenceReadiness reads a process's readiness endpoint.
-func probeSequenceReadiness(url string) (int, readinessReport, error) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	response, err := client.Get(url)
-	if err != nil {
-		return 0, readinessReport{}, err
-	}
-	defer func() { _ = response.Body.Close() }()
-	var report readinessReport
-	if err := json.NewDecoder(response.Body).Decode(&report); err != nil {
-		return response.StatusCode, readinessReport{}, err
-	}
-	return response.StatusCode, report, nil
 }
 
 // authorityGeneration is one instance/epoch pair and how many slots it held.
@@ -286,7 +302,7 @@ func loadAuthorityGenerations(
 	var generations []authorityGeneration
 	require.NoError(t, db.Raw(
 		"SELECT owner_instance_id AS instance_id, epoch, COUNT(*) AS slots "+
-			"FROM slot_ownership WHERE owner_instance_id = ? AND state = 'OWNED' "+
+			"FROM sequence_slot_ownership WHERE owner_instance_id = ? AND state = 'OWNED' "+
 			"GROUP BY owner_instance_id, epoch ORDER BY epoch",
 		instanceID,
 	).Scan(&generations).Error)
@@ -313,7 +329,7 @@ func requireAuthorityVacated(
 		for _, generation := range held {
 			count, err := queryCount(
 				db,
-				"SELECT COUNT(*) FROM slot_ownership "+
+				"SELECT COUNT(*) FROM sequence_slot_ownership "+
 					"WHERE owner_instance_id = ? AND epoch = ? AND state = 'OWNED'",
 				generation.InstanceID,
 				generation.Epoch,
@@ -337,7 +353,7 @@ func requireAuthorityVacated(
 // gone.
 func waitForNodeToLeaveLiveSet(t *testing.T, db *gorm.DB, nodeID string) {
 	t.Helper()
-	placement := sequencedata.NewPlacementData(db)
+	placement := sequencedata.NewPlacementData(db, processLeaseDuration, processNodeTTL)
 	require.Eventually(t, func() bool {
 		live, err := placement.LiveNodes(context.Background(), processNodeTTL)
 		if err != nil {
@@ -350,6 +366,28 @@ func waitForNodeToLeaveLiveSet(t *testing.T, db *gorm.DB, nodeID string) {
 		"node %s stayed in the fleet's live set after shutdown", nodeID)
 }
 
+// waitForNodesLive waits until every named node has a fresh lease and liveness
+// row, which is the state the planner reads before it hands out quota.
+func waitForNodesLive(t *testing.T, db *gorm.DB, nodeIDs ...string) {
+	t.Helper()
+	placement := sequencedata.NewPlacementData(db, processLeaseDuration, processNodeTTL)
+	require.Eventually(t, func() bool {
+		live, err := placement.LiveNodes(context.Background(), processNodeTTL)
+		if err != nil {
+			return false
+		}
+		for _, nodeID := range nodeIDs {
+			if !slices.ContainsFunc(live, func(node biz.NodeInfo) bool {
+				return node.ID == nodeID
+			}) {
+				return false
+			}
+		}
+		return true
+	}, discoveryTestTimeout, 50*time.Millisecond,
+		"nodes %v never joined the fleet's live set", nodeIDs)
+}
+
 // requireAuthorityAssignable claims slots the way the process that takes over
 // from a departed node would.
 //
@@ -359,13 +397,33 @@ func waitForNodeToLeaveLiveSet(t *testing.T, db *gorm.DB, nodeID string) {
 // than the quiet window that bounds the old owner's lease.
 func requireAuthorityAssignable(t *testing.T, db *gorm.DB, slots []uint32) {
 	t.Helper()
-	successor := "process-successor"
+	const (
+		successorNode     = "process-successor"
+		successorInstance = "process-successor-instance"
+	)
 	ownership := sequencedata.NewOwnershipData(db)
 	require.Eventually(t, func() bool {
+		// A takeover runs through the same authority as the process it replaces:
+		// the successor registers an instance and claims under that instance's
+		// revision, because a claim without a live lease has no authority behind
+		// it and is refused.
+		if err := ownership.RegisterInstance(
+			context.Background(),
+			successorNode,
+			successorInstance,
+		); err != nil {
+			return false
+		}
+		snapshot, err := ownership.InstanceAuthority(context.Background(), successorInstance)
+		if err != nil {
+			return false
+		}
 		outcomes, err := ownership.ClaimSlots(context.Background(), biz.ClaimRequest{
 			Slots:       slots,
-			NodeID:      successor,
-			InstanceID:  successor + "-instance",
+			NodeID:      successorNode,
+			InstanceID:  successorInstance,
+			Revision:    snapshot.Lease.Revision,
+			Lease:       processLeaseDuration,
 			QuietWindow: processQuietWindow,
 		})
 		if err != nil || len(outcomes) != len(slots) {
@@ -396,7 +454,7 @@ func requireSlotsOwnedBy(
 	require.Eventually(t, func() bool {
 		count, err := queryCount(
 			db,
-			"SELECT COUNT(*) FROM slot_ownership WHERE owner_node_id = ? AND slot_id IN ?",
+			"SELECT COUNT(*) FROM sequence_slot_ownership o JOIN sequence_instance_leases i ON o.owner_instance_id=i.instance_id WHERE i.node_id = ? AND o.slot_id IN ?",
 			ownerNodeID,
 			slots,
 		)
@@ -459,13 +517,13 @@ func sequenceProcessYAML(options sequenceProcessOptions, governorPort int) strin
           metric: {endpoint: localhost:4317, tls: {insecure: true}}
 `, governorPort, sequencepkg.NodeIDAttribute, options.nodeID)
 	if mode != "control" {
-		builder.WriteString(`  server:
+		fmt.Fprintf(&builder, `  server:
     transports: [grpc]
     interceptors: {unary: [protovalidate]}
   transports:
     grpc:
-      server: {address: "127.0.0.1:0"}
-`)
+      server: {address: "127.0.0.1:%d"}
+`, options.grpcPort)
 	}
 	if options.etcdEndpoint != "" {
 		fmt.Fprintf(&builder, `  etcd:
@@ -521,7 +579,9 @@ func sequenceProcessYAML(options sequenceProcessOptions, governorPort int) strin
         reserve_timeout: 1s
       node:
         id: %s
-        heartbeat_timeout_ticks: 3
+        heartbeat_interval: 50ms
+        route_refresh_interval: 50ms
+        handoff_interval: 50ms
         route_query_timeout: 150ms
       ha:
         quiet_window: %s
@@ -540,9 +600,6 @@ func sequenceProcessYAML(options sequenceProcessOptions, governorPort int) strin
       coordinator_lease: 10s
       reconcile_interval: 1s
       pass_timeout: 3s
-    ticker:
-      base_tick_interval: 50ms
-      heartbeat_ticks: 1
 `,
 		mode,
 		options.database.driver,
@@ -555,5 +612,14 @@ func sequenceProcessYAML(options sequenceProcessOptions, governorPort int) strin
 		processMaxPause,
 		processNodeTTL,
 	)
+	if options.migration != nil {
+		fmt.Fprintf(&builder, `      migration:
+        join_stability_window: %s
+        batch_slots: %d
+`,
+			options.migration.joinStabilityWindow,
+			options.migration.batchSlots,
+		)
+	}
 	return builder.String()
 }
