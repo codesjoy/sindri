@@ -726,6 +726,10 @@ func normalizedSlots(slots []uint32) []uint32 {
 // the allocator version, which is the cross-node handoff barrier, only advances
 // once the claim has committed.
 func (obj *Allocator) ApplyRoute(tick int64) {
+	if !obj.applying.CompareAndSwap(false, true) {
+		return
+	}
+	defer obj.applying.Store(false)
 	obj.slotsMu.RLock()
 	pending := obj.prepareApply
 	obj.slotsMu.RUnlock()
@@ -736,7 +740,7 @@ func (obj *Allocator) ApplyRoute(tick int64) {
 	// claim would only pin one to a node that will never allocate from it until
 	// the grant aged out. The pending route is left in place rather than dropped:
 	// the fence is sticky, so nothing recoverable is lost by never applying it.
-	if _, fenced := obj.Fenced(); fenced {
+	if obj.stopping.Load() || obj.fenced.Load() != nil {
 		return
 	}
 	if retryAt := obj.claimRetryAfter.Load(); retryAt != 0 &&
@@ -744,7 +748,9 @@ func (obj *Allocator) ApplyRoute(tick int64) {
 		return
 	}
 
-	epochs, complete := obj.claimSlots(context.Background(), pending.Slots)
+	ctx, cancel := context.WithTimeout(context.Background(), obj.storeTimeout())
+	defer cancel()
+	grants, complete := obj.claimSlots(ctx, pending.Slots)
 	if !complete {
 		obj.claimRetryAfter.Store(
 			time.Now().Add(obj.claimRetryInterval()).UnixNano(),
@@ -756,44 +762,75 @@ func (obj *Allocator) ApplyRoute(tick int64) {
 				slog.Int("slot_count", len(pending.Slots)),
 			)...,
 		)
-		return
 	}
-	obj.claimRetryAfter.Store(0)
+	if complete {
+		obj.claimRetryAfter.Store(0)
+	}
 
 	obj.slotsMu.Lock()
-	defer obj.slotsMu.Unlock()
 	// The generation is the check, not the version: a local replan may have
 	// replaced this plan with a different slot set under the same published
 	// revision while the claim was in flight, and installing the superseded
 	// plan's slots would put this instance back on a slot it no longer wants.
-	if obj.prepareApply == nil || obj.prepareApply.Generation != pending.Generation {
+	if obj.stopping.Load() || obj.fenced.Load() != nil || obj.prepareApply == nil ||
+		obj.prepareApply.Generation != pending.Generation {
+		obj.slotsMu.Unlock()
+		obj.releaseUninstalled(ctx, grants)
 		return
 	}
+	var detached []detachedSlot
+	remaining := make([]uint32, 0, len(pending.Slots))
+	obsolete := make(map[uint32]localGrant)
 	for _, slotID := range pending.Slots {
-		slot := obj.slots[slotID]
-		if slot == nil {
-			slot = &allocationSlot{}
-			obj.slots[slotID] = slot
-		}
-		epoch, ok := epochs[slotID]
-		if !ok {
+		grant, ok := grants[slotID]
+		if obj.hasAuthority() &&
+			(!ok || obj.monoNow() >= grant.anchor+int64(obj.ha.LeaseDeadline())) {
+			remaining = append(remaining, slotID)
+			if ok {
+				obsolete[slotID] = grant
+			}
 			continue
 		}
-		// A successful claim is what reopens a slot that a fence closed: the
-		// gate is only cleared together with a fresh epoch, so a slot can never
-		// come back serving under the authority that fenced it.
-		slot.draining.Store(false)
-		obj.installEpoch(slot, epoch)
+		if old := obj.slots[slotID]; old != nil {
+			old.draining.Store(true)
+			obj.cancelSlotRetries(old)
+			obj.cachedKeys.Add(-old.count.Load())
+			detached = append(detached, detachedSlot{slotID: slotID, slot: old})
+		}
+		// A new authority never inherits a cached range or an in-flight gate.
+		slot := &allocationSlot{}
+		obj.installGrant(slot, grant)
+		obj.slots[slotID] = slot
 	}
 	obj.rebuildCleanupSlotsLocked()
 	// Only a larger published revision moves the client-visible version and
 	// releases the handoff barrier. A plan for the version already applied
 	// changed which slots this node holds, not what the fleet was told.
-	if pending.Version > obj.version {
+	if len(remaining) == 0 && pending.Version > obj.version {
 		obj.version = pending.Version
 		close(obj.versionCh)
 		obj.versionCh = make(chan struct{})
 	}
-	obj.logger.Info("apply route change", slog.Int64("version", pending.Version))
-	obj.prepareApply = nil
+	if len(remaining) == 0 {
+		obj.logger.Info("apply route change", slog.Int64("version", pending.Version))
+		obj.prepareApply = nil
+	} else {
+		next := *pending
+		next.Slots = remaining
+		obj.prepareApply = &next
+	}
+	obj.slotsMu.Unlock()
+	obj.drainAndReleaseWithin(ctx, detached)
+	obj.releaseUninstalled(ctx, obsolete)
+}
+
+func (obj *Allocator) releaseUninstalled(ctx context.Context, grants map[uint32]localGrant) {
+	targets := make([]SlotAuthority, 0, len(grants))
+	for slot, grant := range grants {
+		targets = append(targets, SlotAuthority{
+			SlotID: slot, InstanceID: obj.instanceID, Epoch: grant.epoch,
+		})
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].SlotID < targets[j].SlotID })
+	obj.releaseSlots(ctx, targets)
 }

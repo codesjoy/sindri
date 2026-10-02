@@ -76,6 +76,7 @@ type SequenceRepo interface {
 type reservationScope struct {
 	store     SequenceRepo
 	authority ReservationAuthority
+	timeout   time.Duration
 }
 
 // ReservationRequest asks the repository to reserve a range for one key.
@@ -178,6 +179,7 @@ type Allocator struct {
 	// same published version, so the version cannot answer that question.
 	planGeneration    uint64
 	claimRetryAfter   atomic.Int64
+	applying          atomic.Bool
 	lastCleanup       atomic.Int64
 	cachedKeys        atomic.Int64
 	admissionRejected atomic.Int64

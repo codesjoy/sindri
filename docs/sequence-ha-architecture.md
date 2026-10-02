@@ -150,6 +150,21 @@ The local deadline actually armed on a slot is `L - epsilon`
 (`LeaseDeadline`). It is derived rather than configured so a renewal is always
 attempted while the storage grant is still valid.
 
+The deadline is anchored to a monotonic reading taken **before** sending the
+claim or renewal. Time spent waiting for storage consumes that interval rather
+than extending it. Each claim batch retains its own anchor; a grant already
+expired when it arrives is never installed as serving authority. Claims retain
+confirmed progress across bounded passes, and the directory-version barrier
+advances only after the current plan finishes. A new epoch installs fresh local
+state and never inherits the previous epoch's cached ranges.
+
+Every cursor advance and standby activation checks the local slot before and
+after the in-memory operation. Storage, lock and prefetch waits precede those
+checks. A rejected operation may consume IDs but returns no allocation, and
+foreground reservations have their own `reserve_timeout` within the caller's
+deadline. Every reservation, including a merged batch, presents both epochs and
+the storage lease.
+
 ### 3.3 Quiet window lower bound
 
 `W` must satisfy

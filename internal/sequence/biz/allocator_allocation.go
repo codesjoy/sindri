@@ -80,7 +80,10 @@ func (k *keyState) allocate(
 	if k.initialized.Load() {
 		hadRange = true
 		generation = k.generation.Load()
-		gateStart := k.gateReading()
+		gateStart, err := k.beginLinearization()
+		if err != nil {
+			return 0, err
+		}
 		candidate = k.next.Add(1)
 		if generation%2 == 0 && k.inActiveRange(candidate) &&
 			generation == k.generation.Load() {
@@ -89,6 +92,11 @@ func (k *keyState) allocate(
 			}
 			k.afterAllocate(scope, key, cfg, now, candidate, 1, generation)
 			return candidate, nil
+		}
+		// Even an exhausted or superseded cursor advance must measure its pause;
+		// entering a new slow-path gate must not erase that observation.
+		if err := k.checkLinearizationBound(gateStart); err != nil {
+			return 0, err
 		}
 	}
 
@@ -124,13 +132,26 @@ func (k *keyState) gateReading() int64 {
 	return k.allocator.monoNow()
 }
 
+func (k *keyState) beginLinearization() (int64, error) {
+	started := k.gateReading()
+	if k.allocator != nil {
+		if err := k.allocator.checkAllocationSlot(k.slot); err != nil {
+			return 0, err
+		}
+	}
+	return started, nil
+}
+
 // checkLinearizationBound discards an allocation whose in-memory linearisation
 // outran the configured process-pause bound (section 3.4).
 func (k *keyState) checkLinearizationBound(started int64) error {
 	if k.allocator == nil {
 		return nil
 	}
-	return k.allocator.checkFastPathBound(k.slot, started)
+	if err := k.allocator.checkFastPathBound(k.slot, started); err != nil {
+		return err
+	}
+	return k.allocator.checkAllocationSlot(k.slot)
 }
 
 func (k *keyState) allocateSlow(
@@ -145,26 +166,35 @@ func (k *keyState) allocateSlow(
 ) (int64, uint64, error) {
 	for {
 		k.mu.Lock()
+		gateStart, err := k.beginLinearization()
+		if err != nil {
+			k.mu.Unlock()
+			return 0, 0, err
+		}
 		if k.initialized.Load() {
 			currentGeneration := k.generation.Load()
 			if hadRange && generation == currentGeneration && k.inActiveRange(candidate) {
 				k.touch(now())
 				k.mu.Unlock()
-				return candidate, currentGeneration, nil
+				return candidate, currentGeneration, k.checkLinearizationBound(gateStart)
 			}
 
 			candidate = k.next.Add(1)
 			if k.inActiveRange(candidate) {
 				k.touch(now())
 				k.mu.Unlock()
-				return candidate, currentGeneration, nil
+				return candidate, currentGeneration, k.checkLinearizationBound(gateStart)
+			}
+			if err := k.checkLinearizationBound(gateStart); err != nil {
+				k.mu.Unlock()
+				return 0, 0, err
 			}
 		}
 
 		if k.standby != nil {
 			id, nextGeneration := k.activateStandbyLocked(now(), 1, cfg)
 			k.mu.Unlock()
-			return id, nextGeneration, nil
+			return id, nextGeneration, k.checkLinearizationBound(gateStart)
 		}
 
 		if k.fetch != nil {
@@ -374,6 +404,11 @@ func reserveRanges(
 ) ([]SequenceRange, error) {
 	if len(requests) == 0 {
 		return nil, nil
+	}
+	if scope.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, scope.timeout)
+		defer cancel()
 	}
 	reserved, err := scope.store.ReserveRanges(ctx, scope.authority, requests)
 	if err != nil {
@@ -933,15 +968,19 @@ func (k *keyState) tryAllocateBlock(count int64) (int64, uint64, bool, error) {
 		return 0, 0, false, nil
 	}
 	last := current + count
-	gateStart := k.gateReading()
+	gateStart, err := k.beginLinearization()
+	if err != nil {
+		return 0, 0, false, err
+	}
 	if !k.next.CompareAndSwap(current, last) {
 		return 0, 0, false, nil
 	}
-	if generation != k.generation.Load() {
-		return 0, 0, false, nil
-	}
+	sameGeneration := generation == k.generation.Load()
 	if err := k.checkLinearizationBound(gateStart); err != nil {
 		return 0, 0, false, err
+	}
+	if !sameGeneration {
+		return 0, 0, false, nil
 	}
 	return current + 1, generation, true, nil
 }
@@ -970,10 +1009,15 @@ func (k *keyState) allocateBlockSlow(
 		if k.standby != nil {
 			size := k.standby.End - k.standby.Start + 1
 			if size >= count {
+				gateStart, guardErr := k.beginLinearization()
+				if guardErr != nil {
+					k.mu.Unlock()
+					return 0, 0, guardErr
+				}
 				first, generation := k.activateStandbyLocked(now(), count, cfg)
 				k.touch(now())
 				k.mu.Unlock()
-				return first, generation, nil
+				return first, generation, k.checkLinearizationBound(gateStart)
 			}
 			k.standby = nil
 		}

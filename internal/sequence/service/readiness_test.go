@@ -59,10 +59,17 @@ func (handlerOwnershipRepo) StorageClock(context.Context) (time.Time, error) {
 }
 
 func (handlerOwnershipRepo) ClaimSlots(
-	context.Context,
-	biz.ClaimRequest,
+	_ context.Context,
+	request biz.ClaimRequest,
 ) ([]biz.ClaimOutcome, error) {
-	return nil, nil
+	grants := make([]biz.ClaimOutcome, len(request.Slots))
+	for index, slot := range request.Slots {
+		grants[index] = biz.ClaimOutcome{Granted: true, Ownership: biz.Ownership{
+			SlotID: slot, OwnerNodeID: request.NodeID, OwnerInstanceID: request.InstanceID,
+			Epoch: 1, State: biz.SlotOwned,
+		}}
+	}
+	return grants, nil
 }
 
 func (handlerOwnershipRepo) RenewSlots(

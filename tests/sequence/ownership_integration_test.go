@@ -321,9 +321,9 @@ func TestReservationOwnershipFenceBlocksTakeover(t *testing.T) {
 // TestSlotOwnershipClaimIsIdempotentForItsOwnInstance is the regression test for
 // the claim livelock.
 //
-// A node claims the authority for a new route in batches and drops the whole
-// claim unless every batch granted every slot it asked for, so retrying is the
-// only recovery it has. The rows an attempt already took must therefore be
+// A node claims the authority for a new route in batches. Even with retained
+// confirmed progress, uncertain replies can require claiming the same slots
+// again. The rows an attempt already took must therefore be
 // grantable by the attempt that follows it: they belong to the same claimant, and
 // the quiet window exists to protect a *previous* owner which may still be
 // allocating, not the claimant itself. Refusing them instead made a claim that
@@ -416,6 +416,60 @@ func TestSlotOwnershipClaimIsIdempotentForItsOwnInstance(t *testing.T) {
 				t,
 				ownershipOwnerA,
 				loadSlotOwnership(t, repo, otherSlot).OwnerInstanceID,
+			)
+		})
+	}
+}
+
+func TestExpiredReservationNeverAdvancesWatermarks(t *testing.T) {
+	for _, item := range harnesses {
+		t.Run(item.name, func(t *testing.T) {
+			db := openGORM(t, item)
+			ownership := sequencedata.NewOwnershipData(db)
+			store := sequencedata.NewSequenceData(db)
+			ctx := context.Background()
+			keys := []string{"lease-contract-live", "lease-contract-expired"}
+			require.NotEqual(t, biz.SlotForKey(keys[0]), biz.SlotForKey(keys[1]))
+			authority := claimOwnedSlots(t, db, "reservation-lease-contract", keys...)
+			authority.Lease = 10 * time.Minute
+			authority.Epochs = make(map[uint32]uint64)
+			for _, key := range keys {
+				slot := biz.SlotForKey(key)
+				authority.Epochs[slot] = loadSlotOwnership(t, ownership, slot).Epoch
+				_, err := reserveRange(ctx, store, authority, key, 5)
+				require.NoError(t, err)
+			}
+			clock, err := ownership.StorageClock(ctx)
+			require.NoError(t, err)
+			require.NoError(t, db.Table("slot_ownership").
+				Where("slot_id = ?", biz.SlotForKey(keys[1])).
+				Update("granted_at", clock.Add(-time.Hour)).Error)
+			loadEnds := func() []int64 {
+				t.Helper()
+				ends := make([]int64, len(keys))
+				for index, key := range keys {
+					var model sequencedata.SequenceModel
+					require.NoError(
+						t,
+						db.Where("namespace = ? AND sequence_key = ?", "", key).First(&model).Error,
+					)
+					ends[index] = model.ReservedEnd
+				}
+				return ends
+			}
+			before := loadEnds()
+			_, err = reserveRange(ctx, store, authority, keys[1], 10)
+			require.ErrorIs(t, err, biz.ErrLeaseExpired)
+			require.Equal(t, before, loadEnds())
+			_, err = store.ReserveRanges(ctx, authority, []biz.ReservationRequest{
+				{Key: keys[0], Step: 10}, {Key: keys[1], Step: 10},
+			})
+			require.ErrorIs(t, err, biz.ErrLeaseExpired)
+			require.Equal(
+				t,
+				before,
+				loadEnds(),
+				"one expired slot must reject the entire reservation",
 			)
 		})
 	}

@@ -30,7 +30,8 @@ import (
 func (obj *Allocator) scope() reservationScope {
 	return reservationScope{
 		store:     obj.store,
-		authority: ReservationAuthority{InstanceID: obj.instanceID},
+		authority: ReservationAuthority{InstanceID: obj.instanceID, Lease: obj.ha.LeaseDuration},
+		timeout:   obj.storeTimeout(),
 	}
 }
 
@@ -62,29 +63,28 @@ func (obj *Allocator) ownershipLogArgs() []any {
 	}
 }
 
-// claimSlots acquires the storage authority for the slots this instance is
-// about to serve and returns their epochs. complete is false when at least one
-// slot is still held by another instance whose quiet window has not elapsed; the
-// caller then defers the whole route, because a slot must never become
-// allocatable before this instance is its authoritative owner.
+type localGrant struct {
+	epoch  uint64
+	anchor int64
+}
+
+// claimSlots keeps confirmed batches even when the pass budget is exhausted.
 func (obj *Allocator) claimSlots(
 	ctx context.Context,
 	slots []uint32,
-) (map[uint32]uint64, bool) {
+) (map[uint32]localGrant, bool) {
 	if obj.ownership == nil || len(slots) == 0 {
 		return nil, true
 	}
-	epochs := make(map[uint32]uint64, len(slots))
+	grants := make(map[uint32]localGrant, len(slots))
 	complete := true
 	for start := 0; start < len(slots); start += ownershipBatchSize {
 		end := min(start+ownershipBatchSize, len(slots))
-		// Each statement carries its own bound rather than one deadline covering
-		// the whole claim. A claim covers every slot the node gains at once, which
-		// can be the entire space and therefore many batches, and the batches spend
-		// a shared bound serially: a claim that is legal but slow then fails whole
-		// and is retried whole, so a route needing more batches than the bound can
-		// carry never loads at all.
+		if ctx.Err() != nil {
+			return grants, false
+		}
 		batchCtx, cancel := context.WithTimeout(ctx, obj.storeTimeout())
+		anchor := obj.monoNow()
 		outcomes, err := obj.ownership.ClaimSlots(batchCtx, ClaimRequest{
 			Slots:       slots[start:end],
 			NodeID:      obj.nodeID,
@@ -97,7 +97,7 @@ func (obj *Allocator) claimSlots(
 				"claim slot ownership",
 				append(obj.ownershipLogArgs(), "error", err)...,
 			)
-			return nil, false
+			return grants, false
 		}
 		for _, outcome := range outcomes {
 			if !outcome.Granted {
@@ -105,12 +105,14 @@ func (obj *Allocator) claimSlots(
 				obj.takeoversRefused.Add(1)
 				continue
 			}
-			epochs[outcome.Ownership.SlotID] = outcome.Ownership.Epoch
+			grants[outcome.Ownership.SlotID] = localGrant{
+				epoch: outcome.Ownership.Epoch, anchor: anchor,
+			}
 			obj.takeoversGranted.Add(1)
 			obj.epochChanges.Add(1)
 		}
 	}
-	return epochs, complete
+	return grants, complete
 }
 
 // releaseSlots performs the explicit epoch-CAS release of section 6.5. It is
@@ -165,6 +167,12 @@ type detachedSlot struct {
 // owner start while this instance could still hand out an id from its cached
 // range, which is exactly the regression the whole protocol exists to prevent.
 func (obj *Allocator) drainAndRelease(detached []detachedSlot) {
+	obj.drainAndReleaseWithin(context.Background(), detached)
+}
+
+// drainAndReleaseWithin also respects a route-apply pass's total work budget.
+// If it expires, unreleased authority is left to age out, never released early.
+func (obj *Allocator) drainAndReleaseWithin(ctx context.Context, detached []detachedSlot) {
 	if len(detached) == 0 {
 		return
 	}
@@ -175,7 +183,11 @@ func (obj *Allocator) drainAndRelease(detached []detachedSlot) {
 	}
 	targets := make([]SlotAuthority, 0, len(detached))
 	for _, item := range detached {
-		if !item.slot.drain(timeout) {
+		remaining := timeout
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining = min(remaining, max(time.Until(deadline), 0))
+		}
+		if !item.slot.drain(remaining) {
 			obj.logger.Error(
 				"slot drain timed out; authority retained until the lease expires",
 				append(obj.ownershipLogArgs(),
@@ -198,7 +210,7 @@ func (obj *Allocator) drainAndRelease(detached []detachedSlot) {
 	if len(targets) == 0 {
 		return
 	}
-	released := obj.releaseSlots(context.Background(), targets)
+	released := obj.releaseSlots(ctx, targets)
 	obj.drains.Add(1)
 	obj.lastDrainMicros.Store(secondsToMicros(obj.now().Sub(started)))
 	obj.logger.Info(
@@ -357,6 +369,18 @@ func (obj *Allocator) checkLocalLease(slot *allocationSlot) error {
 	)
 }
 
+// checkAllocationSlot also guards requests that waited after entering the gate.
+func (obj *Allocator) checkAllocationSlot(slot *allocationSlot) error {
+	if slot == nil || !obj.hasAuthority() {
+		return nil
+	}
+	if slot.draining.Load() || obj.fenced.Load() != nil {
+		return xerror.NewWithReason(reason.Reason_SEQUENCE_OWNER_RECOVERING,
+			"slot is no longer serving this allocation", nil)
+	}
+	return obj.checkLocalLease(slot)
+}
+
 // checkFastPathBound measures the in-memory linearisation of section 3.4.
 //
 // A pause inside the interval between passing the gate and advancing the cursor
@@ -411,22 +435,14 @@ func (obj *Allocator) fenceSlot(slot *allocationSlot, why string) {
 // installEpoch records the epoch this instance holds for a slot, dates the
 // renewal cadence, and arms the local lease.
 //
-// The epoch is what the storage lease check and the release CAS compare against,
-// so it must be current. The deadline is derived from a reading taken here,
-// before any request is sent, and the safety margin keeps it strictly inside the
-// storage lease so a renewal is always attempted while the row is valid.
-//
-// renewedAt is dated for the same reason: it is what tells the renewal loop a
-// grant is due, and a node that never renewed would stop serving on a slot it
-// still legitimately holds.
-func (obj *Allocator) installEpoch(slot *allocationSlot, epoch uint64) {
-	slot.epoch.Store(epoch)
-	now := obj.monoNow()
-	slot.renewedAt.Store(now)
+// The anchor precedes the storage request, not the arrival of its response.
+func (obj *Allocator) installGrant(slot *allocationSlot, grant localGrant) {
+	slot.epoch.Store(grant.epoch)
+	slot.renewedAt.Store(grant.anchor)
 	if !obj.hasAuthority() {
 		return
 	}
-	slot.localDeadline.Store(now + int64(obj.ha.LeaseDeadline()))
+	slot.localDeadline.Store(grant.anchor + int64(obj.ha.LeaseDeadline()))
 }
 
 // RenewalBatchObserver receives the duration and the number of slots of one
@@ -543,6 +559,7 @@ func (obj *Allocator) RenewLeases() {
 	// lease: only a row this instance still owns at this epoch is refreshed, so a
 	// renewal can never resurrect authority a takeover already replaced, and a
 	// grant that lapsed without a takeover stays recoverable.
+	anchor := obj.monoNow()
 	renewStarted := time.Now()
 	renewed, err := obj.ownership.RenewSlots(ctx, RenewRequest{
 		Groups: groups,
@@ -566,15 +583,15 @@ func (obj *Allocator) RenewLeases() {
 	for _, row := range renewed {
 		renewedEpochs[row.SlotID] = row.Epoch
 	}
-	deadline := obj.monoNow() + int64(obj.ha.LeaseDeadline())
+	deadline := anchor + int64(obj.ha.LeaseDeadline())
 	for _, item := range pending {
 		// A row that did not come back is not held any more, so it is fenced
 		// rather than re-armed with a deadline it cannot honour.
-		if renewedEpochs[item.slotID] != item.epoch {
+		if renewedEpochs[item.slotID] != item.epoch || obj.monoNow() >= deadline {
 			obj.fenceSlot(item.slot, "lease renewal did not confirm the grant")
 			continue
 		}
-		item.slot.renewedAt.Store(obj.monoNow())
+		item.slot.renewedAt.Store(anchor)
 		item.slot.localDeadline.Store(deadline)
 		obj.renewalSucceeded.Add(1)
 	}
