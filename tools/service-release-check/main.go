@@ -47,18 +47,63 @@ type release struct {
 type checker struct {
 	repo      string
 	skipBuild bool
+	candidate bool
 }
 
 func main() {
 	service := flag.String("service", "", "service name")
 	version := flag.String("version", "", "service release version")
 	repo := flag.String("repo", ".", "repository root")
+	mode := flag.String("mode", "published", "published, candidate, metadata, or prepare-sums")
 	flag.Parse()
-	if err := (&checker{repo: *repo}).run(*service, *version); err != nil {
+	check := &checker{
+		repo:      *repo,
+		candidate: *mode != "published",
+		skipBuild: *mode == "metadata" || *mode == "prepare-sums",
+	}
+	if *mode != "published" && *mode != "candidate" && *mode != "metadata" &&
+		*mode != "prepare-sums" {
+		fmt.Fprintln(os.Stderr, "invalid release check mode")
+		os.Exit(2)
+	}
+	if *version == "" && check.candidate {
+		selected, err := check.selectCandidate(*service)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		*version = selected.Version
+	}
+	if err := check.run(*service, *version); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Printf("service release checks passed for %s %s\n", *service, *version)
+	if *mode == "prepare-sums" {
+		selected, err := check.selectCandidate(*service)
+		if err == nil {
+			err = check.clearCandidateSums(selected)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *mode == "metadata" {
+		selected, err := check.selectCandidate(*service)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		for _, tag := range append([]string{selected.Contract}, selected.TestedClients...) {
+			if tag != "" {
+				_, v := tagModule(tag)
+				fmt.Printf("%s %s\n", tagDirectory(tag), v)
+			}
+		}
+		return
+	}
+	fmt.Printf("%s service release checks passed for %s %s\n", *mode, *service, *version)
 }
 
 func (c *checker) run(service, version string) error {
@@ -112,6 +157,26 @@ func (c *checker) run(service, version string) error {
 	if entry.Contract != "" && !strings.HasPrefix(entry.Contract, "gen/go/"+service+"/") {
 		return fmt.Errorf("contract tag %s does not belong to service %s", entry.Contract, service)
 	}
+	if c.candidate {
+		if err := c.validateCandidateDependencies(*entry); err != nil {
+			return err
+		}
+		if c.skipBuild {
+			return nil
+		}
+		cmd := exec.CommandContext(
+			context.Background(),
+			"sh",
+			"scripts/check-module-release.sh",
+			service,
+		)
+		cmd.Dir = c.repo
+		cmd.Env = append(os.Environ(), "MODULE_CHECK_SERVICE_BUILD=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("candidate isolation check:\n%s\n%w", output, err)
+		}
+		return nil
+	}
 	if err := c.validateTags(*entry); err != nil {
 		return err
 	}
@@ -129,6 +194,104 @@ func (c *checker) run(service, version string) error {
 		return nil
 	}
 	return c.validateServiceBuild(service)
+}
+
+func (c *checker) selectCandidate(service string) (release, error) {
+	if !regexp.MustCompile(`^[a-z][a-z0-9]*$`).MatchString(service) {
+		return release{}, fmt.Errorf("invalid service name %q", service)
+	}
+	data, err := os.ReadFile(filepath.Join(c.repo, "releases", "services", service+".yaml"))
+	if err != nil {
+		return release{}, err
+	}
+	doc, err := decodeManifest(data)
+	if err != nil {
+		return release{}, err
+	}
+	var selected *release
+	for i := range doc.Releases {
+		if c.validateCandidateDependencies(doc.Releases[i]) == nil {
+			if selected != nil {
+				return release{}, errors.New(
+					"ambiguous candidate release mapping; supply distinct module versions",
+				)
+			}
+			selected = &doc.Releases[i]
+		}
+	}
+	if selected == nil {
+		return release{}, errors.New("no release mapping matches the current module dependencies")
+	}
+	return *selected, nil
+}
+
+func (c *checker) validateCandidateDependencies(entry release) error {
+	root, err := c.goModJSON(filepath.Join(c.repo, "go.mod"))
+	if err != nil {
+		return err
+	}
+	contractPath, contractVersion := "", ""
+	if entry.Contract != "" {
+		contractPath, contractVersion = tagModule(entry.Contract)
+		if root[contractPath] != contractVersion {
+			return errors.New("candidate contract does not match root dependency")
+		}
+	}
+	for _, tag := range entry.TestedClients {
+		path, version := tagModule(tag)
+		if root[path] != version {
+			return errors.New("candidate client does not match root dependency")
+		}
+		client, err := c.goModJSON(filepath.Join(c.repo, tagDirectory(tag), "go.mod"))
+		if err != nil {
+			return err
+		}
+		if client[contractPath] != contractVersion {
+			return errors.New("candidate SDK contract dependency does not match manifest")
+		}
+	}
+	return nil
+}
+
+// clearCandidateSums allows deliberate regeneration only for untagged local
+// candidates. All published and third-party checksums remain authoritative.
+func (c *checker) clearCandidateSums(entry release) error {
+	versions := make(map[string]string)
+	for _, tag := range append([]string{entry.Contract}, entry.TestedClients...) {
+		if tag == "" {
+			continue
+		}
+		if _, err := c.git("rev-parse", "--verify", "refs/tags/"+tag+"^{commit}"); err == nil {
+			return fmt.Errorf("cannot regenerate checksums for tagged module %s", tag)
+		}
+		path, version := tagModule(tag)
+		versions[path] = version
+	}
+	paths := []string{filepath.Join(c.repo, "go.sum")}
+	for _, client := range entry.TestedClients {
+		paths = append(paths, filepath.Join(c.repo, tagDirectory(client), "go.sum"))
+	}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		var kept strings.Builder
+		for _, line := range strings.SplitAfter(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) == 3 && versions[fields[0]] == strings.TrimSuffix(fields[1], "/go.mod") {
+				continue
+			}
+			kept.WriteString(line)
+		}
+		if err := os.WriteFile(path, []byte(kept.String()), 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func decodeManifest(data []byte) (manifest, error) {

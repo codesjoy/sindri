@@ -18,7 +18,7 @@ set: [ pipefail ]
 
 vars:
   GO: '{{default "go" .GO}}'
-  SERVICE: '{{default "sequence" .SERVICE}}'
+  SERVICE: '{{default "" .SERVICE}}'
   PROFILE: '{{default "service" .PROFILE}}'
   MONTH: '{{default "" .MONTH}}'
   COPYRIGHT_YEAR: '{{now | date "2006"}}'
@@ -206,6 +206,14 @@ tasks:
     cmds:
       - '"{{.TOOL_DIR}}/golangci-lint" fmt --diff'
 
+  fmt:files:
+    desc: Format an explicit list of Go files without lint fixes
+    requires:
+      vars: [ FILES ]
+    deps: [ tools:check ]
+    cmds:
+      - '"{{.TOOL_DIR}}/golangci-lint" fmt {{.FILES}}'
+
   test:package:
     desc: Run tests for PACKAGE in MODULE (default root module)
     requires:
@@ -287,12 +295,21 @@ tasks:
     cmds:
       - './scripts/check-module-release.sh "{{.SERVICE}}"'
 
+  modules:prepare:
+    desc: Generate candidate module checksums using an isolated local proxy
+    requires:
+      vars: [ SERVICE ]
+    cmds:
+      - './scripts/check-module-release.sh "{{.SERVICE}}" prepare'
+
   service-release:check:
-    desc: Validate SERVICE VERSION against published modules
+    desc: Validate SERVICE VERSION against published or candidate modules (MODE)
     requires:
       vars: [ VERSION ]
+    vars:
+      MODE: '{{default "published" .MODE}}'
     cmds:
-      - '{{.GO}} run ./tools/service-release-check -service "{{.SERVICE}}" -version "{{.VERSION}}"'
+      - '{{.GO}} run ./tools/service-release-check -service "{{.SERVICE}}" -version "{{.VERSION}}" -mode "{{.MODE}}"'
 
   release:check:
     desc: Validate SERVICE modules before creating module tags

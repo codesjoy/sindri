@@ -122,7 +122,7 @@ jobs:
       - name: Run complete merge gate
         run: task verify
       - name: Verify the sequence release manifest
-        run: task service-release:check SERVICE=sequence VERSION=v0.1.0
+        run: task service-release:check SERVICE=sequence VERSION=v0.2.0 MODE=candidate
 
   integration-postgres:
     if: github.event_name == 'pull_request'

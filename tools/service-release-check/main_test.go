@@ -65,6 +65,73 @@ releases:
 	}
 }
 
+func TestCandidateChecksLocalDependenciesWithoutPublishedTags(t *testing.T) {
+	repo := newFixture(t, "v0.2.0")
+	writeFile(
+		t,
+		repo,
+		"go.mod",
+		strings.ReplaceAll(rootGoMod("v0.2.0"), "gen/go/alpha v0.1.0", "gen/go/alpha v0.2.0"),
+	)
+	writeFile(
+		t,
+		repo,
+		"pkg/alpha/go.mod",
+		"module github.com/codesjoy/sindri/pkg/alpha\n\ngo 1.26.4\n\nrequire github.com/codesjoy/sindri/gen/go/alpha v0.2.0\n",
+	)
+	writeFile(
+		t,
+		repo,
+		"releases/services/alpha.yaml",
+		"service: alpha\nreleases:\n  - version: v0.2.0\n    contract: gen/go/alpha/v0.2.0\n    tested_clients:\n      - pkg/alpha/v0.2.0\n",
+	)
+	check := &checker{repo: repo, skipBuild: true, candidate: true}
+	if err := check.run("alpha", "v0.2.0"); err != nil {
+		t.Fatal(err)
+	}
+	selected, err := check.selectCandidate("alpha")
+	if err != nil || selected.Version != "v0.2.0" {
+		t.Fatalf("select candidate: %+v, %v", selected, err)
+	}
+	if err := (&checker{repo: repo, skipBuild: true}).run("alpha", "v0.2.0"); err == nil {
+		t.Fatal("published mode accepted missing tags")
+	}
+	writeFile(
+		t,
+		repo,
+		"go.sum",
+		"github.com/codesjoy/sindri/gen/go/alpha v0.1.0 h1:published\ngithub.com/codesjoy/sindri/gen/go/alpha v0.2.0 h1:candidate\n",
+	)
+	if err := check.clearCandidateSums(selected); err != nil {
+		t.Fatal(err)
+	}
+	sums, err := os.ReadFile(filepath.Join(repo, "go.sum"))
+	if err != nil ||
+		string(sums) != "github.com/codesjoy/sindri/gen/go/alpha v0.1.0 h1:published\n" {
+		t.Fatalf("published checksum changed: %s, %v", sums, err)
+	}
+	writeFile(
+		t,
+		repo,
+		"pkg/alpha/go.mod",
+		"module github.com/codesjoy/sindri/pkg/alpha\n\ngo 1.26.4\n\nrequire github.com/codesjoy/sindri/gen/go/alpha v0.1.0\n",
+	)
+	if err := check.run("alpha", "v0.2.0"); err == nil {
+		t.Fatal("candidate accepted mismatched SDK contract")
+	}
+	if _, err := check.selectCandidate("alpha"); err == nil {
+		t.Fatal("candidate accepted missing dependency mapping")
+	}
+}
+
+func TestPreparationRefusesTaggedModuleChecksums(t *testing.T) {
+	repo := newFixture(t, "v0.1.0")
+	check := &checker{repo: repo}
+	if err := check.clearCandidateSums(release{Contract: "gen/go/alpha/v0.1.0"}); err == nil {
+		t.Fatal("preparation accepted a published contract")
+	}
+}
+
 func TestCheckerRejectsInvalidIdentity(t *testing.T) {
 	check := &checker{repo: t.TempDir(), skipBuild: true}
 	for _, test := range []struct {

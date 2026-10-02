@@ -197,3 +197,35 @@ the migration job create the tables.
 The baseline the migration job applies must match the service you are about to
 run. Applying the baseline from a newer checkout under an older binary, or the
 reverse, is unsupported.
+
+## Release order
+
+The service release is a Git marker (`service/sequence/vX.Y.Z`), and it depends
+on the contract module and the SDK being published first. Publish, and verify,
+in dependency order:
+
+1. `gen/go/sequence/v0.2.0` — the generated contract module.
+2. `pkg/sequence/v0.2.0` — the Go SDK, which depends on the contract.
+3. `service/sequence/v0.2.0` — the service release marker.
+
+Before the tags exist, the repository validates the candidate in isolation:
+
+```sh
+task modules:prepare SERVICE=sequence
+task modules:check SERVICE=sequence
+task service-release:check SERVICE=sequence VERSION=v0.2.0 MODE=candidate
+```
+
+`modules:prepare` regenerates the candidate checksums through a local module
+proxy and writes them to the checked-in `go.sum` files. `modules:check` stays
+read-only and re-verifies the contract, the SDK, and an external consumer with
+`GOWORK=off`. `MODE=candidate` checks the manifest mapping and the isolated
+service build without requiring the tags.
+
+After the contract and SDK tags exist, run the strict check, which also
+validates the tags, the recorded history, and a build against the real published
+dependencies:
+
+```sh
+task service-release:check SERVICE=sequence VERSION=v0.2.0 MODE=published
+```
