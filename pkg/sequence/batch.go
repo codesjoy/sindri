@@ -59,7 +59,7 @@ type KeyAllocation struct {
 	Count   uint32
 }
 
-// BatchClient groups keys by route owner and invokes FetchNextBatch once per owner.
+// BatchClient groups unfinished keys by route owner within one retry budget.
 type BatchClient struct {
 	router *Router
 	client sequencev1.SequenceGeneratorClient
@@ -96,40 +96,58 @@ func (c *BatchClient) FetchNext(
 		return nil, errors.New("sequence batch client: context is required")
 	}
 
-	for attempt := 0; attempt < 2; attempt++ {
+	allocations := make([]KeyAllocation, len(normalized))
+	done := make([]bool, len(normalized))
+	err = c.router.runWithRetry(ctx, func(attemptCtx context.Context) error {
 		if c.router.Version() == 0 {
-			if err := c.router.Refresh(ctx); err != nil {
-				return nil, err
+			if err := c.router.Refresh(attemptCtx); err != nil {
+				return err
 			}
 		}
-		owners, version := c.router.ownerSnapshot()
-		if version == 0 {
-			return nil, ErrRouteUnavailable
+		pending := make([]KeyRequest, 0, len(normalized))
+		indexes := make([]int, 0, len(normalized))
+		for index, request := range normalized {
+			if !done[index] {
+				pending = append(pending, request)
+				indexes = append(indexes, index)
+			}
 		}
-		groups, err := groupKeyRequests(normalized, owners)
+		owners, _ := c.router.ownerSnapshot()
+		groups, err := groupKeyRequests(pending, owners)
 		if err != nil {
-			if errors.Is(err, ErrBatchRouteChanged) && attempt == 0 {
-				if refreshErr := c.router.Refresh(ctx); refreshErr != nil {
-					return nil, refreshErr
+			return err
+		}
+		decoded, groupErrors, fatal := c.fetchGroups(attemptCtx, pending, groups)
+		if fatal != nil {
+			return normalizeBatchRPCError(fatal)
+		}
+		var last error
+		decision := retryDecision{action: RetryAfterBackoff}
+		for index, group := range groups {
+			if groupErr := groupErrors[index]; groupErr != nil {
+				last = groupErr
+				d := classifyRetry(groupErr)
+				decision.after = max(decision.after, d.after)
+				if d.action == RetryAfterRefresh || decision.action != RetryAfterRefresh {
+					decision.action = d.action
 				}
 				continue
 			}
-			return nil, err
-		}
-
-		responses, err := c.fetchGroups(ctx, normalized, groups)
-		if err != nil {
-			if errors.Is(err, ErrBatchRouteChanged) && attempt == 0 {
-				if refreshErr := c.router.Refresh(ctx); refreshErr != nil {
-					return nil, refreshErr
-				}
-				continue
+			for _, pendingIndex := range group.indexes {
+				original := indexes[pendingIndex]
+				allocations[original] = decoded[pendingIndex]
+				done[original] = true
 			}
-			return nil, normalizeBatchRPCError(err)
 		}
-		return decodeBatchResponses(normalized, groups, responses)
+		if last != nil {
+			return &batchRetryError{err: last, decision: decision}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return nil, ErrBatchRouteChanged
+	return allocations, nil
 }
 
 func normalizeKeyRequests(requests []KeyRequest) ([]KeyRequest, error) {
@@ -218,7 +236,7 @@ func (c *BatchClient) fetchGroups(
 	ctx context.Context,
 	requests []KeyRequest,
 	groups []ownerGroup,
-) ([]*sequencev1.FetchNextBatchResponse, error) {
+) ([]KeyAllocation, []error, error) {
 	type groupResult struct {
 		index    int
 		response *sequencev1.FetchNextBatchResponse
@@ -227,6 +245,8 @@ func (c *BatchClient) fetchGroups(
 
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// The outer batch owns the retry budget and regrouping of unfinished keys.
+	callCtx = context.WithValue(callCtx, singleAttemptKey{}, true)
 	results := make(chan groupResult, len(groups))
 	semaphore := make(chan struct{}, MaxBatchConcurrency)
 	var wait sync.WaitGroup
@@ -250,24 +270,31 @@ func (c *BatchClient) fetchGroups(
 		}()
 	}
 
-	responses := make([]*sequencev1.FetchNextBatchResponse, len(groups))
-	var firstErr error
+	allocations := make([]KeyAllocation, len(requests))
+	groupErrors := make([]error, len(groups))
+	var fatal error
 	for range groups {
 		result := <-results
+		if result.err == nil {
+			// Validate immediately so a malformed success cancels remaining RPCs.
+			result.err = decodeGroupResponse(
+				requests,
+				groups[result.index],
+				result.response,
+				allocations,
+			)
+		}
 		if result.err != nil {
-			if firstErr == nil {
-				firstErr = result.err
+			groupErrors[result.index] = result.err
+			if fatal == nil && classifyRetry(result.err).action == RetryNever {
+				fatal = result.err
 				cancel()
 			}
 			continue
 		}
-		responses[result.index] = result.response
 	}
 	wait.Wait()
-	if firstErr != nil {
-		return nil, firstErr
-	}
-	return responses, nil
+	return allocations, groupErrors, fatal
 }
 
 func fetchNextBatchRequest(
@@ -285,41 +312,31 @@ func fetchNextBatchRequest(
 	return &sequencev1.FetchNextBatchRequest{Requests: protoRequests}
 }
 
-func decodeBatchResponses(
+func decodeGroupResponse(
 	requests []KeyRequest,
-	groups []ownerGroup,
-	responses []*sequencev1.FetchNextBatchResponse,
-) ([]KeyAllocation, error) {
-	allocations := make([]KeyAllocation, len(requests))
-	for groupIndex, group := range groups {
-		response := responses[groupIndex]
-		if response == nil {
-			return nil, errors.New("sequence batch client: server returned no response")
+	group ownerGroup,
+	response *sequencev1.FetchNextBatchResponse,
+	allocations []KeyAllocation,
+) error {
+	if response == nil || len(response.GetResults()) != len(group.indexes) {
+		return errors.New("sequence batch client: server result count does not match request")
+	}
+	for resultIndex, original := range group.indexes {
+		request := requests[original]
+		result := response.GetResults()[resultIndex]
+		if result == nil || result.GetKey() != request.Key {
+			return errors.New("sequence batch client: server result key does not match request")
 		}
-		if len(response.GetResults()) != len(group.indexes) {
-			return nil, errors.New(
-				"sequence batch client: server result count does not match request",
-			)
+		if result.GetCount() != request.Count || result.GetId() <= 0 {
+			return ErrCountUnsupported
 		}
-		for resultIndex, original := range group.indexes {
-			request := requests[original]
-			result := response.GetResults()[resultIndex]
-			if result == nil || result.GetKey() != request.Key {
-				return nil, errors.New(
-					"sequence batch client: server result key does not match request",
-				)
-			}
-			if result.GetCount() != request.Count || result.GetId() <= 0 {
-				return nil, ErrCountUnsupported
-			}
-			allocations[original] = KeyAllocation{
-				Key:     request.Key,
-				FirstID: result.GetId(),
-				Count:   result.GetCount(),
-			}
+		allocations[original] = KeyAllocation{
+			Key:     request.Key,
+			FirstID: result.GetId(),
+			Count:   result.GetCount(),
 		}
 	}
-	return allocations, nil
+	return nil
 }
 
 func normalizeBatchRPCError(err error) error {

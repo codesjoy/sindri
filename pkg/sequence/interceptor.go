@@ -20,12 +20,9 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/codesjoy/pkg/basic/xerror"
-	"github.com/codesjoy/sindri/gen/go/sequence/reason"
 	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
 	"github.com/codesjoy/yggdrasil/v3/rpc/interceptor"
 	"github.com/codesjoy/yggdrasil/v3/rpc/metadata"
-	"google.golang.org/genproto/googleapis/rpc/code"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -63,36 +60,17 @@ func interceptFetchNext(
 	reply any,
 	invoker interceptor.UnaryInvoker,
 ) error {
-	if err := validateInterceptorRouter(ctx, router); err != nil {
-		return err
-	}
-	slot := SlotForKey(request.GetKey())
-	version := router.Version()
-	err := invokeRouted(ctx, method, request, reply, invoker, router, slot, version)
-	if err == nil {
+	return router.runWithRetry(ctx, func(attemptCtx context.Context) error {
+		if err := validateInterceptorRouter(attemptCtx, router); err != nil {
+			return err
+		}
+		resetReply(reply)
+		if err := invokeRouted(attemptCtx, method, request, reply, invoker, router,
+			SlotForKey(request.GetKey()), router.Version()); err != nil {
+			return err
+		}
 		return validateFetchNextCount(request, reply)
-	}
-	if !isRefreshableRouteError(err) {
-		return err
-	}
-	if err := router.refreshAfter(ctx, version); err != nil {
-		return err
-	}
-	resetReply(reply)
-	err = invokeRouted(
-		ctx,
-		method,
-		request,
-		reply,
-		invoker,
-		router,
-		SlotForKey(request.GetKey()),
-		router.Version(),
-	)
-	if err != nil {
-		return err
-	}
-	return validateFetchNextCount(request, reply)
+	})
 }
 
 func interceptFetchNextBatch(
@@ -103,34 +81,32 @@ func interceptFetchNextBatch(
 	reply any,
 	invoker interceptor.UnaryInvoker,
 ) error {
-	if err := validateInterceptorRouter(ctx, router); err != nil {
-		return err
-	}
-	slot, err := batchAnchorSlot(request, router)
-	if err != nil {
-		return err
-	}
-	version := router.Version()
-	err = invokeRouted(ctx, method, request, reply, invoker, router, slot, version)
-	if err == nil {
+	return router.runWithRetry(ctx, func(attemptCtx context.Context) error {
+		if err := validateInterceptorRouter(attemptCtx, router); err != nil {
+			return err
+		}
+		slot, err := batchAnchorSlot(request, router)
+		if err != nil {
+			if single, _ := attemptCtx.Value(singleAttemptKey{}).(bool); !single {
+				return &terminalRetryError{err: err}
+			}
+			return err
+		}
+		resetReply(reply)
+		if err := invokeRouted(
+			attemptCtx,
+			method,
+			request,
+			reply,
+			invoker,
+			router,
+			slot,
+			router.Version(),
+		); err != nil {
+			return err
+		}
 		return validateFetchNextBatchCounts(request, reply)
-	}
-	if !isRefreshableRouteError(err) {
-		return err
-	}
-	if err := router.refreshAfter(ctx, version); err != nil {
-		return err
-	}
-	slot, err = batchAnchorSlot(request, router)
-	if err != nil {
-		return err
-	}
-	resetReply(reply)
-	err = invokeRouted(ctx, method, request, reply, invoker, router, slot, router.Version())
-	if err != nil {
-		return err
-	}
-	return validateFetchNextBatchCounts(request, reply)
+	})
 }
 
 func validateInterceptorRouter(ctx context.Context, router *Router) error {
@@ -264,23 +240,6 @@ func validateFetchNextBatchCounts(
 		}
 	}
 	return nil
-}
-
-// isRefreshableRouteError reports whether the error means the client's view of
-// the slot directory may be stale.
-//
-// An epoch that moved and a local lease that lapsed both mean the request was
-// routed by a directory revision the server no longer recognises, so the only
-// useful reaction is to refresh the route and try again. A malformed request
-// is deliberately not in this set: retrying it unchanged cannot help. UNAVAILABLE
-// is included wholesale because every reason that maps to it here either is
-// retriable or is already reported with its own code.
-func isRefreshableRouteError(err error) bool {
-	return xerror.IsReason(err, reason.Reason_SEQUENCE_ROUTE_EXPIRED) ||
-		xerror.IsReason(err, reason.Reason_SEQUENCE_SLOT_NOT_OWNER) ||
-		xerror.IsReason(err, reason.Reason_SEQUENCE_EPOCH_STALE) ||
-		xerror.IsReason(err, reason.Reason_SEQUENCE_LEASE_EXPIRED) ||
-		xerror.IsCode(err, code.Code_UNAVAILABLE)
 }
 
 // NewUnaryClientInterceptorProvider constructs the sequence routing interceptor provider.

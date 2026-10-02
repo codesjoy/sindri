@@ -19,6 +19,7 @@ import (
 	"errors"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/codesjoy/pkg/basic/xerror"
 	"github.com/codesjoy/sindri/gen/go/sequence/reason"
@@ -183,7 +184,7 @@ func TestSequenceInterceptorRefreshesAndRetriesRouteErrorOnce(t *testing.T) {
 	assert.Equal(t, 2, loads)
 }
 
-func TestSequenceInterceptorRefreshesAndRetriesUnavailableOnce(t *testing.T) {
+func TestSequenceInterceptorBoundsUnavailableRetries(t *testing.T) {
 	var loads int
 	router, err := NewRouter(func(
 		_ context.Context,
@@ -193,6 +194,7 @@ func TestSequenceInterceptorRefreshesAndRetriesUnavailableOnce(t *testing.T) {
 		return &sequencev1.GetRouteResponse{Route: testRoute(known+1, "node-a")}, nil
 	})
 	require.NoError(t, err)
+	router.retryWait = func(context.Context, time.Duration) error { return nil }
 	middleware := newUnaryClientInterceptor(router)
 	calls := 0
 	err = middleware(
@@ -207,8 +209,8 @@ func TestSequenceInterceptorRefreshesAndRetriesUnavailableOnce(t *testing.T) {
 	)
 	require.Error(t, err)
 	assert.True(t, xerror.IsCode(err, code.Code_UNAVAILABLE))
-	assert.Equal(t, 2, calls)
-	assert.Equal(t, 2, loads)
+	assert.Equal(t, DefaultRetryPolicy().MaxAttempts, calls)
+	assert.Equal(t, DefaultRetryPolicy().MaxAttempts, loads)
 }
 
 func TestSequenceInterceptorReturnsRefreshFailureAfterUnavailable(t *testing.T) {

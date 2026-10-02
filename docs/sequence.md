@@ -265,15 +265,67 @@ consumed by that attempt can become gaps.
 
 Applications that use multiple Sequence nodes should use the route-aware Go
 integration in `github.com/codesjoy/sindri/pkg/sequence`. It refreshes route
-snapshots, selects the node that owns the key's slot, and retries one stale-route
-failure. `sequence.NewBatchClient(router, client).FetchNext(ctx, requests)` takes
+snapshots, selects the node that owns the key's slot, and performs bounded
+recovery according to the Router's retry policy.
+`sequence.NewBatchClient(router, client).FetchNext(ctx, requests)` takes
 `[]sequence.KeyRequest` and groups the keys by owner, so one owner needs one
-`FetchNextBatch` call; a group that does not succeed fails the whole call. The
+`FetchNextBatch` call per round. Validated successful groups are retained inside
+the call; only unfinished keys are retried and regrouped after a route refresh.
+The public result is still the complete batch in request order or an error,
+never partial success. At most 32 owner RPCs run concurrently. The
 new client checks the response `count` and does not silently downgrade: an old
 server that returns `count=0` is only treated as a single ID, and batches against
 a server without `FetchNextBatch` fail with an explicit compatibility error. The
 generated request and response types live in
 `github.com/codesjoy/sindri/gen/go/sequence/v1`.
+
+### Bounded SDK retries
+
+Existing `NewRouter(loader)` calls remain valid. The routing module,
+interceptors and `BatchClient` share the Router's immutable policy:
+
+```go
+policy := sequence.DefaultRetryPolicy()
+policy.MaxAttempts = 8 // includes the first attempt; use 1 to disable retries
+policy.MaxElapsed = 10 * time.Second
+policy.InitialBackoff = 100 * time.Millisecond
+policy.MaxBackoff = 2 * time.Second
+router, err := sequence.NewRouter(loader, sequence.WithRetryPolicy(policy))
+```
+
+These are the defaults. Explicit policies are validated at construction; all
+durations must be positive and `MaxBackoff >= InitialBackoff`. The elapsed
+budget covers initial route loading, refreshes, RPCs and waits; the caller's
+shorter deadline always wins. Exponential backoff uses equal jitter in the
+current backoff's `[1/2, 1]` interval. A valid `retry_after` is a minimum wait,
+even when it exceeds `MaxBackoff`, and context cancellation interrupts it.
+
+`refresh` errors reload the route and retry with backoff; `retry` and `throttle`
+errors retry after backoff without forcing a reload. `never`, cancellation and
+terminal errors return immediately. Older servers without a classification use
+known Sequence reasons; unclassified transport `UNAVAILABLE` (including no
+available local endpoint) triggers both refresh and backoff. Every attempt
+rebuilds routing metadata and resets its reply. A timeout returns a context
+error; exhaustion returns the last recoverable error without losing its reason
+or code. Route refresh remains singleflight.
+
+For cross-node batches the outer call alone owns the budget; grouped RPCs make
+one attempt per round. Each unfinished key participates in at most eight
+rounds by default, with the whole batch sharing ten seconds. A recoverable group
+failure does not cancel other groups; terminal failures and cancellation do.
+
+Retries are bounded recovery, not exactly-once delivery or a promise to span the
+full takeover window. Lost replies, uncertain commits and failed batches can
+consume IDs and leave gaps; retrying an entire failed public call can allocate
+again for keys that had internally succeeded.
+
+### Rollout and rollback
+
+Upgrade **all servers before enabling the new SDK**. During mixed server
+versions the reservation and allocation safety gaps are not considered closed.
+The lease fences have no bypass switch: stop a problematic node rather than
+disable its safety checks. SDK rollback is independent of the server fixes.
+Database migrations, protobufs and release versions are unchanged.
 
 ## Configuration
 
@@ -312,11 +364,13 @@ publish prunes the older ones in the same transaction, `coordinator_lease` is
 how long one replica keeps the publisher role, and `reconcile_interval` and
 `pass_timeout` bound the cadence and length of one publish pass.
 
-`reserve_timeout` (default `1s`) bounds **one** storage statement — a range
-reservation, one lease renewal, or one claim or release batch — not a whole
-operation. An operation that spans several statements (a reservation for many
-keys, a claim that crosses the 1000-slot batch size) gives each statement its own
-bound, so a slow statement cannot leave the ones after it without any budget.
+`reserve_timeout` (default `1s`) bounds a foreground reservation, lease renewal,
+clock sample or release batch. A foreground reservation uses its own child
+context and also obeys any shorter caller deadline. Each route-apply claim pass
+has one total `reserve_timeout` budget, including claims and cleanup; confirmed
+progress is installed and retained, and later passes claim only the remainder.
+Each grant's local deadline is anchored before its database request, so response
+latency spends the lease rather than extending it.
 
 Each key has at most one background prefetch or retry in flight. A failed
 background reservation leaves the active range usable and schedules a jittered

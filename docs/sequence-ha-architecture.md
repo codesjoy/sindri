@@ -636,6 +636,25 @@ must refresh rather than be answered from it.
 | `SEQUENCE_CAPACITY_EXHAUSTED` | `throttle` | retry more slowly |
 | anything else | `never` | do not retry the request unchanged |
 
+The Go Router's default allocation budget is eight attempts and ten seconds,
+including loading and refreshing routes, RPCs and cancelable waits. It uses
+100 ms initial / 2 s maximum exponential backoff with equal jitter; a valid
+`retry_after` remains a minimum even above that cap. Unclassified transport
+unavailability uses refresh plus backoff; older Sequence reasons provide the
+fallback classification. Attempts rebuild metadata and reset replies. The
+budget bounds recovery but does not promise exactly-once or cover the full
+takeover interval.
+
+Cross-node `BatchClient` owns one outer budget and limits concurrency to 32.
+Successful validated groups are retained; only unfinished keys are regrouped
+and retried, and group interceptors perform no nested retries. Recoverable
+failures leave sibling groups running; terminal errors or cancellation cancel
+the remainder. The external contract stays whole-batch success or error.
+
+Complete the server fleet upgrade before enabling this SDK. A mixed fleet has
+not closed the server safety gaps. Allocation fences have no bypass setting;
+pause or remove a problematic node instead, or roll back the SDK independently.
+
 ## Appendix B: Storage schema
 
 | Table | Key | Role |

@@ -19,7 +19,9 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	rand "math/rand/v2"
 	"sync"
+	"time"
 
 	sequencev1 "github.com/codesjoy/sindri/gen/go/sequence/v1"
 	"google.golang.org/protobuf/proto"
@@ -66,7 +68,10 @@ type refreshCall struct {
 
 // Router owns the immutable client route snapshot shared by interceptors and balancers.
 type Router struct {
-	mu sync.RWMutex
+	retryPolicy RetryPolicy
+	retryWait   func(context.Context, time.Duration) error
+	retryRandom func() float64
+	mu          sync.RWMutex
 
 	loader  RouteLoader
 	current *compiledRoute
@@ -77,14 +82,26 @@ type Router struct {
 }
 
 // NewRouter constructs an empty router backed by loader.
-func NewRouter(loader RouteLoader) (*Router, error) {
+func NewRouter(loader RouteLoader, options ...RouterOption) (*Router, error) {
 	if loader == nil {
 		return nil, errors.New("sequence router: route loader is required")
 	}
-	return &Router{
-		loader:    loader,
-		listeners: make(map[uint64]func()),
-	}, nil
+	router := &Router{
+		retryPolicy: DefaultRetryPolicy(),
+		retryWait:   waitRetry,
+		retryRandom: rand.Float64,
+		loader:      loader,
+		listeners:   make(map[uint64]func()),
+	}
+	for _, option := range options {
+		if option == nil {
+			return nil, errors.New("sequence router: option is required")
+		}
+		if err := option(router); err != nil {
+			return nil, err
+		}
+	}
+	return router, nil
 }
 
 // SlotForKey hashes the original UTF-8 key bytes into the fixed slot space.
