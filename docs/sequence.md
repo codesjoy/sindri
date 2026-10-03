@@ -42,10 +42,12 @@ Placement is computed locally, by every node, from the rows the fleet shares.
 The right to hand out IDs still comes from `sequence_slot_ownership`, so a node claims
 the slots its own plan hands it: an unowned slot is granted immediately, while a
 slot still held by another instance is only taken over once the quiet window
-`ha.quiet_window` has elapsed since that instance's last grant, unless its owner
-released it first. A node that loses a slot stops serving it, waits for its
-in-flight allocations to finish and then releases it with an `epoch`-CAS, which
-lets the next owner start without waiting for the window.
+`ha.quiet_window` has elapsed since the owner's instance lease was last granted
+or renewed, unless its owner released it first. A node that loses a slot stops
+serving it, waits for its in-flight allocations to finish, and then hands it
+back with a RELEASE handoff fenced on the source epoch; the handoff preserves
+the epoch and, once the slot has drained, lets the next owner start without
+waiting for the window.
 
 Inspect startup if a container does not become ready:
 
@@ -60,9 +62,10 @@ There is no central placement decision to wait for. Each node reads
 which of the 16,384 slots its own node id should hold. A slot nobody owns is
 assigned deterministically across the live node ids; a slot whose owner is gone
 is reassigned to a node that is still there; and a slot whose owner came back
-under the same node id but a new process stays with that node id, so a restart
-reclaims the position it left. The node then claims what it planned, and the
-publisher half of the process materialises the result into
+under the same node id but a new process rejoins the even split, so a restart
+normally reclaims the share it left once the quiet window passes. The node then
+claims what it planned, and the publisher half of the process materialises the
+result into
 `sequence_route_snapshot` for clients to follow.
 
 Watch a node converge:
@@ -74,8 +77,9 @@ docker compose -f deploy/docker/compose.yaml logs --since 30s sequence
 Three rules are worth knowing when reading that log:
 
 - A node only ever takes a slot nobody owns, or one whose owner cannot serve it:
-  a dead node id, a node whose grant aged past the quiet window, or a restarted
-  process under the same node id. Adding a node does not move a serving slot.
+  a dead node id, a node whose instance lease aged past the quiet window, or a
+  restarted process under the same node id. Adding a node does not move a
+  serving slot.
 - To move slots off a node, stop it. It drains each slot it holds, records a
   RELEASE handoff, and the nodes that remain pick those slots up. Draining a
   slot means closing its gate and waiting for the allocations already inside it
@@ -128,22 +132,15 @@ grpcurl -plaintext \
   codesjoy.sindri.sequence.v1.SequenceGenerator/GetRoute
 ```
 
-The response includes all 16,384 slots, so it is long. The node lists are the
-projection a router uses; `segments` is the authority they were derived from,
-one entry per run of slots sharing an owner instance and epoch. Its beginning
-should look like this:
+The response includes all 16,384 slots, so it is long. `segments` is the
+authoritative owner view, one entry per run of slots sharing an owner instance
+and epoch, including runs nobody owns. Its beginning should look like this:
 
 ```json
 {
   "route": {
     "version": "1",
     "layoutVersion": "1",
-    "nodes": [
-      {
-        "nodeId": "sequence-1",
-        "slots": [0, 1, 2]
-      }
-    ],
     "segments": [
       {
         "startSlot": 0,
@@ -157,13 +154,9 @@ should look like this:
 }
 ```
 
-A snapshot that carries segments is the current shape: the segments are the
-authoritative owner view, the node lists are only a projection, and the router
-refuses a snapshot whose projection conflicts with them. A snapshot that
-carries no segments is a pre-authority directory from an older deployment: it
-is still followed when its node lists cover all 16,384 slots, but it carries no
-epochs, so a caller sends none and the owner answers without an epoch
-comparison.
+Every snapshot carries `segments`, and they must cover all 16,384 slots exactly
+once; a snapshot without them is refused. There is no pre-authority snapshot
+shape or legacy compilation path: a caller always has a per-slot epoch to send.
 
 ## 5. Read the high-availability report
 
@@ -335,11 +328,11 @@ versions the reservation and allocation safety gaps are not considered closed.
 The lease fences have no bypass switch: stop a problematic node rather than
 disable its safety checks. SDK rollback is independent of the server fixes.
 
-This change moves the contract and SDK to `v0.2.0` and replaces the migration
-chain with a single empty-database baseline. It does not ship an in-place
-upgrade from the previous schema and does not keep an old-SDK compatibility
-layer: rebuild into an empty database, then publish the contract and SDK before
-the service release. The [Docker deployment
+The current contract and SDK release is `v0.2.0`, paired with a single
+empty-database baseline instead of the previous migration chain. There is no
+in-place upgrade from the previous schema and no old-SDK compatibility layer:
+rebuild into an empty database, then publish the contract and SDK before the
+service release. The [Docker deployment
 guide](../deploy/docker/README.md#release-order) lists the exact order.
 
 ## Configuration
@@ -431,4 +424,7 @@ docker compose -f deploy/docker/compose.yaml down -v
 ```
 
 The second command permanently removes the local PostgreSQL, Prometheus, Tempo,
-and Grafana data managed by this Compose project.
+and Grafana data managed by this Compose project. A reset is not a backup path:
+the Sequence database must never be restored to an earlier point in time,
+because a rolled-back watermark can re-issue IDs (see the [Docker deployment
+guide](../deploy/docker/README.md#empty-database-baseline)).

@@ -264,7 +264,7 @@ task test:sequence:chaos                        # deterministic system and chaos
 task service-release:check SERVICE=<service> VERSION=<version>
 ```
 
-The complete command surface remains:
+The core command surface remains:
 
 ```sh
 task tools:install                              # when pinned tools are missing

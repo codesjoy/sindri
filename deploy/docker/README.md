@@ -21,11 +21,12 @@ loopback and is deliberately not published, so read it from inside the container
 docker compose -f deploy/docker/compose.yaml exec sequence \
   bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080; printf "GET /healthz HTTP/1.0\r\n\r\n" >&3; cat <&3'
 ```
-The migration job creates the Sequence tables, including the slot ownership and
-placement tables. There is no central placement decision: each node plans its
-own slots from `sequence_slot_ownership` and `sequence_node_liveness` on every
-heartbeat, claims what its plan hands it, and serves it. The publisher half of
-the same process snapshots that authority into the single
+The migration job creates the Sequence tables, including slot ownership,
+instance leases, node liveness, the coordinator row, the route snapshot,
+handoffs, and ranges. There is no central placement decision: each node plans
+its own slots from `sequence_slot_ownership` and `sequence_node_liveness` on
+every heartbeat, claims what its plan hands it, and serves it. The publisher
+half of the same process snapshots that authority into the single
 `sequence_route_snapshot` row under a coordinator lease, so clients can follow
 the moves. Allocation is paused until the first directory appears, which the
 quick start shows how to watch.
@@ -193,6 +194,11 @@ for an empty database and replaces the previous chain of upgrade migrations.
 There is no bridge from the older schema and no in-place upgrade: rebuild the
 Sequence database into an empty one, stop every Sequence process first, and let
 the migration job create the tables.
+
+Never restore the Sequence database, or the volume it lives on, to an earlier
+point in time. The service does not detect a watermark that moves backwards:
+a restored `sequence_ranges.reserved_end` below an ID the fleet already returned
+lets a key re-issue that ID.
 
 The baseline the migration job applies must match the service you are about to
 run. Applying the baseline from a newer checkout under an older binary, or the
