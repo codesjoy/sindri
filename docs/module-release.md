@@ -61,6 +61,9 @@ contract. The contract assigned to a service version is immutable; additional
 exact client versions may be appended after the service is released, but an
 existing tested client must not be removed. New entries are appended; an
 existing entry keeps its recorded versions and checksums.
+An unrecorded legacy tag whose tagged manifest predates its own entry is
+backfilled by the current manifest instead of rewritten: the tag must still be
+listed, and its mapping is immutable once recorded.
 
 Run `task service-release:check SERVICE=<service> VERSION=<version>` before
 creating a service tag. The check validates referenced tags and module

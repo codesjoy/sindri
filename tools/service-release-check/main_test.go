@@ -257,6 +257,40 @@ releases:
 	}
 }
 
+func TestCheckerAllowsBackfilledLegacyServiceTag(t *testing.T) {
+	repo := newFixture(t, "v0.1.0")
+	writeFile(t, repo, "releases/services/alpha.yaml", `service: alpha
+releases:
+  - version: v0.1.0
+    contract: gen/go/alpha/v0.1.0
+    tested_clients:
+      - pkg/alpha/v0.1.0
+`)
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "record service release")
+	git(t, repo, "tag", "service/alpha/v0.1.0")
+
+	writeFile(t, repo, "internal/alpha/alpha.go", "package alpha\n\nconst revision = 2\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "release unrecorded service patch")
+	git(t, repo, "tag", "service/alpha/v0.1.1")
+
+	writeFile(t, repo, "releases/services/alpha.yaml", `service: alpha
+releases:
+  - version: v0.1.0
+    contract: gen/go/alpha/v0.1.0
+    tested_clients:
+      - pkg/alpha/v0.1.0
+  - version: v0.1.1
+    contract: gen/go/alpha/v0.1.0
+    tested_clients:
+      - pkg/alpha/v0.1.0
+`)
+	if err := (&checker{repo: repo, skipBuild: true}).run("alpha", "v0.1.0"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCheckerRejectsHistoricalMappingChanges(t *testing.T) {
 	tests := []struct {
 		name     string

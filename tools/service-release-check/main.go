@@ -446,11 +446,10 @@ func (c *checker) validateHistory(service string, current manifest) error {
 			}
 		}
 		if previous == nil {
-			return fmt.Errorf(
-				"historical manifest at %s has no release %s",
-				serviceTag,
-				currentRelease.Version,
-			)
+			// The tag predates its own manifest entry: a service-only patch
+			// released before the mapping was recorded. The current manifest
+			// backfills it, and the mapping is immutable from the backfill on.
+			continue
 		}
 		if previous.Contract != currentRelease.Contract {
 			return fmt.Errorf("contract for %s is immutable", serviceTag)
