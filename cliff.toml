@@ -15,6 +15,8 @@
 # git-cliff configuration for Sindri repository changelogs.
 #
 # scripts/chglog.sh renders one calendar month at a time and ignores release tags.
+# The breaking-changes block starts with an explicit \n because TOML trims the
+# whitespace that follows a line-ending backslash.
 
 [changelog]
 header = "# Changelog\n\n"
@@ -24,6 +26,15 @@ body = """
 {% else %}\
 ## Unreleased
 {% endif %}
+{% if commits | filter(attribute="breaking", value=true) | length > 0 %}\
+\n### Breaking changes
+{% for commit in commits | filter(attribute="breaking", value=true) %}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}
+{% if commit.breaking_description %}\
+{{ "  " }}{{ commit.breaking_description | indent(prefix="  ") }}
+{% endif %}\
+{% endfor %}
+{% endif %}\
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
 {% for commit in commits %}
@@ -40,7 +51,7 @@ filter_unconventional = true
 split_commits = false
 protect_breaking_commits = true
 filter_commits = false
-sort_commits = "oldest"
+sort_commits = "newest"
 commit_parsers = [
   { message = "^feat", group = "features" },
   { message = "^fix", group = "bug fixes" },

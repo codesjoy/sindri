@@ -88,6 +88,25 @@ month_range() {
 	fi
 }
 
+# trim_section drops the trailing blank line git-cliff emits so sections join
+# with a single blank line and the changelog ends right after its last entry.
+trim_section() {
+	trim_file=$1
+	awk '
+		{ lines[NR] = $0 }
+		END {
+			last = NR
+			while (last > 0 && lines[last] ~ /^[[:space:]]*$/) {
+				last--
+			}
+			for (i = 1; i <= last; i++) {
+				print lines[i]
+			}
+		}
+	' "$trim_file" >"$trim_file.trim"
+	mv "$trim_file.trim" "$trim_file"
+}
+
 render_month() {
 	render_month_value=$1
 	render_output_path=$2
@@ -95,42 +114,71 @@ render_month() {
 		return 1
 	fi
 	"$git_cliff" --config cliff.toml --ignore-tags '.*' --tag "$render_month_value" --strip all "$range" >"$render_output_path"
+	trim_section "$render_output_path"
 }
 
-replace_month() {
+remove_month() {
 	month=$1
-	section=$2
-	target=$3
-	tmp=$4
-	if [ ! -f "$target" ]; then
-		printf '# Changelog\n\n' >"$target"
-	fi
-	awk -v month="$month" -v section="$section" '
+	input=$2
+	output=$3
+	awk -v month="$month" '
 		BEGIN {
-			inserted = 0
 			skipping = 0
 		}
 		NR == 1 {
 			print
 			next
 		}
-		/^## / {
+		/^## [0-9][0-9][0-9][0-9]-[0-9][0-9]$/ {
 			if ($0 == "## " month) {
-				if (!inserted) {
-					while ((getline line < section) > 0) {
-						print line
-					}
-					close(section)
-					inserted = 1
-				}
 				skipping = 1
 				next
 			}
-			if (skipping) {
-				skipping = 0
-			}
+			skipping = 0
 		}
 		!skipping {
+			print
+		}
+	' "$input" >"$output"
+}
+
+# insert_month places the rendered section before the first older month so
+# sections stay ordered newest first, and appends it when every month is newer.
+insert_month() {
+	month=$1
+	section=$2
+	input=$3
+	output=$4
+	awk -v month="$month" -v section="$section" '
+		BEGIN {
+			inserted = 0
+			blanks = 0
+		}
+		NR == 1 {
+			print
+			next
+		}
+		/^[[:space:]]*$/ {
+			blanks++
+			next
+		}
+		/^## [0-9][0-9][0-9][0-9]-[0-9][0-9]$/ {
+			if (!inserted && substr($0, 4) < month) {
+				print ""
+				while ((getline line < section) > 0) {
+					print line
+				}
+				close(section)
+				print ""
+				inserted = 1
+				blanks = 0
+			}
+		}
+		{
+			while (blanks > 0) {
+				print ""
+				blanks--
+			}
 			print
 		}
 		END {
@@ -142,8 +190,19 @@ replace_month() {
 				close(section)
 			}
 		}
-	' "$target" >"$tmp"
-	mv "$tmp" "$target"
+	' "$input" >"$output"
+}
+
+replace_month() {
+	month=$1
+	section=$2
+	target=$3
+	tmp=$4
+	if [ ! -s "$target" ]; then
+		printf '# Changelog\n\n' >"$target"
+	fi
+	remove_month "$month" "$target" "$tmp"
+	insert_month "$month" "$section" "$tmp" "$target"
 }
 
 write_month() {
