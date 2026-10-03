@@ -16,6 +16,7 @@ package data
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -154,4 +155,49 @@ func TestMembershipCannotOverwriteInstanceAuthorityAndStableAdmissionResets(t *t
 	nodes, err = p.LiveNodes(ctx, 15*time.Second)
 	require.NoError(t, err)
 	require.Len(t, nodes, 1)
+}
+
+// BenchmarkOwnershipSegmentsAtHundredNodeSteadyState pins the capacity-envelope
+// read (section 10.3): with 100 nodes holding even, contiguous shares of the
+// slot space, OwnershipSegments must return one run per node plus the unowned
+// remainder rather than per-slot rows.
+func BenchmarkOwnershipSegmentsAtHundredNodeSteadyState(b *testing.B) {
+	db := openPlacementTestDB(b)
+	ctx := context.Background()
+	ownership := NewOwnershipData(db)
+
+	const (
+		nodeCount    = 100
+		slotsPerNode = biz.SlotCount / nodeCount
+		unownedStart = nodeCount * slotsPerNode
+	)
+	for index := 0; index < nodeCount; index++ {
+		nodeID := fmt.Sprintf("sequence-%03d", index)
+		instanceID := fmt.Sprintf("instance-%03d", index)
+		require.NoError(b, ownership.RegisterInstance(ctx, nodeID, instanceID))
+		start := uint32(index * slotsPerNode)
+		end := start + slotsPerNode - 1
+		require.NoError(b, db.Exec(
+			"UPDATE sequence_slot_ownership SET owner_instance_id = ?, epoch = 1, "+
+				"state = 'OWNED', updated_at = CURRENT_TIMESTAMP WHERE slot_id BETWEEN ? AND ?",
+			instanceID, start, end,
+		).Error)
+	}
+
+	placement := NewPlacementData(db, 3*time.Second, 15*time.Second)
+	var view []biz.OwnershipSegment
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		segments, err := placement.OwnershipSegments(ctx, 3*time.Second)
+		if err != nil {
+			b.Fatal(err)
+		}
+		view = segments
+	}
+	b.StopTimer()
+
+	require.Len(b, view, nodeCount+1, "one owned run per node plus the unowned remainder")
+	require.Equal(b, biz.SlotUnowned, view[len(view)-1].State)
+	require.EqualValues(b, unownedStart, view[len(view)-1].StartSlot)
+	b.ReportMetric(float64(len(view)), "segments/op")
 }
